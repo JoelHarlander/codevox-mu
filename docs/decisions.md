@@ -39,3 +39,9 @@ Joel's words: "I think we accept the risk use libraries done by other people as 
 Decided. The weekly backlog check-in is Saturdays around 5am Sydney time.
 
 Joel's words: "Yes, set up the Monday 9am check-in", then "make it sat 5am".
+
+## 11 Nov 2026 — Visual style follows CodeVox
+
+Decided. CodeVox mU follows the CodeVox visual style. The tokens are in [design/tokens.json](../design/tokens.json). Headings are Space Mono. Body text is IBM Plex Mono.
+
+Joel's words: "I think we follow code box styling" / "Vox" (dictated, meaning CodeVox).
