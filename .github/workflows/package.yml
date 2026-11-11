@@ -61,7 +61,6 @@ jobs:
             libvulkan1 \
             mesa-vulkan-drivers \
             xvfb \
-            cmake \
             binutils \
             patchelf \
             file
