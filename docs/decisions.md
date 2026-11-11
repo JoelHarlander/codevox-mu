@@ -45,3 +45,9 @@ Joel's words: "Yes, set up the Monday 9am check-in", then "make it sat 5am".
 Decided. CodeVox mU follows the CodeVox visual style. The tokens are in [design/tokens.json](../design/tokens.json). Headings are Space Mono. Body text is IBM Plex Mono.
 
 Joel's words: "I think we follow code box styling" / "Vox" (dictated, meaning CodeVox).
+
+## 11 Nov 2026 — Bot drives to a testable build and merges green PRs
+
+Decided. The bot drives CodeVox mU through the backlog until there is a build Joel can install and test. It merges a PR itself once all 5 CI jobs pass. It still never pushes to main or force-pushes.
+
+Joel's words: "i'll need you to drive it I mean", then "Yes, merge green PRs yourself".

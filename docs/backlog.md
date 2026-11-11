@@ -9,10 +9,9 @@ Draft v1, 11 Nov 2026. Still to refine with Joel.
 - RISK. Decided 11 Nov 2026: playback via unofficial libraries, risk accepted. See [Playback via unofficial libraries, risk accepted](decisions.md#11-nov-2026--playback-via-unofficial-libraries-risk-accepted).
 - PM check-in cadence. Decided 11 Nov 2026: weekly backlog check-in, Saturdays around 5am Sydney time. See [Weekly backlog check-in](decisions.md#11-nov-2026--weekly-backlog-check-in).
 - Visual style follows CodeVox. Decided 11 Nov 2026. See [Visual style follows CodeVox](decisions.md#11-nov-2026--visual-style-follows-codevox).
+- A services/backend trait plus a mock.
 
 ## Now
-
-- A services/backend trait plus a mock.
 
 ## Next
 
