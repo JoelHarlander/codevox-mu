@@ -8,6 +8,7 @@ Draft v1, 11 Nov 2026. Still to refine with Joel.
 - CI skeleton: GitHub Actions for Linux, Windows, and macOS (Apple Silicon and Intel). The smoke run opens the window. `macos-13` was retired on 4 Dec 2025, so Intel is `macos-15-intel`. Windows Arm (`aarch64-pc-windows-msvc`) is a cross-compile build only. The x64 runner cannot execute it, so that job does not smoke-test.
 - RISK. Decided 11 Nov 2026: playback via unofficial libraries, risk accepted. See [Playback via unofficial libraries, risk accepted](decisions.md#11-nov-2026--playback-via-unofficial-libraries-risk-accepted).
 - PM check-in cadence. Decided 11 Nov 2026: weekly backlog check-in, Saturdays around 5am Sydney time. See [Weekly backlog check-in](decisions.md#11-nov-2026--weekly-backlog-check-in).
+- Visual style follows CodeVox. Decided 11 Nov 2026. See [Visual style follows CodeVox](decisions.md#11-nov-2026--visual-style-follows-codevox).
 
 ## Now
 
