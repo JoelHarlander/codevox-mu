@@ -10,16 +10,16 @@ Draft v1, 11 Nov 2026. Still to refine with Joel.
 - PM check-in cadence. Decided 11 Nov 2026: weekly backlog check-in, Saturdays around 5am Sydney time. See [Weekly backlog check-in](decisions.md#11-nov-2026--weekly-backlog-check-in).
 - Visual style follows CodeVox. Decided 11 Nov 2026. See [Visual style follows CodeVox](decisions.md#11-nov-2026--visual-style-follows-codevox).
 - A services/backend trait plus a mock.
+- YouTube Music search. Unauthenticated song search through ytmapi-rs (MIT), merged with the Spotify mock. See [YouTube Music search uses ytmapi-rs](decisions.md#11-nov-2026--youtube-music-search-uses-ytmapi-rs).
 
 ## Now
 
 ## Next
 
-Each of the first three is its own small PR, in this order:
+Each of the first two is its own small PR, in this order:
 
 - Spotify sign-in (OAuth PKCE, Web API library): library, playlists, and liked songs.
 - librespot playback spike. In-app playback; free accounts fall back to YouTube Music.
-- YouTube Music search spike.
 - YouTube Music sign-in.
 - One search across both services.
 - A mixed queue.

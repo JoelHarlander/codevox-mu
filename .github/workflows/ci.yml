@@ -63,7 +63,8 @@ jobs:
             libfontconfig1-dev \
             libvulkan1 \
             mesa-vulkan-drivers \
-            xvfb
+            xvfb \
+            cmake
 
       - name: Format
         run: cargo fmt --all --check
