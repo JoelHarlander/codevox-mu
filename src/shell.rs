@@ -1,14 +1,23 @@
 //! The native window.
 //!
-//! One iced window is the whole interface today. Search goes through
-//! [`crate::music`]; the window does not know how a backend is implemented.
+//! One iced window is the whole interface today. Search asks the Spotify
+//! mock immediately and YouTube Music on a background thread. The window
+//! does not know how either catalogue is fetched.
+
+use std::sync::Arc;
 
 use iced::alignment::{Horizontal, Vertical};
+use iced::futures::channel::oneshot;
 use iced::widget::{Space, column, container, row, scrollable, text, text_input};
 use iced::window::{self, Settings};
 use iced::{Background, Border, Color, Element, Fill, Size, Subscription, Task};
 
 use crate::music::{self, MusicService, Source, Track};
+use crate::youtube_music::YouTubeMusic;
+
+/// A blocking catalogue call. The iced executor is not a Tokio runtime, so
+/// the window runs this on its own thread and waits without blocking the UI.
+type BackgroundSearch = Arc<dyn Fn(&str) -> Result<Vec<Track>, music::Error> + Send + Sync>;
 
 /// Window title. This is the product name, not a window-manager default.
 const TITLE: &str = "CodeVox mU";
@@ -65,6 +74,11 @@ pub enum Mode {
 enum Message {
     Frame,
     QueryChanged(String),
+    /// `generation` matches the query that started this search.
+    YoutubeSearched {
+        generation: u64,
+        result: Result<Vec<Track>, music::Error>,
+    },
 }
 
 struct Shell {
@@ -77,7 +91,12 @@ struct Shell {
     exit_requested: bool,
     query: String,
     results: Vec<Track>,
-    services: Vec<Box<dyn MusicService>>,
+    /// YouTube Music failure for the query now on screen. Spotify rows stay.
+    error: Option<String>,
+    /// Bumped on every edit so a slow reply cannot overwrite a newer query.
+    generation: u64,
+    spotify: music::MockService,
+    youtube: BackgroundSearch,
 }
 
 pub fn run(mode: Mode) -> iced::Result {
@@ -135,14 +154,7 @@ fn arm_smoke_timeout() {
 
 #[test]
 fn extra_frames_after_exit_are_ignored() {
-    let mut shell = Shell {
-        mode: Mode::Smoke,
-        frame_count: 0,
-        exit_requested: false,
-        query: String::new(),
-        results: Vec::new(),
-        services: Vec::new(),
-    };
+    let mut shell = test_shell(Mode::Smoke);
 
     for frame in 1..SMOKE_FRAME_COUNT_LIMIT {
         assert_eq!(shell.smoke_frame(), SmokeFrame::Continue, "frame {frame}");
@@ -165,18 +177,104 @@ fn extra_frames_after_exit_are_ignored() {
 }
 
 #[test]
-fn search_box_merges_mock_sources() {
-    let mut shell = Shell::boot(Mode::Run);
+fn search_box_merges_spotify_now_and_youtube_when_it_returns() {
+    let mut shell = test_shell(Mode::Run);
     let _ = shell.update(Message::QueryChanged("night".into()));
 
     assert_eq!(shell.query, "night");
+    assert_eq!(shell.generation, 1);
+    let sources: Vec<_> = shell.results.iter().map(|track| track.source).collect();
+    assert_eq!(sources, [Source::Spotify]);
+    assert!(shell.error.is_none());
+
+    let youtube = music::MockService::youtube_music()
+        .search("night")
+        .expect("mock");
+    let _ = shell.update(Message::YoutubeSearched {
+        generation: 1,
+        result: Ok(youtube),
+    });
     let sources: Vec<_> = shell.results.iter().map(|track| track.source).collect();
     assert_eq!(sources, [Source::Spotify, Source::YouTubeMusic]);
+    assert_eq!(shell.results[1].title, "Night Drive (Live)");
     let _ = Shell::view(&shell);
 
     let _ = shell.update(Message::QueryChanged("   ".into()));
     assert!(shell.results.is_empty());
+    assert!(shell.error.is_none());
     let _ = Shell::view(&shell);
+}
+
+#[test]
+fn youtube_failure_keeps_spotify_rows_and_shows_an_error() {
+    let mut shell = test_shell(Mode::Run);
+    let _ = shell.update(Message::QueryChanged("night".into()));
+    let _ = shell.update(Message::YoutubeSearched {
+        generation: 1,
+        result: Err(music::Error::Unavailable("timed out".into())),
+    });
+
+    assert!(
+        shell
+            .results
+            .iter()
+            .all(|track| track.source == Source::Spotify)
+    );
+    assert_eq!(
+        shell.error.as_deref(),
+        Some("YouTube Music search failed: timed out")
+    );
+    let _ = Shell::view(&shell);
+}
+
+#[test]
+fn a_stale_youtube_reply_does_not_replace_the_current_query() {
+    let mut shell = test_shell(Mode::Run);
+    let _ = shell.update(Message::QueryChanged("night".into()));
+    let _ = shell.update(Message::QueryChanged("paper".into()));
+    assert_eq!(shell.generation, 2);
+
+    let night = music::MockService::youtube_music()
+        .search("night")
+        .expect("night");
+    let _ = shell.update(Message::YoutubeSearched {
+        generation: 1,
+        result: Ok(night),
+    });
+    assert!(
+        shell
+            .results
+            .iter()
+            .all(|track| track.source == Source::Spotify)
+    );
+    assert_eq!(shell.results[0].title, "Paper Boats");
+
+    let paper = music::MockService::youtube_music()
+        .search("paper")
+        .expect("paper");
+    let _ = shell.update(Message::YoutubeSearched {
+        generation: 2,
+        result: Ok(paper),
+    });
+    let titles: Vec<_> = shell
+        .results
+        .iter()
+        .map(|track| (track.source, track.title.as_str()))
+        .collect();
+    assert_eq!(
+        titles,
+        [
+            (Source::Spotify, "Paper Boats"),
+            (Source::YouTubeMusic, "Paper Planes"),
+        ]
+    );
+}
+
+#[cfg(test)]
+fn test_shell(mode: Mode) -> Shell {
+    let youtube = music::MockService::youtube_music();
+    // Tests never poll the task, and the closure is the mock if they do.
+    Shell::with_youtube(mode, Arc::new(move |query| youtube.search(query)))
 }
 
 impl Shell {
@@ -185,35 +283,93 @@ impl Shell {
             arm_smoke_timeout();
         }
 
+        let youtube = YouTubeMusic::new();
+        Self::with_youtube(mode, Arc::new(move |query| youtube.search(query)))
+    }
+
+    fn with_youtube(mode: Mode, youtube: BackgroundSearch) -> Self {
         Self {
             mode,
             frame_count: 0,
             exit_requested: false,
             query: String::new(),
             results: Vec::new(),
-            services: music::mock_services(),
+            error: None,
+            generation: 0,
+            spotify: music::MockService::spotify(),
+            youtube,
         }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Frame => self.on_frame(),
-            Message::QueryChanged(query) => {
-                self.set_query(query);
+            Message::QueryChanged(query) => self.set_query(query),
+            Message::YoutubeSearched { generation, result } => {
+                self.apply_youtube(generation, result);
                 Task::none()
             }
         }
     }
 
-    fn set_query(&mut self, query: String) {
+    fn set_query(&mut self, query: String) -> Task<Message> {
         self.query = query;
-        // The mock does not fail a search. A later backend might; drop the
-        // rows rather than leave the previous query on screen.
-        self.results = music::search_merged(
-            self.services.iter().map(|service| service.as_ref()),
-            &self.query,
+        self.generation += 1;
+        let generation = self.generation;
+        self.error = None;
+
+        if self.query.trim().is_empty() {
+            self.results.clear();
+            return Task::none();
+        }
+
+        // Spotify is memory. YouTube blocks, so it rides an iced task.
+        self.results = self.spotify.search(&self.query).unwrap_or_default();
+
+        let youtube = Arc::clone(&self.youtube);
+        let query = self.query.clone();
+        Task::perform(
+            async move {
+                let (sender, receiver) = oneshot::channel();
+                let started = std::thread::Builder::new()
+                    .name("youtube-music-search".into())
+                    .spawn(move || {
+                        let _ = sender.send(youtube(&query));
+                    });
+                if let Err(error) = started {
+                    return Err(music::Error::Unavailable(format!(
+                        "could not start the search thread: {error}"
+                    )));
+                }
+                receiver.await.unwrap_or_else(|_| {
+                    Err(music::Error::Unavailable(
+                        "the search thread stopped before it replied".into(),
+                    ))
+                })
+            },
+            move |result| Message::YoutubeSearched { generation, result },
         )
-        .unwrap_or_default();
+    }
+
+    fn apply_youtube(&mut self, generation: u64, result: Result<Vec<Track>, music::Error>) {
+        if generation != self.generation || self.query.trim().is_empty() {
+            return;
+        }
+
+        let youtube_tracks = match result {
+            Ok(tracks) => {
+                self.error = None;
+                tracks
+            }
+            Err(error) => {
+                self.error = Some(format!("YouTube Music search failed: {error}"));
+                Vec::new()
+            }
+        };
+
+        let mut results = self.spotify.search(&self.query).unwrap_or_default();
+        results.extend(youtube_tracks);
+        self.results = results;
     }
 
     fn on_frame(&mut self) -> Task<Message> {
@@ -308,6 +464,16 @@ impl Shell {
 }
 
 fn status_line(shell: &Shell) -> Option<Element<'_, Message>> {
+    if let Some(error) = &shell.error {
+        return Some(
+            text(error)
+                .font(crate::theme::BODY)
+                .size(META_SIZE)
+                .color(crate::theme::DESTRUCTIVE)
+                .into(),
+        );
+    }
+
     if shell.query.trim().is_empty() || !shell.results.is_empty() {
         return None;
     }

@@ -51,3 +51,9 @@ Joel's words: "I think we follow code box styling" / "Vox" (dictated, meaning Co
 Decided. The bot drives CodeVox mU through the backlog until there is a build Joel can install and test. It merges a PR itself once all 5 CI jobs pass. It still never pushes to main or force-pushes.
 
 Joel's words: "i'll need you to drive it I mean", then "Yes, merge green PRs yourself".
+
+## 11 Nov 2026 — YouTube Music search uses ytmapi-rs
+
+Decided. Unauthenticated song search uses [ytmapi-rs](https://crates.io/crates/ytmapi-rs) 0.3.4, the maintained Rust client for YouTube Music's InnerTube API. crates.io lists the licence as MIT, which matches this project's MIT licence. It is not GPL. The repository is <https://github.com/nick42d/youtui>, last published 7 Nov 2026. No API key or account token is committed. The crate carries the public web client key. Playback, sign-in, and the library stay behind the service trait so this client can be replaced.
+
+Transitive licences were checked from the resolved lockfile. ytmapi-rs and json-crawler are MIT. reqwest is MIT OR Apache-2.0. tokio is MIT. No dependency is GPL-only. Two crates also offer a copyleft alternative, and this project uses the permissive grant: r-efi is MIT OR Apache-2.0 OR LGPL-2.1-or-later, and self_cell is Apache-2.0 OR GPL-2.0-only.

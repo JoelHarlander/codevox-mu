@@ -12,9 +12,12 @@ publish = false
 [dependencies]
 # Current stable iced.
 iced = "0.14.0"
-
-[dev-dependencies]
-# The theme test reads design/tokens.json. Not linked into the binary.
+# Unauthenticated YouTube Music InnerTube search. The crate is MIT.
+# `rustls` avoids an OpenSSL build.
+ytmapi-rs = { version = "0.3.4", default-features = false, features = ["rustls"] }
+# The window executor is not a Tokio runtime. Search runs here, off the UI thread.
+tokio = { version = "1.52", features = ["rt-multi-thread", "time", "net"] }
+# The theme test reads design/tokens.json. Search re-reads the InnerTube body.
 serde_json = "1"
 
 # Unsigned test installers. cargo-packager 0.11.8 reads this table.

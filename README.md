@@ -15,7 +15,7 @@ Install the current stable Rust toolchain from <https://rustup.rs>. Then:
 cargo run --release
 ```
 
-The window is titled "CodeVox mU". The search box queries the in-memory Spotify and YouTube Music mocks and lists matches tagged by source, in the CodeVox style.
+The window is titled "CodeVox mU". The search box queries the in-memory Spotify mock and YouTube Music, and lists matches tagged by source, in the CodeVox style. YouTube Music search needs a network. If it fails, the Spotify rows stay and an error line is shown.
 
 ```sh
 cargo run --release -- --smoke
@@ -42,5 +42,6 @@ Windows needs the MSVC build tools. macOS needs the Xcode command line tools.
 `src/main.rs` parses the invocation.
 `src/theme.rs` is the CodeVox visual style (`design/tokens.json`).
 `src/music.rs` is the service trait, the shared track and playlist types, the mixed queue, and the mock catalogues.
+`src/youtube_music.rs` is unauthenticated YouTube Music song search.
 `src/shell.rs` is the iced window.
-A new concern gets its own module when it has real code. Playback, accounts, and the network are not in the tree yet.
+A new concern gets its own module when it has real code. Playback and accounts are not in the tree yet.

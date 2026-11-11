@@ -7,6 +7,7 @@
 mod music;
 mod shell;
 mod theme;
+mod youtube_music;
 
 use std::process::exit;
 

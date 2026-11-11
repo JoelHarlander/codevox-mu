@@ -1,8 +1,8 @@
 //! Catalogue reads shared by every music backend.
 //!
-//! Spotify and YouTube Music will implement [`MusicService`]. The mock does
-//! the same against a fixed list of tracks, so search and the queue can run
-//! with no network and no account.
+//! [`MockService`] answers from a fixed list, so search and the queue can run
+//! with no network and no account. The unauthenticated YouTube Music search
+//! backend is [`crate::youtube_music::YouTubeMusic`].
 //!
 //! The window only calls [`MusicService::search`]. Resolve, playlists, and
 //! [`Queue`] are the rest of the v1 contract, so the binary target treats
@@ -104,25 +104,33 @@ impl Queue {
 pub enum Error {
     /// No track or playlist uses this id on this service.
     NotFound,
+    /// The service could not be reached, or its reply could not be read.
+    ///
+    /// The string is a short reason safe to show in the window.
+    Unavailable(String),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::NotFound => formatter.write_str("not found on this service"),
+            Error::Unavailable(reason) => formatter.write_str(reason),
         }
     }
 }
 
 impl std::error::Error for Error {}
 
-/// Catalogue reads. Synchronous: the mock is memory, and the search box
-/// calls this on each keystroke.
+/// Catalogue reads.
+///
+/// The mock answers from memory. A backend that calls the network blocks
+/// the caller, so the window must run that call off the UI thread.
 pub trait MusicService {
-    /// Tracks whose title, artist, or album contains `query`.
+    /// Tracks that match `query`.
     ///
-    /// The match ignores case. A blank query matches nothing. Results stay
-    /// in the service's own order.
+    /// A blank query matches nothing. The mock matches title, artist, and
+    /// album, ignoring case. A network backend uses that service's own
+    /// search. Results stay in the service's own order.
     fn search(&self, query: &str) -> Result<Vec<Track>, Error>;
 
     /// The track this service would play for `id`.
@@ -157,7 +165,8 @@ where
 
 /// Spotify mock, then the YouTube Music mock.
 ///
-/// This is what the shell searches until a real backend exists.
+/// An offline catalogue. The window searches the Spotify mock and the live
+/// YouTube Music backend, not this pair.
 pub fn mock_services() -> Vec<Box<dyn MusicService>> {
     vec![
         Box::new(MockService::spotify()),
@@ -378,9 +387,8 @@ mod tests {
     use super::*;
 
     fn search_both(query: &str) -> Vec<Track> {
-        let spotify = MockService::spotify();
-        let youtube = MockService::youtube_music();
-        search_merged([&spotify, &youtube], query).expect("mock search")
+        let services = mock_services();
+        search_merged(services.iter().map(|service| service.as_ref()), query).expect("mock search")
     }
 
     #[test]
