@@ -5,6 +5,7 @@
 //! argument fails before a window exists.
 
 mod shell;
+mod theme;
 
 use std::process::exit;
 

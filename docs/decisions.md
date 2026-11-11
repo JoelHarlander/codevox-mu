@@ -26,6 +26,22 @@ Decided. The UI toolkit is [iced](https://iced.rs).
 
 Joel's words: "Go with iced".
 
-## 11 Nov 2026 — Still open
+## 11 Nov 2026 — Playback via unofficial libraries, risk accepted
 
-- The PM check-in cadence.
+Decided. Spotify has no sanctioned native-playback API. The Web API plus Connect, or the Web Playback SDK, need Premium or a browser engine, so native playback uses librespot (unofficial). YouTube Music has no public API, so search, library, and streaming use community libraries (ytmusicapi-style and yt-dlp-style extraction), which go against YouTube's terms.
+
+They may break when the services change. There is account and takedown risk. Keep each service behind a swappable backend trait so a library can be replaced. Never commit credentials. Use the Web API for Spotify metadata where it suffices. Check the licence of each chosen library for compatibility with MIT. Flag any GPL dependency, for example librespot's licence, before adopting it.
+
+Joel's words: "I think we accept the risk use libraries done by other people as mentioned."
+
+## 11 Nov 2026 — Weekly backlog check-in
+
+Decided. The weekly backlog check-in is Saturdays around 5am Sydney time.
+
+Joel's words: "Yes, set up the Monday 9am check-in", then "make it sat 5am".
+
+## 11 Nov 2026 — Visual style follows CodeVox
+
+Decided. CodeVox mU follows the CodeVox visual style. The tokens are in [design/tokens.json](../design/tokens.json). Headings are Space Mono. Body text is IBM Plex Mono.
+
+Joel's words: "I think we follow code box styling" / "Vox" (dictated, meaning CodeVox).

@@ -3,7 +3,7 @@
 //! One iced window is the whole interface today. A new concern gets its own
 //! module when it has real code.
 
-use iced::widget::{container, text};
+use iced::widget::{Space, column, container, text};
 use iced::window::{self, Settings};
 use iced::{Element, Fill, Size, Subscription, Task};
 
@@ -14,6 +14,15 @@ const LABEL: &str = "Placeholder";
 
 /// Logical pixels. Large enough that the placeholder is readable on a laptop.
 const WINDOW_SIZE: Size = Size::new(960.0, 640.0);
+
+const PANEL_PADDING: f32 = 24.0;
+const PANEL_SPACING: f32 = 14.0;
+const HEADING_SIZE: f32 = 22.0;
+const BODY_SIZE: f32 = 14.0;
+
+/// The one accent mark on the placeholder. Short, so it reads as a rule.
+const ACCENT_MARK_WIDTH: f32 = 28.0;
+const ACCENT_MARK_HEIGHT: f32 = 2.0;
 
 /// `--smoke` exits once this many frames have been drawn.
 ///
@@ -61,11 +70,18 @@ struct Shell {
 }
 
 pub fn run(mode: Mode) -> iced::Result {
-    iced::application(move || Shell::boot(mode), Shell::update, Shell::view)
+    let mut application = iced::application(move || Shell::boot(mode), Shell::update, Shell::view)
         .title(TITLE)
+        .theme(Shell::theme)
         .window(window_settings())
         .subscription(Shell::subscription)
-        .run()
+        .default_font(crate::theme::FALLBACK);
+
+    for face in crate::theme::FONTS {
+        application = application.font(face);
+    }
+
+    application.run()
 }
 
 /// Size, position, and close behaviour are product choices.
@@ -194,7 +210,35 @@ impl Shell {
         }
     }
 
-    fn view(_shell: &Self) -> Element<'_, Message> {
-        container(text(LABEL)).center(Fill).into()
+    fn theme(_shell: &Self) -> iced::Theme {
+        crate::theme::theme()
     }
+
+    fn view(_shell: &Self) -> Element<'_, Message> {
+        let heading = text(TITLE)
+            .font(crate::theme::HEADING)
+            .size(HEADING_SIZE)
+            .color(crate::theme::TEXT_PRIMARY);
+        let body = text(LABEL)
+            .font(crate::theme::BODY)
+            .size(BODY_SIZE)
+            .color(crate::theme::TEXT_SECONDARY);
+        let accent = container(
+            Space::new()
+                .width(ACCENT_MARK_WIDTH)
+                .height(ACCENT_MARK_HEIGHT),
+        )
+        .style(accent_mark);
+
+        let panel = container(column![heading, accent, body].spacing(PANEL_SPACING))
+            .padding(PANEL_PADDING)
+            .style(crate::theme::panel);
+
+        container(panel).center(Fill).into()
+    }
+}
+
+/// Solid accent. The placeholder paints this once.
+fn accent_mark(_theme: &iced::Theme) -> container::Style {
+    container::background(crate::theme::ACCENT)
 }

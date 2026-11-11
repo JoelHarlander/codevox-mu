@@ -15,7 +15,7 @@ Install the current stable Rust toolchain from <https://rustup.rs>. Then:
 cargo run --release
 ```
 
-The window is titled "CodeVox mU" and shows a placeholder label.
+The window is titled "CodeVox mU" and shows a placeholder in the CodeVox style.
 
 ```sh
 cargo run --release -- --smoke
@@ -38,5 +38,6 @@ Windows needs the MSVC build tools. macOS needs the Xcode command line tools.
 ## Layout
 
 `src/main.rs` parses the invocation.
+`src/theme.rs` is the CodeVox visual style (`design/tokens.json`).
 `src/shell.rs` is the iced window.
 A new concern gets its own module when it has real code. Playback, accounts, and the network are not in the tree yet.
