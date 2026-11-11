@@ -27,10 +27,22 @@ const ACCENT_MARK_HEIGHT: f32 = 2.0;
 /// `--smoke` exits once this many frames have been drawn.
 ///
 /// One frame proves the window presented. The extra frames prove the loop
-/// kept running. Zero would never exit.
+/// kept running. Zero would never exit. A frame that arrives after the exit
+/// request is not counted: some platforms deliver one more before the
+/// window closes.
 const SMOKE_FRAME_COUNT_LIMIT: u32 = 3;
 
 const _: () = assert!(SMOKE_FRAME_COUNT_LIMIT > 0);
+
+/// Gives up when smoke is still running this long after the process started.
+///
+/// Drawing the budget is fast. This only fires when the process never
+/// exits, including when the runtime ignores the exit request. It is
+/// armed for `--smoke` only, so a normal session is unaffected.
+const SMOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Distinct from a usage error (`2` in `main`). A hang is a failed run.
+const SMOKE_TIMEOUT_EXIT_CODE: i32 = 1;
 
 /// How the window should live.
 ///
@@ -50,6 +62,11 @@ enum Message {
 struct Shell {
     mode: Mode,
     frame_count: u32,
+    /// Set once smoke has asked the runtime to exit.
+    ///
+    /// Later frames are ignored. They are not a sign that the budget was
+    /// exceeded; the window can still be closing.
+    exit_requested: bool,
 }
 
 pub fn run(mode: Mode) -> iced::Result {
@@ -80,11 +97,69 @@ fn window_settings() -> Settings {
     }
 }
 
+/// What a smoke frame should do. Kept separate from [`Task`] so the
+/// late-frame case can be tested without a window.
+#[derive(Debug, PartialEq, Eq)]
+enum SmokeFrame {
+    Continue,
+    RequestExit,
+    Ignore,
+}
+
+/// Ends the process if smoke is still alive after [`SMOKE_TIMEOUT`].
+///
+/// The thread is detached. A normal exit returns from `main` and the
+/// process dies before this wakes up. `Run` mode must not call it.
+fn arm_smoke_timeout() {
+    std::thread::spawn(|| {
+        std::thread::sleep(SMOKE_TIMEOUT);
+        eprintln!(
+            "codevox-mu smoke: timed out after {}s without exiting",
+            SMOKE_TIMEOUT.as_secs()
+        );
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        std::process::exit(SMOKE_TIMEOUT_EXIT_CODE);
+    });
+}
+
+#[test]
+fn extra_frames_after_exit_are_ignored() {
+    let mut shell = Shell {
+        mode: Mode::Smoke,
+        frame_count: 0,
+        exit_requested: false,
+    };
+
+    for frame in 1..SMOKE_FRAME_COUNT_LIMIT {
+        assert_eq!(shell.smoke_frame(), SmokeFrame::Continue, "frame {frame}");
+        assert!(!shell.exit_requested);
+    }
+
+    // The frame that meets the budget goes through `on_frame`, which is
+    // where a late frame used to abort. Building the exit task must not
+    // leave the process.
+    let _ = shell.on_frame();
+    assert!(shell.exit_requested);
+    assert_eq!(shell.frame_count, SMOKE_FRAME_COUNT_LIMIT);
+
+    for _ in 0..4 {
+        let _ = shell.on_frame();
+    }
+
+    assert_eq!(shell.frame_count, SMOKE_FRAME_COUNT_LIMIT);
+    assert!(shell.exit_requested);
+}
+
 impl Shell {
     fn boot(mode: Mode) -> Self {
+        if mode == Mode::Smoke {
+            arm_smoke_timeout();
+        }
+
         Self {
             mode,
             frame_count: 0,
+            exit_requested: false,
         }
     }
 
@@ -98,16 +173,33 @@ impl Shell {
         // Frames are only subscribed in smoke mode. A frame in any other
         // mode means the subscription and the mode have drifted.
         assert!(matches!(self.mode, Mode::Smoke));
-        assert!(self.frame_count < SMOKE_FRAME_COUNT_LIMIT);
+
+        match self.smoke_frame() {
+            SmokeFrame::Continue | SmokeFrame::Ignore => Task::none(),
+            SmokeFrame::RequestExit => {
+                eprintln!("codevox-mu smoke: rendered {SMOKE_FRAME_COUNT_LIMIT} frames, exiting");
+                iced::exit()
+            }
+        }
+    }
+
+    /// One delivered smoke frame.
+    ///
+    /// The exit request happens once. A frame that shows up afterwards is
+    /// ignored, so a slow close cannot trip a frame-budget assertion.
+    fn smoke_frame(&mut self) -> SmokeFrame {
+        if self.exit_requested {
+            return SmokeFrame::Ignore;
+        }
 
         self.frame_count += 1;
 
         if self.frame_count < SMOKE_FRAME_COUNT_LIMIT {
-            Task::none()
+            SmokeFrame::Continue
         } else {
             assert_eq!(self.frame_count, SMOKE_FRAME_COUNT_LIMIT);
-            eprintln!("codevox-mu smoke: rendered {SMOKE_FRAME_COUNT_LIMIT} frames, exiting");
-            iced::exit()
+            self.exit_requested = true;
+            SmokeFrame::RequestExit
         }
     }
 
