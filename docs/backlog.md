@@ -6,16 +6,20 @@ Draft v1, 11 Nov 2026. Still to refine with Joel.
 
 - Choose the UI toolkit. Decided 11 Nov 2026: iced. See the decision log.
 - CI skeleton: GitHub Actions for Linux, Windows, and macOS (Apple Silicon and Intel). The smoke run opens the window. `macos-13` was retired on 4 Dec 2025, so Intel is `macos-15-intel`. Windows Arm (`aarch64-pc-windows-msvc`) is a cross-compile build only. The x64 runner cannot execute it, so that job does not smoke-test.
+- RISK. Decided 11 Nov 2026: playback via unofficial libraries, risk accepted. See [Playback via unofficial libraries, risk accepted](decisions.md#11-nov-2026--playback-via-unofficial-libraries-risk-accepted).
 
 ## Now
 
 - Agree the PM check-in cadence. Decision needed.
-- RISK, for Joel to decide. Not settled. YouTube Music has no official public playback API. In-app Spotify playback libraries such as librespot are unofficial. Respect each service's terms.
 
 ## Next
 
-- Spotify sign-in: library, playlists, and liked songs.
-- Playback in-app with Premium, or via Spotify Connect. Free accounts fall back to YouTube Music. Waits on the RISK decision.
+Each of the first four is its own small PR, in this order:
+
+- A services/backend trait plus a mock.
+- Spotify sign-in (OAuth PKCE, Web API library): library, playlists, and liked songs.
+- librespot playback spike. In-app playback; free accounts fall back to YouTube Music.
+- YouTube Music search spike.
 - YouTube Music sign-in.
 - One search across both services.
 - A mixed queue.
