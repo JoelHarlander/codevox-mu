@@ -16,3 +16,91 @@ iced = "0.14.0"
 [dev-dependencies]
 # The theme test reads design/tokens.json. Not linked into the binary.
 serde_json = "1"
+
+# Unsigned test installers. cargo-packager 0.11.8 reads this table.
+# RPM is not a packager format; cargo-generate-rpm 0.21.1 reads the table below.
+# Both versions are pinned in .github/workflows/package.yml.
+[package.metadata.packager]
+product-name = "CodeVox mU"
+identifier = "com.codevox.mu"
+category = "Music"
+homepage = "https://github.com/JoelHarlander/codevox-mu"
+license-file = "LICENSE"
+authors = ["Joel Harlander"]
+publisher = "CodeVox"
+out-dir = "target/packager"
+long-description = "Unsigned test build of the CodeVox mU desktop player."
+icons = ["assets/icon.png", "assets/icon.ico", "assets/icon.icns"]
+resources = [
+    "assets/fonts",
+    "assets/icon.png",
+    "assets/icon.ico",
+    "assets/icon.icns",
+    "LICENSE",
+]
+
+[package.metadata.packager.macos]
+# Ad-hoc signature (`codesign -s -`). No Developer ID certificate and no notarisation.
+signing-identity = "-"
+
+[package.metadata.packager.deb]
+package-name = "codevox-mu"
+section = "sound"
+priority = "optional"
+desktop-template = "packaging/codevox-mu.desktop"
+# Runtime libraries the binary dlopens. They are not in the ELF NEEDED list.
+depends = [
+    "libc6",
+    "libgcc-s1",
+    "libx11-6",
+    "libx11-xcb1",
+    "libxcb1",
+    "libxcursor1",
+    "libxi6",
+    "libxkbcommon0",
+    "libxkbcommon-x11-0",
+    "libwayland-client0",
+    "libwayland-egl1",
+    "libegl1",
+    "libvulkan1",
+]
+
+[package.metadata.packager.deb.files]
+LICENSE = "usr/share/doc/codevox-mu/LICENSE"
+
+[package.metadata.packager.appimage]
+# Keep the host Vulkan and GL loaders. A bundled driver breaks lavapipe and real GPUs.
+excluded-libraries = [
+    "libvulkan.so.1",
+    "libEGL.so.1",
+    "libGL.so.1",
+    "libGLdispatch.so.0",
+    "libGLX.so.0",
+]
+
+[package.metadata.generate-rpm]
+release = "1"
+require-sh = false
+assets = [
+    { source = "target/release/codevox-mu", dest = "/usr/bin/codevox-mu", mode = "755" },
+    { source = "assets/fonts/*", dest = "/usr/lib/codevox-mu/fonts/", mode = "644" },
+    { source = "assets/icon.png", dest = "/usr/lib/codevox-mu/icon.png", mode = "644" },
+    { source = "assets/icon.ico", dest = "/usr/lib/codevox-mu/icon.ico", mode = "644" },
+    { source = "assets/icon.icns", dest = "/usr/lib/codevox-mu/icon.icns", mode = "644" },
+    { source = "assets/icon.png", dest = "/usr/share/icons/hicolor/512x512/apps/codevox-mu.png", mode = "644" },
+    { source = "packaging/codevox-mu.desktop", dest = "/usr/share/applications/codevox-mu.desktop", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/doc/codevox-mu/LICENSE", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+"libvulkan.so.1()(64bit)" = "*"
+"libEGL.so.1()(64bit)" = "*"
+"libwayland-client.so.0()(64bit)" = "*"
+"libwayland-egl.so.1()(64bit)" = "*"
+"libxkbcommon.so.0()(64bit)" = "*"
+"libxkbcommon-x11.so.0()(64bit)" = "*"
+"libX11.so.6()(64bit)" = "*"
+"libX11-xcb.so.1()(64bit)" = "*"
+"libxcb.so.1()(64bit)" = "*"
+"libXcursor.so.1()(64bit)" = "*"
+"libXi.so.6()(64bit)" = "*"

@@ -23,6 +23,8 @@ cargo run --release -- --smoke
 
 `--smoke` draws three frames and exits 0. Any other argument is a usage error and exits 2. Continuous integration uses `--smoke` to prove the binary opens a window.
 
+Unsigned installers for Windows, macOS, and Linux are built by the Package workflow and uploaded as Actions artifacts. See [install testing](docs/install-testing.md).
+
 Linux needs the iced system libraries. On Debian or Ubuntu:
 
 ```sh

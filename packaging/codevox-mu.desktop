@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=CodeVox mU
+Comment=Spotify and YouTube Music in one native desktop player.
+Exec=codevox-mu
+Icon=codevox-mu
+Terminal=false
+Categories=AudioVideo;Audio;Music;
