@@ -57,3 +57,11 @@ Joel's words: "i'll need you to drive it I mean", then "Yes, merge green PRs you
 Decided. Unauthenticated song search uses [ytmapi-rs](https://crates.io/crates/ytmapi-rs) 0.3.4, the maintained Rust client for YouTube Music's InnerTube API. crates.io lists the licence as MIT, which matches this project's MIT licence. It is not GPL. The repository is <https://github.com/nick42d/youtui>, last published 7 Nov 2026. No API key or account token is committed. The crate carries the public web client key. Playback, sign-in, and the library stay behind the service trait so this client can be replaced.
 
 Transitive licences were checked from the resolved lockfile. ytmapi-rs and json-crawler are MIT. reqwest is MIT OR Apache-2.0. tokio is MIT. No dependency is GPL-only. Two crates also offer a copyleft alternative, and this project uses the permissive grant: r-efi is MIT OR Apache-2.0 OR LGPL-2.1-or-later, and self_cell is Apache-2.0 OR GPL-2.0-only.
+
+## 11 Nov 2026 — Spotify via librespot, YouTube Music for everyone else
+
+Decided. No Spotify developer app. Spotify sign-in and playback go through librespot (Premium required; unofficial, against Spotify's terms, can be blocked). Free users and anything else play from YouTube Music, including Spotify playlists matched to YouTube Music tracks.
+
+Joel's words: "Let's do the last 2".
+
+YouTube Music playback resolves a video id with [innertube-rs](https://crates.io/crates/innertube-rs) 0.10.1 (MIT). [rusty_ytdl](https://crates.io/crates/rusty_ytdl) 0.7.4 is MIT OR Apache-2.0, but its last release was August 2024 and its Android client URLs were rejected with HTTP 403. [rustypipe](https://crates.io/crates/rustypipe) is GPL-3.0 and is not a dependency. Audio is decoded with symphonia through [rodio](https://crates.io/crates/rodio) 0.23.0 (MIT OR Apache-2.0) and played with cpal (WASAPI, CoreAudio, ALSA). Symphonia is MPL-2.0, a file-level weak copyleft, not GPL. rodio's MIT and Apache decoders do not read the AAC in the MP4 container YouTube serves.

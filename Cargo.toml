@@ -15,10 +15,17 @@ iced = "0.14.0"
 # Unauthenticated YouTube Music InnerTube search. The crate is MIT.
 # `rustls` avoids an OpenSSL build.
 ytmapi-rs = { version = "0.3.4", default-features = false, features = ["rustls"] }
-# The window executor is not a Tokio runtime. Search runs here, off the UI thread.
+# The window executor is not a Tokio runtime. Search and stream
+# extraction run here, off the UI thread.
 tokio = { version = "1.52", features = ["rt-multi-thread", "time", "net"] }
 # The theme test reads design/tokens.json. Search re-reads the InnerTube body.
 serde_json = "1"
+# YouTube audio URLs. MIT. rustls, no OpenSSL.
+# rustypipe is GPL-3.0 and is not a dependency. See src/extract.rs.
+innertube-rs = "0.10.1"
+# Symphonia decodes. cpal plays: WASAPI, CoreAudio, and ALSA.
+# Symphonia itself is MPL-2.0. rodio is MIT OR Apache-2.0.
+rodio = { version = "0.23.0", default-features = false, features = ["playback", "mp4", "wav"] }
 
 # Unsigned test installers. cargo-packager 0.11.8 reads this table.
 # RPM is not a packager format; cargo-generate-rpm 0.21.1 reads the table below.
@@ -60,6 +67,7 @@ depends = [
     "libxcb1",
     "libxcursor1",
     "libxi6",
+    "libasound2",
     "libxkbcommon0",
     "libxkbcommon-x11-0",
     "libwayland-client0",
@@ -73,12 +81,14 @@ LICENSE = "usr/share/doc/codevox-mu/LICENSE"
 
 [package.metadata.packager.appimage]
 # Keep the host Vulkan and GL loaders. A bundled driver breaks lavapipe and real GPUs.
+# Keep the host ALSA library so PulseAudio and PipeWire plugins stay available.
 excluded-libraries = [
     "libvulkan.so.1",
     "libEGL.so.1",
     "libGL.so.1",
     "libGLdispatch.so.0",
     "libGLX.so.0",
+    "libasound.so.2",
 ]
 
 [package.metadata.generate-rpm]
@@ -107,3 +117,4 @@ assets = [
 "libxcb.so.1()(64bit)" = "*"
 "libXcursor.so.1()(64bit)" = "*"
 "libXi.so.6()(64bit)" = "*"
+"libasound.so.2()(64bit)" = "*"

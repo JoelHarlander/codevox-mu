@@ -4,7 +4,10 @@
 //! [`shell::Mode`] to the window. The shell never reads `argv`, so a bad
 //! argument fails before a window exists.
 
+mod extract;
 mod music;
+mod output;
+mod player;
 mod shell;
 mod theme;
 mod youtube_music;
