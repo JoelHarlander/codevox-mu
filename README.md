@@ -3,7 +3,7 @@
 CodeVox mU is a native desktop app that will put Spotify and YouTube Music in one player.
 One search, one mixed queue, and mixed playlists.
 It targets Windows, macOS, and Linux.
-The licence is MIT. The UI toolkit is [iced](https://iced.rs). Playback and accounts are still open.
+The licence is MIT. The UI toolkit is [iced](https://iced.rs). Accounts are still open. YouTube Music tracks play in the window.
 
 See the [decision log](docs/decisions.md) and the [backlog](docs/backlog.md).
 
@@ -15,7 +15,7 @@ Install the current stable Rust toolchain from <https://rustup.rs>. Then:
 cargo run --release
 ```
 
-The window is titled "CodeVox mU". The search box queries the in-memory Spotify mock and YouTube Music, and lists matches tagged by source, in the CodeVox style. YouTube Music search needs a network. If it fails, the Spotify rows stay and an error line is shown.
+The window is titled "CodeVox mU". The search box queries the in-memory Spotify mock and YouTube Music, and lists matches tagged by source, in the CodeVox style. YouTube Music search needs a network. If it fails, the Spotify rows stay and an error line is shown. Clicking a YouTube Music row plays it. A Spotify row is not played; the bar says Spotify playback is coming next.
 
 ```sh
 cargo run --release -- --smoke
@@ -25,10 +25,10 @@ cargo run --release -- --smoke
 
 Unsigned installers for Windows, macOS, and Linux are built by the Package workflow and uploaded as Actions artifacts. See [install testing](docs/install-testing.md).
 
-Linux needs the iced system libraries. On Debian or Ubuntu:
+Linux needs the iced system libraries and ALSA. On Debian or Ubuntu:
 
 ```sh
-sudo apt install pkg-config libxkbcommon-dev libxkbcommon-x11-dev \
+sudo apt install pkg-config libasound2-dev libxkbcommon-dev libxkbcommon-x11-dev \
   libwayland-dev libx11-dev libxcb1-dev libxcursor-dev libxi-dev \
   libxrandr-dev libfontconfig1-dev libvulkan1 mesa-vulkan-drivers
 ```
@@ -43,5 +43,8 @@ Windows needs the MSVC build tools. macOS needs the Xcode command line tools.
 `src/theme.rs` is the CodeVox visual style (`design/tokens.json`).
 `src/music.rs` is the service trait, the shared track and playlist types, the mixed queue, and the mock catalogues.
 `src/youtube_music.rs` is unauthenticated YouTube Music song search.
+`src/extract.rs` resolves a YouTube video id to an audio stream.
+`src/player.rs` is play, pause, stop, and next over the mixed queue.
+`src/output.rs` decodes with symphonia and plays through cpal.
 `src/shell.rs` is the iced window.
-A new concern gets its own module when it has real code. Playback and accounts are not in the tree yet.
+A new concern gets its own module when it has real code. Accounts are not in the tree yet.
