@@ -34,6 +34,8 @@ They may break when the services change. There is account and takedown risk. Kee
 
 Joel's words: "I think we accept the risk use libraries done by other people as mentioned."
 
-## 11 Nov 2026 — Still open
+## 11 Nov 2026 — Weekly backlog check-in
 
-- The PM check-in cadence.
+Decided. The weekly backlog check-in is Saturdays around 5am Sydney time.
+
+Joel's words: "Yes, set up the Monday 9am check-in", then "make it sat 5am".
