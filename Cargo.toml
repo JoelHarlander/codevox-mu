@@ -10,7 +10,7 @@ readme = "README.md"
 publish = false
 
 [dependencies]
-# Current stable iced. The shell is the whole program so far.
+# Current stable iced.
 iced = "0.14.0"
 
 [dev-dependencies]
