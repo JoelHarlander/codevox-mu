@@ -20,7 +20,12 @@ Decided. MIT. Text is in [LICENSE](../LICENSE).
 
 Joel's words: "Use MIT".
 
+## 11 Nov 2026 — UI toolkit
+
+Decided. The UI toolkit is [iced](https://iced.rs).
+
+Joel's words: "Go with iced".
+
 ## 11 Nov 2026 — Still open
 
-- The UI toolkit and stack choice.
 - The PM check-in cadence.

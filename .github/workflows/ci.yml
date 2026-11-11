@@ -1,0 +1,147 @@
+# Prove the binary formats, lints, builds, tests, and opens a window.
+# macos-13 was retired on 4 Dec 2025. Intel macOS is macos-15-intel.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  ci:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+          - macos-15-intel
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+          cache-on-failure: true
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxrandr-dev \
+            libfontconfig1-dev \
+            libvulkan1 \
+            mesa-vulkan-drivers \
+            xvfb
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --locked --release --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --locked --release
+
+      - name: Test
+        run: cargo test --locked --release
+
+      - name: Smoke (Linux)
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          icds=(/usr/share/vulkan/icd.d/lvp_icd*.json)
+          if (( ${#icds[@]} == 0 )); then
+            echo "codevox-mu: lavapipe ICD not found" >&2
+            ls -la /usr/share/vulkan/icd.d >&2 || true
+            exit 1
+          fi
+          export VK_DRIVER_FILES="${icds[0]}"
+          export VK_ICD_FILENAMES="${icds[0]}"
+          export WGPU_BACKEND=vulkan
+          export WGPU_ADAPTER_NAME=llvmpipe
+          unset WAYLAND_DISPLAY || true
+          echo "codevox-mu: using Vulkan ICD ${icds[0]}"
+          xvfb-run -a --server-args="-screen 0 1280x800x24" \
+            ./target/release/codevox-mu --smoke
+
+      - name: Smoke (macOS)
+        if: runner.os == 'macOS'
+        timeout-minutes: 5
+        run: ./target/release/codevox-mu --smoke
+
+      - name: Smoke (Windows)
+        if: runner.os == 'Windows'
+        timeout-minutes: 5
+        shell: pwsh
+        run: .\target\release\codevox-mu.exe --smoke
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: codevox-mu-${{ matrix.os }}
+          path: target/release/codevox-mu${{ runner.os == 'Windows' && '.exe' || '' }}
+          if-no-files-found: error
+
+  windows-arm:
+    name: windows-arm (cross-compile)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-arm
+          cache-on-failure: true
+
+      - name: Build
+        run: cargo build --locked --release --target aarch64-pc-windows-msvc
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: codevox-mu-windows-arm
+          path: target/aarch64-pc-windows-msvc/release/codevox-mu.exe
+          if-no-files-found: error
