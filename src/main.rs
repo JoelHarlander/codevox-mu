@@ -13,6 +13,7 @@ mod search;
 mod shell;
 mod spotify;
 mod theme;
+mod youtube_account;
 mod youtube_music;
 
 use std::process::exit;

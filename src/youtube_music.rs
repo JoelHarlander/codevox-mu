@@ -1,9 +1,10 @@
-//! Unauthenticated YouTube Music search.
+//! YouTube Music search, and the signed-in library.
 //!
 //! The HTTP client is [ytmapi-rs](https://crates.io/crates/ytmapi-rs) (MIT),
-//! which speaks YouTube Music's InnerTube API. This module only searches
-//! songs. Playback, sign-in, and the library stay out. No API key or account
-//! token is stored here; the crate carries the public web client key.
+//! which speaks YouTube Music's InnerTube API. Search does not need an
+//! account. The library and playlists do: [`crate::youtube_account`] stores a
+//! browser cookie and opens a signed-in client. No API key is stored here;
+//! the crate carries the public web client key.
 //!
 //! [`YouTubeMusic::search`] blocks on the network. The window runs it on a
 //! background thread. Parsing is separate, so a recorded response can be
@@ -21,6 +22,7 @@ use ytmapi_rs::query::search::{FilteredSearch, SongsFilter};
 
 use crate::music::{Error, MusicService, Playlist, Source, Track};
 use crate::player::{YoutubeMatch, match_query};
+use crate::youtube_account::{Account, LibrarySession};
 
 /// How long an error row is allowed to get. The API text can be a whole body.
 const ERROR_CHARS: usize = 160;
@@ -38,6 +40,7 @@ pub struct YouTubeMusic {
 struct Inner {
     runtime: Mutex<Option<tokio::runtime::Runtime>>,
     client: Mutex<Option<YtMusic<NoAuthToken>>>,
+    account: Account,
 }
 
 impl YouTubeMusic {
@@ -46,6 +49,7 @@ impl YouTubeMusic {
             inner: Arc::new(Inner {
                 runtime: Mutex::new(None),
                 client: Mutex::new(None),
+                account: Account::live(),
             }),
         }
     }
@@ -90,12 +94,37 @@ impl MusicService for YouTubeMusic {
     }
 
     fn playlists(&self) -> Result<Vec<Playlist>, Error> {
-        // The library needs an account. This backend does not sign in.
-        Ok(Vec::new())
+        self.inner.account.playlists()
     }
 
-    fn playlist_tracks(&self, _playlist_id: &str) -> Result<Vec<Track>, Error> {
-        Err(Error::NotFound)
+    fn playlist_tracks(&self, playlist_id: &str) -> Result<Vec<Track>, Error> {
+        self.inner.account.playlist_tracks(playlist_id)
+    }
+}
+
+impl LibrarySession for YouTubeMusic {
+    fn signed_in(&self) -> bool {
+        self.inner.account.signed_in()
+    }
+
+    fn sign_in(&self, cookie: &str) -> Result<(), Error> {
+        self.inner.account.sign_in(cookie)
+    }
+
+    fn restore(&self) -> Result<bool, Error> {
+        self.inner.account.restore()
+    }
+
+    fn sign_out(&self) -> Result<(), Error> {
+        self.inner.account.sign_out()
+    }
+
+    fn playlists(&self) -> Result<Vec<Playlist>, Error> {
+        self.inner.account.playlists()
+    }
+
+    fn playlist_tracks(&self, playlist_id: &str) -> Result<Vec<Track>, Error> {
+        self.inner.account.playlist_tracks(playlist_id)
     }
 }
 
@@ -199,7 +228,7 @@ fn artists_from_byline(byline: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_duration(text: &str) -> Result<Duration, Error> {
+pub(crate) fn parse_duration(text: &str) -> Result<Duration, Error> {
     let text = text.trim();
     let mut parts = text.split(':');
     let first = parts.next();
@@ -311,11 +340,22 @@ mod tests {
     }
 
     #[test]
-    fn resolve_and_library_are_out_of_scope() {
+    fn signed_out_library_asks_for_sign_in_and_does_not_open_a_runtime() {
         let service = YouTubeMusic::new();
         assert_eq!(service.resolve("dQw4w9WgXcQ"), Err(Error::NotFound));
-        assert!(service.playlists().expect("no library").is_empty());
-        assert_eq!(service.playlist_tracks("list"), Err(Error::NotFound));
+        assert!(!LibrarySession::signed_in(&service));
+        let playlists = LibrarySession::playlists(&service).expect_err("signed out");
+        assert!(
+            playlists.to_string().to_lowercase().contains("sign in"),
+            "{playlists}"
+        );
+        assert_eq!(
+            LibrarySession::playlist_tracks(&service, "list")
+                .expect_err("signed out")
+                .to_string(),
+            playlists.to_string()
+        );
+        assert!(service.inner.runtime.lock().expect("runtime").is_none());
     }
 
     #[test]

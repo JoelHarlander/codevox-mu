@@ -2,8 +2,9 @@
 //!
 //! One iced window is the whole interface today. Search asks Spotify and
 //! YouTube Music on background threads, then keeps one row per recording.
-//! Choosing a row asks the playback thread to play it. The window does not
-//! know how a catalogue is fetched or how a stream is decoded.
+//! Choosing a row asks the playback thread to play it. A browser cookie
+//! signs in to YouTube Music and opens that account's library. The window
+//! does not know how a catalogue is fetched or how a stream is decoded.
 
 use std::sync::Arc;
 
@@ -13,10 +14,11 @@ use iced::widget::{Space, button, column, container, row, scrollable, text, text
 use iced::window::{self, Settings};
 use iced::{Background, Border, Color, Element, Fill, Shadow, Size, Subscription, Task};
 
-use crate::music::{self, MusicService, Source, Track};
+use crate::music::{self, MusicService, Playlist, Source, Track};
 use crate::player::{self, Phase};
 use crate::search;
 use crate::spotify::{self, AccountPhase};
+use crate::youtube_account::LibrarySession;
 use crate::youtube_music::{YouTubeFallback, YouTubeMusic};
 
 /// A blocking catalogue call. The iced executor is not a Tokio runtime, so
@@ -101,11 +103,50 @@ enum Message {
         epoch: u64,
         phase: AccountPhase,
     },
+    ShowSignIn,
+    CancelSignIn,
+    CookieChanged(String),
+    SubmitCookie,
+    SignInFinished {
+        epoch: u64,
+        result: Result<bool, music::Error>,
+    },
+    SignOut,
+    SessionCleared(Result<(), music::Error>),
+    ShowLibrary,
+    LibraryReady {
+        epoch: u64,
+        result: Result<Vec<Playlist>, music::Error>,
+    },
+    OpenPlaylist {
+        id: String,
+        name: String,
+    },
+    PlaylistReady {
+        epoch: u64,
+        result: Result<Vec<Track>, music::Error>,
+    },
+    ShowSearch,
+    BackToLibrary,
     /// The window exists, so OS media controls can attach to it.
     BindMedia(window::Id),
     /// `hwnd` is the native handle on Windows. Other platforms pass `None`.
     MediaBound(Option<isize>),
     Media(crate::media_controls::MediaCommand),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum YtSign {
+    Out,
+    Busy,
+    In,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pane {
+    Search,
+    Library,
+    Playlist,
 }
 
 struct Shell {
@@ -133,9 +174,25 @@ struct Shell {
     spotify: BackgroundSearch,
     youtube: BackgroundSearch,
     sign_in: SignIn,
+    library: Arc<dyn LibrarySession>,
+    pane: Pane,
+    sign: YtSign,
+    cookie_draft: String,
+    cookie_open: bool,
+    playlists: Vec<Playlist>,
+    playlist_tracks: Vec<Track>,
+    playlist_name: String,
+    library_loading: bool,
+    /// Bumped when a YouTube Music sign-in or library fetch starts, so a
+    /// slower reply cannot overwrite a newer one. Spotify sign-in uses
+    /// `epoch` instead, so the two replies cannot cancel each other.
+    library_epoch: u64,
+    restore_started: bool,
     playback: player::Playback,
     /// A clock tick is already waiting. Keeps the 200 ms timer from stacking.
     clock_armed: bool,
+    #[cfg(test)]
+    last_play: Option<Track>,
 }
 
 pub fn run(mode: Mode) -> iced::Result {
@@ -423,6 +480,201 @@ fn smoke_play_does_not_start_the_clock() {
     let _ = Shell::view(&shell);
 }
 
+#[test]
+fn a_cookie_without_sapisid_stays_signed_out_and_hides_the_paste() {
+    let mut shell = test_shell(Mode::Run);
+    let _ = shell.update(Message::ShowSignIn);
+    assert!(shell.cookie_open);
+    shell.cookie_draft = "VISITOR=MARKER-42".into();
+    let _ = shell.update(Message::SubmitCookie);
+    let error = shell.error.clone().expect("sign-in error");
+    assert!(error.contains("SAPISID"), "{error}");
+    assert!(!error.contains("MARKER-42"), "{error}");
+    assert_eq!(shell.sign, YtSign::Out);
+    let _ = Shell::view(&shell);
+}
+
+#[test]
+fn the_library_stays_closed_until_sign_in() {
+    let mut shell = test_shell(Mode::Run);
+    let _ = shell.update(Message::ShowLibrary);
+    assert_eq!(shell.pane, Pane::Search);
+    let error = shell.error.expect("prompt");
+    assert!(error.contains("Sign in"), "{error}");
+}
+
+#[test]
+fn a_playlist_track_plays_through_the_same_message_as_search() {
+    let mut shell = test_shell(Mode::Run);
+    shell.cookie_draft = "SAPISID=test-value;".into();
+    let _ = shell.update(Message::SubmitCookie);
+    assert_eq!(shell.sign, YtSign::Busy);
+    let epoch = shell.library_epoch;
+    let _ = shell.update(Message::SignInFinished {
+        epoch,
+        result: Ok(true),
+    });
+    shell
+        .library
+        .sign_in("SAPISID=test-value;")
+        .expect("the service accepts the same cookie");
+    assert_eq!(shell.sign, YtSign::In);
+    assert!(shell.cookie_draft.is_empty());
+
+    let _ = shell.update(Message::ShowLibrary);
+    assert_eq!(shell.pane, Pane::Library);
+    let epoch = shell.library_epoch;
+    let _ = shell.update(Message::LibraryReady {
+        epoch,
+        result: Ok(vec![Playlist {
+            id: "PLnight".into(),
+            source: Source::YouTubeMusic,
+            name: "Night".into(),
+        }]),
+    });
+    assert_eq!(shell.playlists[0].name, "Night");
+
+    let _ = shell.update(Message::OpenPlaylist {
+        id: "PLnight".into(),
+        name: "Night".into(),
+    });
+    let track = Track {
+        id: "abcdefghijk".into(),
+        source: Source::YouTubeMusic,
+        title: "Night Drive".into(),
+        artists: vec!["Ada Vega".into()],
+        album: None,
+        duration: std::time::Duration::from_secs(200),
+    };
+    let epoch = shell.library_epoch;
+    let _ = shell.update(Message::PlaylistReady {
+        epoch,
+        result: Ok(vec![track.clone()]),
+    });
+    assert_eq!(shell.playlist_tracks, vec![track.clone()]);
+    assert!(matches!(play_message(&track), Message::Play(played) if played == track));
+    let _ = shell.update(play_message(&track));
+    assert_eq!(shell.last_play.as_ref(), Some(&track));
+    assert_eq!(shell.playback.phase(), Phase::Idle);
+
+    let stale = shell.library_epoch;
+    let _ = shell.update(Message::BackToLibrary);
+    assert_eq!(shell.pane, Pane::Library);
+    let _ = shell.update(Message::PlaylistReady {
+        epoch: stale,
+        result: Ok(vec![track]),
+    });
+    assert!(shell.playlist_tracks.is_empty());
+    let _ = Shell::view(&shell);
+}
+
+#[test]
+fn a_late_sign_in_does_not_undo_sign_out() {
+    let mut shell = test_shell(Mode::Run);
+    shell.cookie_draft = "SAPISID=test-value;".into();
+    let _ = shell.update(Message::SubmitCookie);
+    let epoch = shell.library_epoch;
+    let _ = shell.update(Message::SignOut);
+    let _ = shell.update(Message::SignInFinished {
+        epoch,
+        result: Ok(true),
+    });
+    assert_eq!(shell.sign, YtSign::Out);
+    assert_eq!(shell.pane, Pane::Search);
+    assert!(shell.playlists.is_empty());
+}
+
+#[cfg(test)]
+struct FakeLibrary {
+    signed_in: std::sync::Mutex<bool>,
+    playlists: Vec<Playlist>,
+    tracks: Vec<Track>,
+}
+
+#[cfg(test)]
+impl FakeLibrary {
+    fn empty() -> Self {
+        Self {
+            signed_in: std::sync::Mutex::new(false),
+            playlists: Vec::new(),
+            tracks: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl LibrarySession for FakeLibrary {
+    fn signed_in(&self) -> bool {
+        *self.signed_in.lock().expect("sign-in")
+    }
+
+    fn sign_in(&self, cookie: &str) -> Result<(), music::Error> {
+        crate::youtube_account::normalize_session_cookie(cookie)?;
+        *self.signed_in.lock().expect("sign-in") = true;
+        Ok(())
+    }
+
+    fn restore(&self) -> Result<bool, music::Error> {
+        Ok(false)
+    }
+
+    fn sign_out(&self) -> Result<(), music::Error> {
+        *self.signed_in.lock().expect("sign-in") = false;
+        Ok(())
+    }
+
+    fn playlists(&self) -> Result<Vec<Playlist>, music::Error> {
+        if self.signed_in() {
+            Ok(self.playlists.clone())
+        } else {
+            Err(music::Error::Unavailable(
+                "Sign in to YouTube Music to see your library.".into(),
+            ))
+        }
+    }
+
+    fn playlist_tracks(&self, playlist_id: &str) -> Result<Vec<Track>, music::Error> {
+        if playlist_id == "PLnight" {
+            Ok(self.tracks.clone())
+        } else {
+            Err(music::Error::NotFound)
+        }
+    }
+}
+
+/// No keyring and no network. Smoke uses this so the three frames stay offline.
+struct ClosedLibrary;
+
+impl LibrarySession for ClosedLibrary {
+    fn signed_in(&self) -> bool {
+        false
+    }
+
+    fn sign_in(&self, _cookie: &str) -> Result<(), music::Error> {
+        Err(music::Error::Unavailable(
+            "YouTube Music sign-in is not available.".into(),
+        ))
+    }
+
+    fn restore(&self) -> Result<bool, music::Error> {
+        Ok(false)
+    }
+
+    fn sign_out(&self) -> Result<(), music::Error> {
+        Ok(())
+    }
+
+    fn playlists(&self) -> Result<Vec<Playlist>, music::Error> {
+        Err(music::Error::Unavailable(
+            "Sign in to YouTube Music to see your library.".into(),
+        ))
+    }
+
+    fn playlist_tracks(&self, _playlist_id: &str) -> Result<Vec<Track>, music::Error> {
+        Err(music::Error::NotFound)
+    }
+}
+
 #[cfg(test)]
 fn test_shell(mode: Mode) -> Shell {
     let spotify = music::MockService::spotify();
@@ -433,6 +685,7 @@ fn test_shell(mode: Mode) -> Shell {
         Arc::new(move |query| spotify.search(query)),
         Arc::new(move |query| youtube.search(query)),
         Arc::new(|| AccountPhase::SignedOut),
+        Arc::new(FakeLibrary::empty()),
     )
 }
 
@@ -447,6 +700,7 @@ impl Shell {
                 Arc::new(|_| Ok(Vec::new())),
                 Arc::new(|_| Ok(Vec::new())),
                 Arc::new(|| AccountPhase::SignedOut),
+                Arc::new(ClosedLibrary),
             );
             return (shell, Task::none());
         }
@@ -456,6 +710,7 @@ impl Shell {
         let sign_account = account.clone();
         let play_account = account.clone();
         let youtube = YouTubeMusic::new();
+        let library: Arc<dyn LibrarySession> = Arc::new(youtube.clone());
         let mut shell = Self::with_services(
             mode,
             Arc::new(move |query| {
@@ -463,6 +718,7 @@ impl Shell {
             }),
             Arc::new(move |query| youtube.search(query)),
             Arc::new(move || sign_account.sign_in()),
+            library,
         );
         shell.playback = player::Playback::start(
             Box::new(spotify::LibrespotEngine::new(play_account)),
@@ -480,6 +736,7 @@ impl Shell {
         spotify: BackgroundSearch,
         youtube: BackgroundSearch,
         sign_in: SignIn,
+        library: Arc<dyn LibrarySession>,
     ) -> Self {
         Self {
             mode,
@@ -499,8 +756,21 @@ impl Shell {
             spotify,
             youtube,
             sign_in,
+            library,
+            pane: Pane::Search,
+            sign: YtSign::Out,
+            cookie_draft: String::new(),
+            cookie_open: false,
+            playlists: Vec::new(),
+            playlist_tracks: Vec::new(),
+            playlist_name: String::new(),
+            library_loading: false,
+            library_epoch: 0,
+            restore_started: false,
             playback: player::Playback::dormant(),
             clock_armed: false,
+            #[cfg(test)]
+            last_play: None,
         }
     }
 
@@ -524,6 +794,10 @@ impl Shell {
                 Task::none()
             }
             Message::Play(track) => {
+                #[cfg(test)]
+                {
+                    self.last_play = Some(track.clone());
+                }
                 self.playback.play_now(track);
                 self.arm_clock()
             }
@@ -544,9 +818,59 @@ impl Shell {
                 self.arm_clock()
             }
             Message::Tick => self.on_tick(),
-            Message::BindMedia(id) => {
-                crate::media_controls::read_handle(id).map(Message::MediaBound)
+            Message::ShowSignIn => {
+                self.cookie_open = true;
+                self.error = None;
+                Task::none()
             }
+            Message::CancelSignIn => {
+                self.cookie_open = false;
+                self.cookie_draft.clear();
+                Task::none()
+            }
+            Message::CookieChanged(cookie) => {
+                self.cookie_draft = cookie;
+                Task::none()
+            }
+            Message::SubmitCookie => self.submit_cookie(),
+            Message::SignInFinished { epoch, result } => {
+                self.finish_sign_in(epoch, result);
+                Task::none()
+            }
+            Message::SignOut => self.sign_out(),
+            Message::SessionCleared(Err(error)) => {
+                self.error = Some(format!("YouTube Music sign-out failed: {error}"));
+                Task::none()
+            }
+            Message::SessionCleared(Ok(())) => Task::none(),
+            Message::ShowLibrary => self.show_library(),
+            Message::LibraryReady { epoch, result } => {
+                self.finish_library(epoch, result);
+                Task::none()
+            }
+            Message::OpenPlaylist { id, name } => self.open_playlist(id, name),
+            Message::PlaylistReady { epoch, result } => {
+                self.finish_playlist(epoch, result);
+                Task::none()
+            }
+            Message::ShowSearch => {
+                self.library_epoch = self.library_epoch.wrapping_add(1);
+                self.back_to_search();
+                Task::none()
+            }
+            Message::BackToLibrary => {
+                self.library_epoch = self.library_epoch.wrapping_add(1);
+                self.pane = Pane::Library;
+                self.playlist_tracks.clear();
+                self.playlist_name.clear();
+                self.library_loading = false;
+                self.error = None;
+                Task::none()
+            }
+            Message::BindMedia(id) => Task::batch([
+                crate::media_controls::read_handle(id).map(Message::MediaBound),
+                self.restore_saved_sign_in(),
+            ]),
             Message::MediaBound(hwnd) => {
                 crate::media_controls::attach(hwnd);
                 Task::none()
@@ -580,6 +904,185 @@ impl Shell {
             Phase::Loading | Phase::Playing => self.arm_clock(),
             Phase::Idle | Phase::Paused | Phase::Stopped => Task::none(),
         }
+    }
+
+    fn submit_cookie(&mut self) -> Task<Message> {
+        if let Err(error) = crate::youtube_account::normalize_session_cookie(&self.cookie_draft) {
+            self.sign = YtSign::Out;
+            self.error = Some(format!("YouTube Music sign-in failed: {error}"));
+            return Task::none();
+        }
+        self.sign = YtSign::Busy;
+        self.error = None;
+        self.library_epoch = self.library_epoch.wrapping_add(1);
+        let epoch = self.library_epoch;
+        let library = Arc::clone(&self.library);
+        let cookie = self.cookie_draft.clone();
+        self.off_ui(
+            "youtube-music-sign-in",
+            move || library.sign_in(&cookie).map(|()| true),
+            move |result| Message::SignInFinished { epoch, result },
+        )
+    }
+
+    fn finish_sign_in(&mut self, epoch: u64, result: Result<bool, music::Error>) {
+        if epoch != self.library_epoch {
+            return;
+        }
+        match result {
+            Ok(true) => {
+                self.sign = YtSign::In;
+                self.cookie_draft.clear();
+                self.cookie_open = false;
+                self.error = None;
+            }
+            Ok(false) => {
+                if self.sign == YtSign::Busy {
+                    self.sign = YtSign::Out;
+                }
+            }
+            Err(error) => {
+                self.sign = YtSign::Out;
+                self.cookie_open = true;
+                self.error = Some(format!("YouTube Music sign-in failed: {error}"));
+            }
+        }
+    }
+
+    fn sign_out(&mut self) -> Task<Message> {
+        self.library_epoch = self.library_epoch.wrapping_add(1);
+        self.sign = YtSign::Out;
+        self.back_to_search();
+        self.cookie_draft.clear();
+        self.cookie_open = false;
+        let library = Arc::clone(&self.library);
+        self.off_ui(
+            "youtube-music-sign-out",
+            move || library.sign_out(),
+            Message::SessionCleared,
+        )
+    }
+
+    fn show_library(&mut self) -> Task<Message> {
+        if self.sign != YtSign::In || !self.library.signed_in() {
+            self.sign = YtSign::Out;
+            self.error = Some("Sign in to YouTube Music to see your library.".to_string());
+            return Task::none();
+        }
+        self.pane = Pane::Library;
+        self.library_loading = true;
+        self.error = None;
+        self.library_epoch = self.library_epoch.wrapping_add(1);
+        let epoch = self.library_epoch;
+        let library = Arc::clone(&self.library);
+        self.off_ui(
+            "youtube-music-library",
+            move || library.playlists(),
+            move |result| Message::LibraryReady { epoch, result },
+        )
+    }
+
+    fn finish_library(&mut self, epoch: u64, result: Result<Vec<Playlist>, music::Error>) {
+        if epoch != self.library_epoch || self.pane != Pane::Library {
+            return;
+        }
+        self.library_loading = false;
+        match result {
+            Ok(playlists) => {
+                self.playlists = playlists;
+                self.error = None;
+            }
+            Err(error) => {
+                self.playlists.clear();
+                self.error = Some(format!("YouTube Music library failed: {error}"));
+            }
+        }
+    }
+
+    fn open_playlist(&mut self, id: String, name: String) -> Task<Message> {
+        self.pane = Pane::Playlist;
+        self.playlist_name = name;
+        self.playlist_tracks.clear();
+        self.library_loading = true;
+        self.error = None;
+        self.library_epoch = self.library_epoch.wrapping_add(1);
+        let epoch = self.library_epoch;
+        let library = Arc::clone(&self.library);
+        self.off_ui(
+            "youtube-music-playlist",
+            move || library.playlist_tracks(&id),
+            move |result| Message::PlaylistReady { epoch, result },
+        )
+    }
+
+    fn finish_playlist(&mut self, epoch: u64, result: Result<Vec<Track>, music::Error>) {
+        if epoch != self.library_epoch || self.pane != Pane::Playlist {
+            return;
+        }
+        self.library_loading = false;
+        match result {
+            Ok(tracks) => {
+                self.playlist_tracks = tracks;
+                self.error = None;
+            }
+            Err(error) => {
+                self.playlist_tracks.clear();
+                self.error = Some(format!("YouTube Music playlist failed: {error}"));
+            }
+        }
+    }
+
+    fn back_to_search(&mut self) {
+        self.pane = Pane::Search;
+        self.playlists.clear();
+        self.playlist_tracks.clear();
+        self.playlist_name.clear();
+        self.library_loading = false;
+    }
+
+    fn restore_saved_sign_in(&mut self) -> Task<Message> {
+        if self.mode != Mode::Run || self.restore_started {
+            return Task::none();
+        }
+        self.restore_started = true;
+        self.library_epoch = self.library_epoch.wrapping_add(1);
+        let epoch = self.library_epoch;
+        let library = Arc::clone(&self.library);
+        self.off_ui(
+            "youtube-music-restore",
+            move || library.restore(),
+            move |result| Message::SignInFinished { epoch, result },
+        )
+    }
+
+    fn off_ui<T, F, M>(&self, thread_name: &'static str, work: F, message: M) -> Task<Message>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, music::Error> + Send + 'static,
+        M: FnOnce(Result<T, music::Error>) -> Message + Send + 'static,
+    {
+        Task::perform(
+            async move {
+                let (sender, receiver) = oneshot::channel();
+                let started =
+                    std::thread::Builder::new()
+                        .name(thread_name.into())
+                        .spawn(move || {
+                            let _ = sender.send(work());
+                        });
+                if let Err(error) = started {
+                    return Err(music::Error::Unavailable(format!(
+                        "could not start the YouTube Music thread: {error}"
+                    )));
+                }
+                receiver.await.unwrap_or_else(|_| {
+                    Err(music::Error::Unavailable(
+                        "the YouTube Music thread stopped before it replied".into(),
+                    ))
+                })
+            },
+            message,
+        )
     }
 
     fn set_query(&mut self, query: String) -> Task<Message> {
@@ -745,17 +1248,35 @@ impl Shell {
             .font(crate::theme::BODY)
             .style(search_field);
 
-        let results = column(shell.results.iter().map(result_row))
-            .spacing(RESULT_SPACING)
-            .width(Fill);
-        let mut content =
-            column![heading, accent, account_row(shell), input].spacing(PANEL_SPACING);
+        let list = match shell.pane {
+            Pane::Search => column(shell.results.iter().map(result_row)),
+            Pane::Library => column(shell.playlists.iter().map(playlist_row)),
+            Pane::Playlist => column(shell.playlist_tracks.iter().map(library_track_row)),
+        }
+        .spacing(RESULT_SPACING)
+        .width(Fill);
+        let mut content = column![heading, accent, account_row(shell), account_controls(shell)]
+            .spacing(PANEL_SPACING);
+        if shell.pane == Pane::Search {
+            content = content.push(input);
+        }
+        if shell.cookie_open && shell.sign == YtSign::Out {
+            content = content.push(cookie_form(shell));
+        }
+        if shell.pane == Pane::Playlist && !shell.playlist_name.is_empty() {
+            content = content.push(
+                text(&shell.playlist_name)
+                    .font(crate::theme::BODY)
+                    .size(BODY_SIZE)
+                    .color(crate::theme::TEXT_PRIMARY),
+            );
+        }
         if let Some(status) = status_line(shell) {
             content = content.push(status);
         }
 
         let content = content
-            .push(scrollable(results).width(Fill).height(Fill))
+            .push(scrollable(list).width(Fill).height(Fill))
             .push(now_playing(shell))
             .width(Fill)
             .height(Fill);
@@ -807,9 +1328,27 @@ fn status_line(shell: &Shell) -> Option<Element<'_, Message>> {
         lines.push(status_text(error, crate::theme::DESTRUCTIVE));
     }
 
-    let settled = !shell.spotify_pending && !shell.youtube_pending;
-    if lines.is_empty() && settled && !shell.query.trim().is_empty() && shell.results.is_empty() {
-        lines.push(status_text("No matches", crate::theme::TEXT_SECONDARY));
+    if lines.is_empty() {
+        let note = match shell.pane {
+            Pane::Search
+                if !shell.spotify_pending
+                    && !shell.youtube_pending
+                    && !shell.query.trim().is_empty()
+                    && shell.results.is_empty() =>
+            {
+                Some("No matches")
+            }
+            Pane::Library if !shell.library_loading && shell.playlists.is_empty() => {
+                Some("No playlists")
+            }
+            Pane::Playlist if !shell.library_loading && shell.playlist_tracks.is_empty() => {
+                Some("This playlist is empty.")
+            }
+            _ => None,
+        };
+        if let Some(note) = note {
+            lines.push(status_text(note, crate::theme::TEXT_SECONDARY));
+        }
     }
 
     match lines.len() {
@@ -817,6 +1356,57 @@ fn status_line(shell: &Shell) -> Option<Element<'_, Message>> {
         1 => lines.pop(),
         _ => Some(column(lines).spacing(4).into()),
     }
+}
+
+fn account_controls(shell: &Shell) -> Element<'_, Message> {
+    let controls = match (shell.pane, shell.sign, shell.cookie_open) {
+        (Pane::Search, YtSign::In, _) => row![
+            transport_button("Library", Some(Message::ShowLibrary), true),
+            transport_button("Sign out", Some(Message::SignOut), false),
+        ],
+        (Pane::Search, YtSign::Busy, _) => {
+            return text("Signing in to YouTube Music…")
+                .font(crate::theme::BODY)
+                .size(META_SIZE)
+                .color(crate::theme::TEXT_SECONDARY)
+                .into();
+        }
+        (Pane::Search, YtSign::Out, false) => {
+            row![transport_button("Sign in", Some(Message::ShowSignIn), true)]
+        }
+        (Pane::Library, _, _) => row![
+            transport_button("Back", Some(Message::ShowSearch), false),
+            transport_button("Sign out", Some(Message::SignOut), false),
+        ],
+        (Pane::Playlist, _, _) => row![
+            transport_button("Back", Some(Message::BackToLibrary), false),
+            transport_button("Sign out", Some(Message::SignOut), false),
+        ],
+        (Pane::Search, YtSign::Out, true) => row![],
+    };
+    controls.spacing(8).into()
+}
+
+fn cookie_form(shell: &Shell) -> Element<'_, Message> {
+    let help = text(
+        "Copy the Cookie header from music.youtube.com while you are signed in. It has to include SAPISID.",
+    )
+    .font(crate::theme::BODY)
+    .size(META_SIZE)
+    .color(crate::theme::TEXT_SECONDARY);
+    let input = text_input("Cookie header", &shell.cookie_draft)
+        .on_input(Message::CookieChanged)
+        .secure(true)
+        .padding([10.0, 12.0])
+        .size(BODY_SIZE)
+        .font(crate::theme::BODY)
+        .style(search_field);
+    let buttons = row![
+        transport_button("Continue", Some(Message::SubmitCookie), true),
+        transport_button("Cancel", Some(Message::CancelSignIn), false),
+    ]
+    .spacing(8);
+    column![help, input, buttons].spacing(8).into()
 }
 
 fn status_text(label: impl Into<String>, color: iced::Color) -> Element<'static, Message> {
@@ -887,14 +1477,42 @@ async fn account_task(
     })
 }
 
+fn play_message(track: &Track) -> Message {
+    Message::Play(track.clone())
+}
+
 fn result_row(row: &search::SearchRow) -> Element<'_, Message> {
-    let play = Message::Play(row.track.clone());
-    button(result_body(&row.track))
-        .on_press(play)
+    track_button(&row.track)
+}
+
+fn library_track_row(track: &Track) -> Element<'_, Message> {
+    track_button(track)
+}
+
+fn track_button(track: &Track) -> Element<'_, Message> {
+    button(result_body(track))
+        .on_press(play_message(track))
         .width(Fill)
         .padding([6.0, 0.0])
         .style(result_button)
         .into()
+}
+
+fn playlist_row(playlist: &Playlist) -> Element<'_, Message> {
+    button(
+        text(&playlist.name)
+            .font(crate::theme::BODY)
+            .size(BODY_SIZE)
+            .color(crate::theme::TEXT_PRIMARY),
+    )
+    .on_press(Message::OpenPlaylist {
+        id: playlist.id.clone(),
+        name: playlist.name.clone(),
+    })
+    .width(Fill)
+    .padding([6.0, 0.0])
+    .style(result_button)
+    .into()
 }
 
 fn result_body(track: &Track) -> Element<'_, Message> {

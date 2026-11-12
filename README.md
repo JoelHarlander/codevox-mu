@@ -3,7 +3,7 @@
 CodeVox mU is a native desktop app that will put Spotify and YouTube Music in one player.
 One search, one mixed queue, and mixed playlists.
 It targets Windows, macOS, and Linux.
-The licence is MIT. The UI toolkit is [iced](https://iced.rs). YouTube Music tracks play in the window. Spotify sign-in uses librespot. Premium accounts play Spotify in the window. Other accounts play the matching YouTube Music track.
+The licence is MIT. The UI toolkit is [iced](https://iced.rs). YouTube Music tracks play in the window. Signing in with a browser cookie shows that account's library and playlists. Spotify sign-in uses librespot. Premium accounts play Spotify in the window. Other accounts play the matching YouTube Music track.
 
 See the [decision log](docs/decisions.md) and the [backlog](docs/backlog.md).
 
@@ -16,6 +16,8 @@ cargo run --release
 ```
 
 The window is titled "CodeVox mU". Sign in to Spotify from the control under the title. The browser login uses Spotify's desktop client. The refresh token is stored in the OS cache directory for CodeVox mU, not in this repo. Search asks YouTube Music, and Spotify once you are signed in, and lists one row per recording, tagged by source, in the CodeVox style. Both searches need a network. If one fails, the other rows stay and an error line is shown. A Premium account plays a Spotify row in the window. A free account, or a failed sign-in, plays the YouTube Music match for that title and artist. The bar says so.
+
+Sign in to YouTube Music from the button under the title. Paste the Cookie header from music.youtube.com while that browser is signed in. The header has to include SAPISID. The cookie is stored in the OS keyring, or in the per-user config directory when the keyring is unavailable. The library lists playlists, with Liked songs first. Opening a playlist and clicking a track plays it the same way a search hit does. Sign out forgets the cookie. Search itself does not need an account.
 
 ```sh
 cargo run --release -- --smoke
@@ -44,10 +46,11 @@ Windows needs the MSVC build tools. macOS needs the Xcode command line tools.
 `src/music.rs` is the service trait, the shared track and playlist types, the mixed queue, and the mock catalogues.
 `src/search.rs` merges per-service search hits into one list and collapses the same recording.
 `src/youtube_music.rs` is unauthenticated YouTube Music song search, and the Spotify fallback match.
+`src/youtube_account.rs` signs in with a browser cookie and reads the library and playlists.
 `src/spotify.rs` is Spotify sign-in, search, and librespot playback.
 `src/extract.rs` resolves a YouTube video id to an audio stream.
 `src/player.rs` is play, pause, stop, next, and previous over the mixed queue.
 `src/output.rs` decodes with symphonia and plays through cpal.
 `src/media_controls.rs` is OS media keys and the system now-playing overlay.
 `src/shell.rs` is the iced window.
-A new concern gets its own module when it has real code. YouTube Music sign-in is not in the tree yet.
+A new concern gets its own module when it has real code.
