@@ -1,11 +1,19 @@
 //! Spotify sign-in and playback through librespot.
 //!
-//! Sign-in is the OAuth authorisation-code flow with PKCE from
-//! [librespot-oauth](https://crates.io/crates/librespot-oauth) (MIT), using the
-//! desktop client id librespot already ships. There is no Spotify developer
-//! app and no client secret. The refresh token and librespot's reusable
-//! credentials are written under the OS cache directory, mode `0600` where
-//! the platform has modes. They are never written into the repo.
+//! Web API calls and the PKCE sign-in use CodeVox mU's own client id
+//! ([`web_client_id`]). It is a public PKCE client. There is no client secret.
+//! The desktop id librespot ships is shared by every librespot app, and Spotify
+//! rate-limits that id for Web API calls.
+//!
+//! librespot 0.8 only completes its client-token and login5 steps for an
+//! official Spotify client id. An access token minted for this app's client is
+//! rejected, so playback is a second PKCE login with [`desktop_client_id`].
+//! Premium sign-in opens the browser twice. A free account never starts that
+//! second login.
+//!
+//! Both refresh tokens, and librespot's reusable credentials, are written under
+//! the OS cache directory, mode `0600` where the platform has modes. They are
+//! never written into the repo.
 //!
 //! Playback uses [librespot-playback](https://crates.io/crates/librespot-playback)
 //! (MIT). Its rodio backend links an older `alsa-sys` than the YouTube player,
@@ -19,7 +27,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use librespot_core::authentication::Credentials;
 use librespot_core::cache::Cache;
@@ -40,16 +48,41 @@ use crate::player::{SpotifyEngine, SpotifyFeed};
 /// How long an error row is allowed to get.
 const ERROR_CHARS: usize = 160;
 
-/// Local callback librespot's desktop client id accepts.
+/// Local callback. Registered for CodeVox mU's Spotify app, and accepted by
+/// librespot's desktop client id. The two logins run one after the other, so
+/// they share the port.
 const REDIRECT_URI: &str = "http://127.0.0.1:8898/login";
 
-/// Shown in the browser tab after Spotify redirects back.
+/// Shown in the browser tab after the Web API redirect.
 const BROWSER_MESSAGE: &str = "Signed in. You can close this tab and return to CodeVox mU.";
 
-/// Scopes the desktop client id is asked for. Playback needs `streaming`.
-/// The profile call needs `user-read-private` (name and Premium) and
-/// `user-read-email` as a name fallback.
-const SCOPES: &[&str] = &["streaming", "user-read-private", "user-read-email"];
+/// Shown after the playback redirect. Premium sign-in opens the browser again
+/// for Spotify's desktop client id.
+const PLAYBACK_BROWSER_MESSAGE: &str =
+    "Playback is signed in. You can close this tab and return to CodeVox mU.";
+
+/// Scopes for the Web API sign-in. The library reads are included so the
+/// account is asked once. `streaming` stays on this consent as well.
+const SCOPES: &[&str] = &[
+    "streaming",
+    "user-read-private",
+    "user-read-email",
+    "user-library-read",
+    "playlist-read-private",
+    "playlist-read-collaborative",
+];
+
+/// The desktop login only mints the token librespot's session accepts.
+const PLAYBACK_SCOPES: &[&str] = &["streaming"];
+
+/// CodeVox mU's public PKCE client. Not a secret, and there is no client secret.
+const DEFAULT_WEB_CLIENT_ID: &str = "34edc1e59dcb447db61ea7720733cbde";
+
+/// Process environment that overrides the compiled client id.
+const RUNTIME_CLIENT_ID_ENV: &str = "CODEVOX_MU_SPOTIFY_CLIENT_ID";
+
+/// One 429 is retried only when Spotify's requested wait fits in this long.
+const RATE_LIMIT_RETRY_CAP: Duration = Duration::from_secs(10);
 
 const PROFILE_URL: &str = "https://api.spotify.com/v1/me";
 const SEARCH_URL: &str = "https://api.spotify.com/v1/search";
@@ -135,10 +168,43 @@ fn account_name(name: &str) -> &str {
 
 /// Spotify's desktop client id, as librespot selects it for this operating system.
 ///
-/// This is a public client id, not a secret. The PKCE flow does not use a
-/// client secret.
+/// Playback uses this id. librespot 0.8's client-token and login5 calls fail
+/// with an invalid-credential error for any other id, including a token from
+/// [`web_client_id`]. This value is public, not a secret.
 pub fn desktop_client_id() -> String {
     SessionConfig::default().client_id
+}
+
+/// Client id for PKCE sign-in and every Web API request.
+///
+/// A non-empty [`RUNTIME_CLIENT_ID_ENV`] wins, then the id compiled from
+/// `SPOTIFY_CLIENT_ID`, then [`DEFAULT_WEB_CLIENT_ID`].
+pub fn web_client_id() -> String {
+    resolve_client_id(
+        std::env::var(RUNTIME_CLIENT_ID_ENV).ok().as_deref(),
+        option_env!("SPOTIFY_CLIENT_ID"),
+    )
+}
+
+/// Resolution order for [`web_client_id`]. Blank values are skipped.
+fn resolve_client_id(runtime: Option<&str>, compiled: Option<&str>) -> String {
+    [runtime, compiled]
+        .into_iter()
+        .find_map(|value| {
+            let value = value?.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        })
+        .unwrap_or_else(|| DEFAULT_WEB_CLIENT_ID.to_string())
+}
+
+/// librespot session for playback. The client id stays the desktop id even
+/// when the Web API token belongs to [`web_client_id`].
+fn playback_session_config(device_id: &str) -> SessionConfig {
+    SessionConfig {
+        device_id: device_id.to_string(),
+        client_id: desktop_client_id(),
+        ..SessionConfig::default()
+    }
 }
 
 /// `true` only for a Premium product string from `/v1/me`.
@@ -267,9 +333,125 @@ fn api_error_message(value: &serde_json::Value) -> Option<String> {
         .pointer("/error/status")
         .and_then(serde_json::Value::as_u64);
     Some(match status {
+        Some(429) => rate_limit_message(None),
         Some(status) => format!("Spotify replied {status}: {message}"),
         None => format!("Spotify replied: {message}"),
     })
+}
+
+/// What to do with one HTTP 429. `already_retried` stops a second wait.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RateLimitChoice {
+    /// Sleep this long, then send the request once more.
+    RetryAfter(Duration),
+    /// Show this sentence. It does not include the status code.
+    GiveUp(String),
+}
+
+fn rate_limit_choice(
+    retry_after: Option<&str>,
+    now: SystemTime,
+    already_retried: bool,
+) -> RateLimitChoice {
+    let delay = retry_after.and_then(|value| parse_retry_after(value, now));
+    if !already_retried && let Some(delay) = delay.filter(|delay| *delay <= RATE_LIMIT_RETRY_CAP) {
+        return RateLimitChoice::RetryAfter(delay);
+    }
+    RateLimitChoice::GiveUp(rate_limit_message(delay))
+}
+
+/// `Retry-After` as a delay from `now`. Delta-seconds, or an IMF-fixdate.
+/// Anything else is `None`, and the caller does not guess a wait.
+fn parse_retry_after(header: &str, now: SystemTime) -> Option<Duration> {
+    let header = header.trim();
+    if header.is_empty() {
+        return None;
+    }
+    if header.bytes().all(|byte| byte.is_ascii_digit()) {
+        let seconds: u64 = header.parse().ok()?;
+        return Some(Duration::from_secs(seconds));
+    }
+    let when = http_date(header)?;
+    Some(when.duration_since(now).unwrap_or(Duration::ZERO))
+}
+
+fn rate_limit_message(wait: Option<Duration>) -> String {
+    match wait {
+        Some(wait) if wait > RATE_LIMIT_RETRY_CAP => format!(
+            "Spotify is limiting requests. Try again in {}.",
+            wait_phrase(wait)
+        ),
+        _ => "Spotify is limiting requests. Wait a moment and try again.".to_string(),
+    }
+}
+
+fn wait_phrase(wait: Duration) -> String {
+    let seconds = wait.as_secs().max(1);
+    if seconds < 60 {
+        let unit = if seconds == 1 { "second" } else { "seconds" };
+        return format!("{seconds} {unit}");
+    }
+    let minutes = seconds.div_ceil(60);
+    let unit = if minutes == 1 { "minute" } else { "minutes" };
+    format!("{minutes} {unit}")
+}
+
+/// IMF-fixdate, the HTTP-date form Spotify sends (`Sun, 06 Nov 1994 08:49:37 GMT`).
+fn http_date(value: &str) -> Option<SystemTime> {
+    let mut parts = value.split_whitespace();
+    let _weekday = parts.next()?;
+    let day: u32 = parts.next()?.parse().ok()?;
+    let month = month_number(parts.next()?)?;
+    let year: i32 = parts.next()?.parse().ok()?;
+    let time = parts.next()?;
+    let mut clock = time.split(':');
+    let hour: u32 = clock.next()?.parse().ok()?;
+    let minute: u32 = clock.next()?.parse().ok()?;
+    let second: u32 = clock.next()?.parse().ok()?;
+    if clock.next().is_some() {
+        return None;
+    }
+    let zone = parts.next()?;
+    if !zone.eq_ignore_ascii_case("GMT") || parts.next().is_some() {
+        return None;
+    }
+    if day == 0 || day > 31 || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    let unix = days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second);
+    let unix = u64::try_from(unix).ok()?;
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(unix))
+}
+
+fn month_number(name: &str) -> Option<u32> {
+    Some(match name {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    })
+}
+
+/// Days since the civil epoch, Howard Hinnant's public-domain algorithm.
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = (year - era * 400) as u64;
+    let shifted = month + if month > 2 { 0 } else { 12 };
+    let day_of_year = (153 * (shifted - 3) + 2) / 5 + day - 1;
+    let day_of_era =
+        year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + u64::from(day_of_year);
+    i64::from(era) * 146_097 + day_of_era as i64 - 719_468
 }
 
 fn text_field(value: &serde_json::Value, key: &str) -> String {
@@ -353,7 +535,11 @@ struct SavedAccount {
     device_id: String,
     display_name: String,
     product: String,
+    /// Web API refresh token, minted for [`web_client_id`].
     refresh_token: String,
+    /// Playback refresh token, minted for [`desktop_client_id`]. Empty when
+    /// the account is not Premium.
+    playback_refresh_token: String,
 }
 
 impl std::fmt::Debug for SavedAccount {
@@ -364,6 +550,7 @@ impl std::fmt::Debug for SavedAccount {
             .field("display_name", &self.display_name)
             .field("product", &self.product)
             .field("refresh_token", &"[redacted]")
+            .field("playback_refresh_token", &"[redacted]")
             .finish()
     }
 }
@@ -380,6 +567,7 @@ fn read_saved(path: &Path) -> Option<SavedAccount> {
         display_name: text_field(&value, "display_name"),
         product: text_field(&value, "product"),
         refresh_token,
+        playback_refresh_token: text_field(&value, "playback_refresh_token"),
     })
 }
 
@@ -392,6 +580,7 @@ fn write_saved(path: &Path, saved: &SavedAccount) -> Result<(), String> {
         "display_name": saved.display_name,
         "product": saved.product,
         "refresh_token": saved.refresh_token,
+        "playback_refresh_token": saved.playback_refresh_token,
     });
     let text = serde_json::to_string(&body).map_err(|error| error.to_string())?;
     write_private(path, text.as_bytes())
@@ -539,12 +728,19 @@ impl SpotifyAccount {
         if !self.still(epoch) {
             return self.current_phase();
         }
-        self.finish_login(epoch, &saved.refresh_token, &saved.device_id, true)
+        self.finish_login(
+            epoch,
+            &saved.refresh_token,
+            &saved.playback_refresh_token,
+            &saved.device_id,
+            true,
+        )
     }
 
-    /// Browser sign-in. Blocks until the redirect arrives or the flow fails.
-    /// Check the cache directory first so a failed save does not follow a
-    /// completed login.
+    /// Browser sign-in for the Web API. A Premium account then approves
+    /// playback with Spotify's desktop client. Blocks until the redirect
+    /// arrives or the flow fails. Check the cache directory first so a failed
+    /// save does not follow a completed login.
     pub fn sign_in(&self) -> AccountPhase {
         if cache_dir().is_none() {
             return AccountPhase::Failed {
@@ -552,17 +748,16 @@ impl SpotifyAccount {
             };
         }
         let epoch = self.bump_epoch();
-        let client =
-            match OAuthClientBuilder::new(&desktop_client_id(), REDIRECT_URI, SCOPES.to_vec())
-                .open_in_browser()
-                .with_custom_message(BROWSER_MESSAGE)
-                .build()
-            {
-                Ok(client) => client,
-                Err(error) => {
-                    return self.fail(epoch, scrub(&error.to_string(), &[]));
-                }
-            };
+        let client = match OAuthClientBuilder::new(&web_client_id(), REDIRECT_URI, SCOPES.to_vec())
+            .open_in_browser()
+            .with_custom_message(BROWSER_MESSAGE)
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                return self.fail(epoch, scrub(&error.to_string(), &[]));
+            }
+        };
         let token = match client.get_access_token() {
             Ok(token) => token,
             Err(error) => {
@@ -572,7 +767,7 @@ impl SpotifyAccount {
         if !self.still(epoch) {
             return self.current_phase();
         }
-        self.finish_login(epoch, &token.refresh_token, "", false)
+        self.finish_login(epoch, &token.refresh_token, "", "", false)
     }
 
     pub fn can_play(&self) -> bool {
@@ -588,6 +783,7 @@ impl SpotifyAccount {
         &self,
         epoch: u64,
         refresh_token: &str,
+        playback_refresh_token: &str,
         device_id: &str,
         prefer_saved_credentials: bool,
     ) -> AccountPhase {
@@ -598,7 +794,14 @@ impl SpotifyAccount {
         let refreshed = match client.refresh_token(refresh_token) {
             Ok(token) => token,
             Err(error) => {
-                return self.fail(epoch, scrub(&error.to_string(), &[refresh_token]));
+                // A token saved before the Web API client changed cannot be
+                // refreshed. Ask for a new sign-in instead of the raw reply.
+                let message = if prefer_saved_credentials {
+                    "Spotify sign-in needs to be renewed.".to_string()
+                } else {
+                    scrub(&error.to_string(), &[refresh_token])
+                };
+                return self.fail(epoch, message);
             }
         };
         // Spotify omits the refresh token on some refreshes. Keep the one we have.
@@ -628,6 +831,32 @@ impl SpotifyAccount {
             return self.current_phase();
         }
 
+        // Playback is a different client. Do it before saving, so a cancelled
+        // browser does not leave a Premium account with no playback token.
+        let (playback_access, playback_refresh) = if profile.premium {
+            match playback_credentials(playback_refresh_token, !prefer_saved_credentials) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    return self.fail(
+                        epoch,
+                        scrub(
+                            &error,
+                            &[
+                                &refresh_token,
+                                &refreshed.access_token,
+                                playback_refresh_token,
+                            ],
+                        ),
+                    );
+                }
+            }
+        } else {
+            (String::new(), String::new())
+        };
+        if !self.still(epoch) {
+            return self.current_phase();
+        }
+
         let device_id = if device_id.is_empty() {
             SessionConfig::default().device_id
         } else {
@@ -638,6 +867,7 @@ impl SpotifyAccount {
             display_name: profile.name.clone(),
             product: profile.product.clone(),
             refresh_token: refresh_token.clone(),
+            playback_refresh_token: playback_refresh.clone(),
         };
         let Some(cache) = cache_dir() else {
             return self.fail(
@@ -648,7 +878,15 @@ impl SpotifyAccount {
         if let Err(error) = write_saved(&account_path(&cache), &saved) {
             return self.fail(
                 epoch,
-                scrub(&error, &[&refresh_token, &refreshed.access_token]),
+                scrub(
+                    &error,
+                    &[
+                        &refresh_token,
+                        &refreshed.access_token,
+                        &playback_access,
+                        &playback_refresh,
+                    ],
+                ),
             );
         }
 
@@ -671,8 +909,8 @@ impl SpotifyAccount {
         match self.connect(
             &cache,
             &device_id,
-            &refreshed.access_token,
-            &refresh_token,
+            &playback_access,
+            &playback_refresh,
             prefer_saved_credentials,
         ) {
             Ok(session) => {
@@ -708,11 +946,14 @@ impl SpotifyAccount {
         let cached = prefer_saved_credentials
             .then(|| store.credentials())
             .flatten();
-        let credentials = cached.unwrap_or_else(|| Credentials::with_access_token(access_token));
-        let config = SessionConfig {
-            device_id: device_id.to_string(),
-            ..SessionConfig::default()
+        let credentials = if let Some(credentials) = cached {
+            credentials
+        } else if !access_token.is_empty() {
+            Credentials::with_access_token(access_token)
+        } else {
+            return Err("Spotify playback needs you to sign in again.".to_string());
         };
+        let config = playback_session_config(device_id);
         let handle = self.handle().map_err(|error| error.to_string())?;
         let access_token = access_token.to_string();
         let refresh_token = refresh_token.to_string();
@@ -747,16 +988,35 @@ impl SpotifyAccount {
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect();
         let result = handle.block_on(async move {
-            client
-                .get(url)
-                .bearer_auth(&access_token)
-                .query(&query)
-                .send()
-                .await
-                .map_err(|error| scrub(&error.to_string(), &[&access_token]))?
-                .text()
-                .await
-                .map_err(|error| scrub(&error.to_string(), &[&access_token]))
+            let mut retried = false;
+            loop {
+                let response = client
+                    .get(&url)
+                    .bearer_auth(&access_token)
+                    .query(&query)
+                    .send()
+                    .await
+                    .map_err(|error| scrub(&error.to_string(), &[&access_token]))?;
+                if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    return response
+                        .text()
+                        .await
+                        .map_err(|error| scrub(&error.to_string(), &[&access_token]));
+                }
+                let retry_after = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let _ = response.bytes().await;
+                match rate_limit_choice(retry_after.as_deref(), SystemTime::now(), retried) {
+                    RateLimitChoice::RetryAfter(delay) => {
+                        tokio::time::sleep(delay).await;
+                        retried = true;
+                    }
+                    RateLimitChoice::GiveUp(message) => return Err(message),
+                }
+            }
         });
         // The async block captured access_token. Rebuild a scrub from the
         // caller's copy: the error strings were already scrubbed inside.
@@ -885,9 +1145,63 @@ impl SpotifyAccount {
 }
 
 fn oauth_client() -> Result<librespot_oauth::OAuthClient, Error> {
-    OAuthClientBuilder::new(&desktop_client_id(), REDIRECT_URI, SCOPES.to_vec())
+    OAuthClientBuilder::new(&web_client_id(), REDIRECT_URI, SCOPES.to_vec())
         .build()
         .map_err(brief)
+}
+
+fn playback_oauth_client(open_browser: bool) -> Result<librespot_oauth::OAuthClient, Error> {
+    let builder =
+        OAuthClientBuilder::new(&desktop_client_id(), REDIRECT_URI, PLAYBACK_SCOPES.to_vec());
+    let builder = if open_browser {
+        builder
+            .open_in_browser()
+            .with_custom_message(PLAYBACK_BROWSER_MESSAGE)
+    } else {
+        builder
+    };
+    builder.build().map_err(brief)
+}
+
+/// `(access token, refresh token)` for the desktop playback login.
+///
+/// A saved refresh is used when Spotify still accepts it. Restore never opens
+/// a browser. Without a token, the session uses librespot's cached credentials.
+/// A fresh Premium sign-in opens the browser.
+fn playback_credentials(
+    refresh_token: &str,
+    interactive: bool,
+) -> Result<(String, String), String> {
+    if !refresh_token.is_empty() {
+        if let Some(refreshed) = refreshed_playback(refresh_token) {
+            return Ok(refreshed);
+        }
+        if !interactive {
+            return Ok((String::new(), refresh_token.to_string()));
+        }
+    }
+    if !interactive {
+        return Ok((String::new(), String::new()));
+    }
+    let client = playback_oauth_client(true).map_err(|error| error.to_string())?;
+    let token = client
+        .get_access_token()
+        .map_err(|error| scrub(&error.to_string(), &[refresh_token]))?;
+    if token.access_token.is_empty() {
+        return Err("Spotify did not return a playback token.".to_string());
+    }
+    Ok((token.access_token, token.refresh_token))
+}
+
+fn refreshed_playback(refresh_token: &str) -> Option<(String, String)> {
+    let client = playback_oauth_client(false).ok()?;
+    let token = client.refresh_token(refresh_token).ok()?;
+    let refresh = if token.refresh_token.is_empty() {
+        refresh_token.to_string()
+    } else {
+        token.refresh_token
+    };
+    Some((token.access_token, refresh))
 }
 
 fn restrict_credentials(dir: &Path) {
@@ -1407,6 +1721,7 @@ mod tests {
             display_name: "Ada Vega".to_string(),
             product: "premium".to_string(),
             refresh_token: "refresh-token-fixture-value".to_string(),
+            playback_refresh_token: "playback-token-fixture-value".to_string(),
         };
         let path = account_path(&dir);
         write_saved(&path, &saved).expect("write");
@@ -1414,10 +1729,22 @@ mod tests {
         let debug = format!("{saved:?}");
         assert!(debug.contains("[redacted]"), "{debug}");
         assert!(!debug.contains("refresh-token-fixture-value"), "{debug}");
+        assert!(!debug.contains("playback-token-fixture-value"), "{debug}");
 
         let read = read_saved(&path).expect("read");
         assert_eq!(read.refresh_token, saved.refresh_token);
+        assert_eq!(read.playback_refresh_token, saved.playback_refresh_token);
         assert_eq!(read.display_name, "Ada Vega");
+
+        let legacy = dir.join("legacy.json");
+        fs::write(
+            &legacy,
+            r#"{"device_id":"d","display_name":"Ada","product":"premium","refresh_token":"refresh-token-fixture-value"}"#,
+        )
+        .expect("legacy");
+        let legacy_read = read_saved(&legacy).expect("legacy read");
+        assert_eq!(legacy_read.refresh_token, saved.refresh_token);
+        assert_eq!(legacy_read.playback_refresh_token, "");
 
         #[cfg(unix)]
         {
@@ -1466,5 +1793,156 @@ mod tests {
         );
         assert!(catalogue.account.runtime.lock().expect("runtime").is_none());
         assert!(catalogue.account.client.lock().expect("client").is_none());
+    }
+
+    #[test]
+    fn client_id_prefers_runtime_then_compiled_then_the_built_in_app() {
+        let compiled = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let runtime = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        assert_eq!(resolve_client_id(Some(runtime), Some(compiled)), runtime);
+        assert_eq!(
+            resolve_client_id(Some("   "), Some(compiled)),
+            compiled,
+            "a blank runtime override falls through"
+        );
+        assert_eq!(
+            resolve_client_id(None, Some("  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ")),
+            compiled,
+            "the compiled id is trimmed"
+        );
+        assert_eq!(
+            resolve_client_id(Some(""), Some(" ")),
+            "34edc1e59dcb447db61ea7720733cbde",
+            "blank overrides fall through to the CodeVox mU app"
+        );
+        assert_eq!(
+            resolve_client_id(None, None),
+            "34edc1e59dcb447db61ea7720733cbde"
+        );
+        assert_ne!(resolve_client_id(None, None), desktop_client_id());
+
+        let id = web_client_id();
+        assert_ne!(id, desktop_client_id());
+        assert!(!id.trim().is_empty());
+    }
+
+    #[test]
+    fn playback_session_uses_the_desktop_client_id() {
+        let config = playback_session_config("device-42");
+        assert_eq!(config.device_id, "device-42");
+        assert_eq!(config.client_id, desktop_client_id());
+        assert_ne!(config.client_id, DEFAULT_WEB_CLIENT_ID);
+    }
+
+    #[test]
+    fn web_sign_in_includes_the_library_scopes() {
+        for scope in [
+            "streaming",
+            "user-read-private",
+            "user-read-email",
+            "user-library-read",
+            "playlist-read-private",
+            "playlist-read-collaborative",
+        ] {
+            assert!(SCOPES.contains(&scope), "missing {scope}");
+        }
+    }
+
+    #[test]
+    fn retry_after_retries_once_inside_ten_seconds_and_explains_the_rest() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_445_412_480);
+        let rfc = http_date("Sun, 06 Nov 1994 08:49:37 GMT").expect("rfc date");
+        assert_eq!(
+            rfc.duration_since(SystemTime::UNIX_EPOCH).expect("rfc"),
+            Duration::from_secs(784_111_777)
+        );
+
+        assert_eq!(parse_retry_after("0", now), Some(Duration::ZERO));
+        assert_eq!(
+            parse_retry_after("  10  ", now),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(parse_retry_after("11", now), Some(Duration::from_secs(11)));
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2015 07:28:04 GMT", now),
+            Some(Duration::from_secs(4))
+        );
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2015 07:28:30 GMT", now),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 1970 00:00:00 GMT", now),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(parse_retry_after("", now), None);
+        assert_eq!(parse_retry_after("soon", now), None);
+        assert_eq!(parse_retry_after("1.5", now), None);
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2015 07:28:00 UTC", now),
+            None
+        );
+
+        assert_eq!(
+            rate_limit_choice(Some("10"), now, false),
+            RateLimitChoice::RetryAfter(Duration::from_secs(10))
+        );
+        assert_eq!(
+            rate_limit_choice(Some("0"), now, false),
+            RateLimitChoice::RetryAfter(Duration::ZERO)
+        );
+        assert_eq!(
+            rate_limit_choice(Some("Wed, 21 Oct 2015 07:28:04 GMT"), now, false),
+            RateLimitChoice::RetryAfter(Duration::from_secs(4))
+        );
+
+        match rate_limit_choice(Some("45"), now, false) {
+            RateLimitChoice::GiveUp(message) => {
+                assert!(message.contains("45 seconds"), "{message}");
+                assert_human_rate_limit(&message);
+            }
+            other => panic!("45s is past the cap: {other:?}"),
+        }
+        match rate_limit_choice(Some("90"), now, false) {
+            RateLimitChoice::GiveUp(message) => {
+                assert!(message.contains("2 minutes"), "{message}");
+                assert_human_rate_limit(&message);
+            }
+            other => panic!("90s is past the cap: {other:?}"),
+        }
+        match rate_limit_choice(Some("1"), now, true) {
+            RateLimitChoice::GiveUp(message) => {
+                assert!(message.contains("Wait a moment"), "{message}");
+                assert_human_rate_limit(&message);
+            }
+            other => panic!("a second 429 is not retried: {other:?}"),
+        }
+        match rate_limit_choice(None, now, false) {
+            RateLimitChoice::GiveUp(message) => {
+                assert!(message.contains("Wait a moment"), "{message}");
+                assert_human_rate_limit(&message);
+            }
+            other => panic!("a missing Retry-After is not a guessed wait: {other:?}"),
+        }
+    }
+
+    fn assert_human_rate_limit(message: &str) {
+        assert!(!message.contains("429"), "{message}");
+        assert!(!message.contains("API rate limit exceeded"), "{message}");
+    }
+
+    #[test]
+    fn a_rate_limit_body_is_a_sentence_without_the_status() {
+        let body = r#"{"error":{"status":429,"message":"API rate limit exceeded"}}"#;
+        for error in [
+            profile_from_json(body).expect_err("profile"),
+            tracks_from_search_json(body).expect_err("search"),
+        ] {
+            let Error::Unavailable(reason) = error else {
+                panic!("rate limits are unavailable");
+            };
+            assert!(reason.contains("limiting requests"), "{reason}");
+            assert_human_rate_limit(&reason);
+        }
     }
 }
