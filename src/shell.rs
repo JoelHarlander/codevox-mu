@@ -33,6 +33,9 @@ type BackgroundSearch = Arc<dyn Fn(&str) -> Result<Vec<Track>, music::Error> + S
 /// Spotify sign-in. Tests pass a closure that does not open a browser.
 type SignIn = Arc<dyn Fn() -> AccountPhase + Send + Sync>;
 
+/// Spotify catalogue. Search stays a closure; library reads use the trait.
+type Catalogue = Arc<dyn MusicService + Send + Sync>;
+
 /// Window title. This is the product name, not a window-manager default.
 const TITLE: &str = "CodeVox mU";
 
@@ -93,7 +96,11 @@ const SMOKE_TIMEOUT_EXIT_CODE: i32 = 1;
 pub enum Mode {
     Run,
     Smoke,
-    Screenshot { main: PathBuf, accounts: PathBuf },
+    Screenshot {
+        main: PathBuf,
+        accounts: PathBuf,
+        library: PathBuf,
+    },
 }
 
 /// Which headless capture just finished.
@@ -101,6 +108,7 @@ pub enum Mode {
 enum Capture {
     Main,
     Accounts,
+    Library,
 }
 
 /// Progress of `--screenshot`. `Idle` is every other mode.
@@ -111,6 +119,8 @@ enum ShotStep {
     MainPending,
     Accounts,
     AccountsPending,
+    Library,
+    LibraryPending,
 }
 
 #[derive(Debug, Clone)]
@@ -157,9 +167,10 @@ enum Message {
     ShowLibrary,
     LibraryReady {
         epoch: u64,
-        result: Result<Vec<Playlist>, music::Error>,
+        result: Result<LibraryLoad, music::Error>,
     },
     OpenPlaylist {
+        source: Source,
         id: String,
         name: String,
     },
@@ -201,6 +212,16 @@ enum YtSign {
     In,
 }
 
+/// Playlists gathered for one Library open, plus a per-service failure.
+///
+/// One service can fail while the other's rows still show.
+#[derive(Clone, Debug)]
+struct LibraryLoad {
+    playlists: Vec<Playlist>,
+    spotify_error: Option<String>,
+    youtube_error: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pane {
     Search,
@@ -236,6 +257,7 @@ struct Shell {
     youtube: BackgroundSearch,
     sign_in: SignIn,
     library: Arc<dyn LibrarySession>,
+    spotify_catalogue: Catalogue,
     pane: Pane,
     sign: YtSign,
     cookie_draft: String,
@@ -243,6 +265,7 @@ struct Shell {
     playlists: Vec<Playlist>,
     playlist_tracks: Vec<Track>,
     playlist_name: String,
+    playlist_source: Option<Source>,
     library_loading: bool,
     /// Bumped when a YouTube Music sign-in or library fetch starts, so a
     /// slower reply cannot overwrite a newer one. Spotify sign-in uses
@@ -261,6 +284,7 @@ struct Shell {
     shot_step: ShotStep,
     screenshot_main: Option<PathBuf>,
     screenshot_accounts: Option<PathBuf>,
+    screenshot_library: Option<PathBuf>,
     #[cfg(test)]
     last_play: Option<Track>,
 }
@@ -575,12 +599,18 @@ fn a_cookie_without_sapisid_stays_signed_out_and_hides_the_paste() {
 }
 
 #[test]
-fn the_library_stays_closed_until_sign_in() {
+fn the_library_says_when_both_accounts_are_signed_out() {
     let mut shell = test_shell(Mode::Run);
     let _ = shell.update(Message::ShowLibrary);
-    assert_eq!(shell.pane, Pane::Search);
-    let error = shell.error.expect("prompt");
-    assert!(error.contains("Sign in"), "{error}");
+    assert_eq!(shell.pane, Pane::Library);
+    assert!(!shell.library_loading);
+    assert!(shell.playlists.is_empty());
+    assert_eq!(
+        status_note(&shell),
+        Some("Sign in to Spotify or YouTube Music to see your library.")
+    );
+    assert!(notice_lines(&shell).is_empty());
+    let _ = Shell::view(&shell);
 }
 
 #[test]
@@ -606,15 +636,20 @@ fn a_playlist_track_plays_through_the_same_message_as_search() {
     let epoch = shell.library_epoch;
     let _ = shell.update(Message::LibraryReady {
         epoch,
-        result: Ok(vec![Playlist {
-            id: "PLnight".into(),
-            source: Source::YouTubeMusic,
-            name: "Night".into(),
-        }]),
+        result: Ok(LibraryLoad {
+            playlists: vec![Playlist {
+                id: "PLnight".into(),
+                source: Source::YouTubeMusic,
+                name: "Night".into(),
+            }],
+            spotify_error: None,
+            youtube_error: None,
+        }),
     });
     assert_eq!(shell.playlists[0].name, "Night");
 
     let _ = shell.update(Message::OpenPlaylist {
+        source: Source::YouTubeMusic,
         id: "PLnight".into(),
         name: "Night".into(),
     });
@@ -645,6 +680,173 @@ fn a_playlist_track_plays_through_the_same_message_as_search() {
         result: Ok(vec![track]),
     });
     assert!(shell.playlist_tracks.is_empty());
+    let _ = Shell::view(&shell);
+}
+
+#[test]
+fn library_rows_keep_both_sources_and_spotify_tracks_use_search_playback() {
+    let spotify_liked = Playlist {
+        id: "liked-songs".into(),
+        source: Source::Spotify,
+        name: "Liked Songs".into(),
+    };
+    let glow = Playlist {
+        id: "37i9dQZF1DXcBWIGoYBM5M".into(),
+        source: Source::Spotify,
+        name: "Low Glow".into(),
+    };
+    let youtube_liked = Playlist {
+        id: "liked-songs".into(),
+        source: Source::YouTubeMusic,
+        name: "Liked songs".into(),
+    };
+    let weekday = Playlist {
+        id: "yt-weekday".into(),
+        source: Source::YouTubeMusic,
+        name: "Weekday".into(),
+    };
+    let merged = merge_library(
+        Some(Ok(vec![spotify_liked.clone(), glow.clone()])),
+        Some(Ok(vec![youtube_liked.clone(), weekday.clone()])),
+    );
+    assert_eq!(
+        merged
+            .playlists
+            .iter()
+            .map(|playlist| (playlist.source, playlist.name.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (Source::Spotify, "Liked Songs"),
+            (Source::Spotify, "Low Glow"),
+            (Source::YouTubeMusic, "Liked songs"),
+            (Source::YouTubeMusic, "Weekday"),
+        ]
+    );
+    assert!(merged.spotify_error.is_none());
+    assert!(merged.youtube_error.is_none());
+
+    let mut shell = test_shell(Mode::Run);
+    shell.phase = AccountPhase::SignedIn {
+        name: "Ada Vega".into(),
+    };
+    shell.sign = YtSign::In;
+    shell
+        .library
+        .sign_in("SAPISID=test-value;")
+        .expect("youtube session");
+    let _ = shell.update(Message::ShowLibrary);
+    assert_eq!(shell.pane, Pane::Library);
+    assert!(shell.library_loading);
+    let epoch = shell.library_epoch;
+    let _ = shell.update(Message::LibraryReady {
+        epoch,
+        result: Ok(merged),
+    });
+    assert_eq!(shell.playlists.len(), 4);
+    let _ = Shell::view(&shell);
+
+    let _ = shell.update(Message::OpenPlaylist {
+        source: Source::Spotify,
+        id: glow.id.clone(),
+        name: glow.name.clone(),
+    });
+    let track = Track {
+        id: "5sWHDYs0csV6RS48xBl0tH".into(),
+        source: Source::Spotify,
+        title: "Night Drive".into(),
+        artists: vec!["Ada Vega".into()],
+        album: Some("Low Glow".into()),
+        duration: std::time::Duration::from_secs(192),
+    };
+    let epoch = shell.library_epoch;
+    let _ = shell.update(Message::PlaylistReady {
+        epoch,
+        result: Ok(vec![track.clone()]),
+    });
+    assert_eq!(shell.playlist_tracks, vec![track.clone()]);
+    assert!(matches!(play_message(&track), Message::Play(played) if played == track));
+    let _ = shell.update(Message::PlayNext(track.clone()));
+    let _ = shell.update(Message::Enqueue(track.clone()));
+    assert!(shell.last_play.is_none());
+    let _ = shell.update(play_message(&track));
+    assert_eq!(shell.last_play.as_ref(), Some(&track));
+    assert_eq!(
+        shell.last_play.as_ref().map(|played| played.source),
+        Some(Source::Spotify)
+    );
+    let _ = Shell::view(&shell);
+}
+
+#[test]
+fn an_empty_signed_in_library_says_there_are_no_playlists() {
+    let mut shell = test_shell(Mode::Run);
+    shell.phase = AccountPhase::SignedIn {
+        name: "Ada Vega".into(),
+    };
+    let _ = shell.update(Message::ShowLibrary);
+    let epoch = shell.library_epoch;
+    let _ = shell.update(Message::LibraryReady {
+        epoch,
+        result: Ok(merge_library(Some(Ok(Vec::new())), None)),
+    });
+    assert!(shell.playlists.is_empty());
+    assert_eq!(status_note(&shell), Some("No playlists"));
+    assert!(notice_lines(&shell).is_empty());
+    let _ = Shell::view(&shell);
+}
+
+#[test]
+fn a_spotify_rate_limit_keeps_the_youtube_library_and_the_sentence() {
+    let weekday = Playlist {
+        id: "yt-weekday".into(),
+        source: Source::YouTubeMusic,
+        name: "Weekday".into(),
+    };
+    let limited = "Spotify is limiting requests. Wait a moment and try again.";
+    let merged = merge_library(
+        Some(Err(music::Error::Unavailable(limited.to_string()))),
+        Some(Ok(vec![weekday.clone()])),
+    );
+    assert_eq!(merged.playlists, vec![weekday]);
+    assert_eq!(merged.spotify_error.as_deref(), Some(limited));
+    assert!(merged.youtube_error.is_none());
+
+    let mut shell = test_shell(Mode::Run);
+    shell.phase = AccountPhase::NotPremium {
+        name: "Jonah".into(),
+    };
+    shell.sign = YtSign::In;
+    shell
+        .library
+        .sign_in("SAPISID=test-value;")
+        .expect("youtube session");
+    let _ = shell.update(Message::ShowLibrary);
+    let epoch = shell.library_epoch;
+    let _ = shell.update(Message::LibraryReady {
+        epoch,
+        result: Ok(merged),
+    });
+    assert_eq!(shell.playlists[0].name, "Weekday");
+    let lines = notice_lines(&shell);
+    assert!(lines.iter().any(|line| line == limited), "{lines:?}");
+    assert!(lines.iter().all(|line| !line.contains("429")), "{lines:?}");
+    assert_ne!(status_note(&shell), Some("No playlists"));
+    let _ = Shell::view(&shell);
+
+    let _ = shell.update(Message::OpenPlaylist {
+        source: Source::Spotify,
+        id: "liked-songs".into(),
+        name: "Liked Songs".into(),
+    });
+    let epoch = shell.library_epoch;
+    let _ = shell.update(Message::PlaylistReady {
+        epoch,
+        result: Err(music::Error::Unavailable(limited.to_string())),
+    });
+    assert!(shell.playlist_tracks.is_empty());
+    let lines = notice_lines(&shell);
+    assert!(lines.iter().any(|line| line == limited), "{lines:?}");
+    assert_ne!(status_note(&shell), Some("This playlist is empty."));
     let _ = Shell::view(&shell);
 }
 
@@ -766,6 +968,7 @@ fn test_shell(mode: Mode) -> Shell {
         Arc::new(move |query| youtube.search(query)),
         Arc::new(|| AccountPhase::SignedOut),
         Arc::new(FakeLibrary::empty()),
+        Arc::new(music::MockService::spotify()),
     )
 }
 
@@ -781,6 +984,7 @@ impl Shell {
                 Arc::new(|_| Ok(Vec::new())),
                 Arc::new(|| AccountPhase::SignedOut),
                 Arc::new(ClosedLibrary),
+                Arc::new(music::MockService::spotify()),
             );
             return (shell, Task::none());
         }
@@ -794,6 +998,7 @@ impl Shell {
                 Arc::new(|query| music::MockService::youtube_music().search(query)),
                 Arc::new(|| AccountPhase::SignedOut),
                 Arc::new(ClosedLibrary),
+                Arc::new(music::MockService::spotify()),
             );
             shell.seed_screenshot();
             return (shell, Task::none());
@@ -803,6 +1008,7 @@ impl Shell {
         let search_account = account.clone();
         let sign_account = account.clone();
         let play_account = account.clone();
+        let library_account = account.clone();
         let youtube = YouTubeMusic::new();
         let library: Arc<dyn LibrarySession> = Arc::new(youtube.clone());
         let mut shell = Self::with_services(
@@ -813,6 +1019,7 @@ impl Shell {
             Arc::new(move |query| youtube.search(query)),
             Arc::new(move || sign_account.sign_in()),
             library,
+            Arc::new(spotify::SpotifyCatalogue::new(library_account)),
         );
         shell.playback = player::Playback::start(
             Box::new(spotify::LibrespotEngine::new(play_account)),
@@ -831,6 +1038,7 @@ impl Shell {
         youtube: BackgroundSearch,
         sign_in: SignIn,
         library: Arc<dyn LibrarySession>,
+        spotify_catalogue: Catalogue,
     ) -> Self {
         let shot_step = match &mode {
             Mode::Screenshot { .. } => ShotStep::Main,
@@ -842,6 +1050,10 @@ impl Shell {
         };
         let screenshot_accounts = match &mode {
             Mode::Screenshot { accounts, .. } => Some(accounts.clone()),
+            Mode::Run | Mode::Smoke => None,
+        };
+        let screenshot_library = match &mode {
+            Mode::Screenshot { library, .. } => Some(library.clone()),
             Mode::Run | Mode::Smoke => None,
         };
         Self {
@@ -863,6 +1075,7 @@ impl Shell {
             youtube,
             sign_in,
             library,
+            spotify_catalogue,
             pane: Pane::Search,
             sign: YtSign::Out,
             cookie_draft: String::new(),
@@ -870,6 +1083,7 @@ impl Shell {
             playlists: Vec::new(),
             playlist_tracks: Vec::new(),
             playlist_name: String::new(),
+            playlist_source: None,
             library_loading: false,
             library_epoch: 0,
             restore_started: false,
@@ -882,6 +1096,7 @@ impl Shell {
             shot_step,
             screenshot_main,
             screenshot_accounts,
+            screenshot_library,
             #[cfg(test)]
             last_play: None,
         }
@@ -1027,7 +1242,7 @@ impl Shell {
                 self.finish_library(epoch, result);
                 Task::none()
             }
-            Message::OpenPlaylist { id, name } => self.open_playlist(id, name),
+            Message::OpenPlaylist { source, id, name } => self.open_playlist(source, id, name),
             Message::PlaylistReady { epoch, result } => {
                 self.finish_playlist(epoch, result);
                 Task::none()
@@ -1146,55 +1361,91 @@ impl Shell {
     }
 
     fn show_library(&mut self) -> Task<Message> {
-        if self.sign != YtSign::In || !self.library.signed_in() {
+        if self.sign == YtSign::In && !self.library.signed_in() {
             self.sign = YtSign::Out;
-            self.error = Some("Sign in to YouTube Music to see your library.".to_string());
+        }
+        let spotify_in = spotify_signed_in(&self.phase);
+        let youtube_in = youtube_signed_in(self);
+        self.pane = Pane::Library;
+        self.playlist_tracks.clear();
+        self.playlist_name.clear();
+        self.playlist_source = None;
+        self.error = None;
+        self.spotify_error = None;
+        self.library_epoch = self.library_epoch.wrapping_add(1);
+        if !spotify_in && !youtube_in {
+            self.playlists.clear();
+            self.library_loading = false;
             return Task::none();
         }
-        self.pane = Pane::Library;
         self.library_loading = true;
-        self.error = None;
-        self.library_epoch = self.library_epoch.wrapping_add(1);
         let epoch = self.library_epoch;
+        let catalogue = Arc::clone(&self.spotify_catalogue);
         let library = Arc::clone(&self.library);
         self.off_ui(
-            "youtube-music-library",
-            move || library.playlists(),
+            "library",
+            move || {
+                Ok(load_signed_in_libraries(
+                    spotify_in,
+                    youtube_in,
+                    catalogue.as_ref(),
+                    library.as_ref(),
+                ))
+            },
             move |result| Message::LibraryReady { epoch, result },
         )
     }
 
-    fn finish_library(&mut self, epoch: u64, result: Result<Vec<Playlist>, music::Error>) {
+    fn finish_library(&mut self, epoch: u64, result: Result<LibraryLoad, music::Error>) {
         if epoch != self.library_epoch || self.pane != Pane::Library {
             return;
         }
         self.library_loading = false;
         match result {
-            Ok(playlists) => {
-                self.playlists = playlists;
-                self.error = None;
+            Ok(load) => {
+                self.playlists = load.playlists;
+                self.spotify_error = load.spotify_error;
+                self.error = load.youtube_error;
             }
             Err(error) => {
                 self.playlists.clear();
-                self.error = Some(format!("YouTube Music library failed: {error}"));
+                self.error = Some(format!("Library failed: {error}"));
             }
         }
     }
 
-    fn open_playlist(&mut self, id: String, name: String) -> Task<Message> {
+    fn open_playlist(&mut self, source: Source, id: String, name: String) -> Task<Message> {
         self.pane = Pane::Playlist;
         self.playlist_name = name;
+        self.playlist_source = Some(source);
         self.playlist_tracks.clear();
         self.library_loading = true;
         self.error = None;
         self.library_epoch = self.library_epoch.wrapping_add(1);
         let epoch = self.library_epoch;
-        let library = Arc::clone(&self.library);
-        self.off_ui(
-            "youtube-music-playlist",
-            move || library.playlist_tracks(&id),
-            move |result| Message::PlaylistReady { epoch, result },
-        )
+        match source {
+            Source::Spotify => {
+                let catalogue = Arc::clone(&self.spotify_catalogue);
+                self.off_ui(
+                    "spotify-playlist",
+                    move || catalogue.playlist_tracks(&id),
+                    move |result| Message::PlaylistReady { epoch, result },
+                )
+            }
+            Source::YouTubeMusic => {
+                let library = Arc::clone(&self.library);
+                self.off_ui(
+                    "youtube-music-playlist",
+                    move || library.playlist_tracks(&id),
+                    move |result| Message::PlaylistReady { epoch, result },
+                )
+            }
+            Source::Local => {
+                self.library_loading = false;
+                self.error = Some("Local playlists are not available.".to_string());
+                Task::none()
+            }
+        }
     }
 
     fn finish_playlist(&mut self, epoch: u64, result: Result<Vec<Track>, music::Error>) {
@@ -1209,7 +1460,7 @@ impl Shell {
             }
             Err(error) => {
                 self.playlist_tracks.clear();
-                self.error = Some(format!("YouTube Music playlist failed: {error}"));
+                self.error = Some(playlist_failure(self.playlist_source, &error));
             }
         }
     }
@@ -1254,13 +1505,13 @@ impl Shell {
                         });
                 if let Err(error) = started {
                     return Err(music::Error::Unavailable(format!(
-                        "could not start the YouTube Music thread: {error}"
+                        "could not start {thread_name}: {error}"
                     )));
                 }
                 receiver.await.unwrap_or_else(|_| {
-                    Err(music::Error::Unavailable(
-                        "the YouTube Music thread stopped before it replied".into(),
-                    ))
+                    Err(music::Error::Unavailable(format!(
+                        "{thread_name} stopped before it replied"
+                    )))
                 })
             },
             message,
@@ -1403,7 +1654,7 @@ impl Shell {
         match &self.mode {
             // Smoke must not open a D-Bus session or a media-controls handle.
             Mode::Smoke => window::frames().map(|_| Message::Frame),
-            // Screenshot paints, captures, switches pane, captures, and exits.
+            // Screenshot paints, captures search, accounts, and library, then exits.
             // No media keys and no account restore.
             Mode::Screenshot { .. } => Subscription::batch([
                 window::frames().map(|_| Message::Frame),
@@ -1465,6 +1716,7 @@ impl Shell {
         else {
             return;
         };
+        self.playlists = sample_library();
         self.preview = Some(player::NowPlaying {
             title: track.title.clone(),
             artist: track.artists.join(", "),
@@ -1492,15 +1744,21 @@ impl Shell {
         let Some(id) = self.window_id else {
             return Task::none();
         };
-        let ready = matches!(self.shot_step, ShotStep::Main | ShotStep::Accounts)
-            && self.frame_count >= SHOT_FRAME_DELAY;
+        let ready = matches!(
+            self.shot_step,
+            ShotStep::Main | ShotStep::Accounts | ShotStep::Library
+        ) && self.frame_count >= SHOT_FRAME_DELAY;
         if !ready {
             return Task::none();
         }
         let (kind, path) = match self.shot_step {
             ShotStep::Main => (Capture::Main, self.screenshot_main.clone()),
             ShotStep::Accounts => (Capture::Accounts, self.screenshot_accounts.clone()),
-            ShotStep::Idle | ShotStep::MainPending | ShotStep::AccountsPending => {
+            ShotStep::Library => (Capture::Library, self.screenshot_library.clone()),
+            ShotStep::Idle
+            | ShotStep::MainPending
+            | ShotStep::AccountsPending
+            | ShotStep::LibraryPending => {
                 return Task::none();
             }
         };
@@ -1512,6 +1770,7 @@ impl Shell {
         self.shot_step = match kind {
             Capture::Main => ShotStep::MainPending,
             Capture::Accounts => ShotStep::AccountsPending,
+            Capture::Library => ShotStep::LibraryPending,
         };
         window::screenshot(id).map(move |shot| {
             let result = write_png(&path, shot.rgba.as_ref(), shot.size.width, shot.size.height);
@@ -1540,8 +1799,23 @@ impl Shell {
                 if let Some(path) = &self.screenshot_accounts {
                     eprintln!("codevox-mu screenshot: wrote {}", path.display());
                 }
+                self.pane = Pane::Library;
+                self.phase = AccountPhase::SignedIn {
+                    name: "Ada Vega".into(),
+                };
+                self.sign = YtSign::In;
+                self.cookie_open = false;
+                self.library_loading = false;
+                self.frame_count = 0;
+                self.shot_step = ShotStep::Library;
+                Task::none()
+            }
+            Capture::Library => {
+                if let Some(path) = &self.screenshot_library {
+                    eprintln!("codevox-mu screenshot: wrote {}", path.display());
+                }
                 self.exit_requested = true;
-                eprintln!("codevox-mu screenshot: accounts view saved, exiting");
+                eprintln!("codevox-mu screenshot: library view saved, exiting");
                 iced::exit()
             }
         }
@@ -1744,6 +2018,112 @@ fn spotify_search_notice(detail: &str) -> String {
     } else {
         format!("Spotify search failed: {detail}")
     }
+}
+
+fn spotify_library_notice(detail: &str) -> String {
+    if detail.starts_with("Spotify ") {
+        detail.to_string()
+    } else {
+        format!("Spotify library failed: {detail}")
+    }
+}
+
+fn spotify_signed_in(phase: &AccountPhase) -> bool {
+    matches!(
+        phase,
+        AccountPhase::SignedIn { .. } | AccountPhase::NotPremium { .. }
+    )
+}
+
+fn youtube_signed_in(shell: &Shell) -> bool {
+    shell.sign == YtSign::In && shell.library.signed_in()
+}
+
+fn library_accounts_open(shell: &Shell) -> bool {
+    spotify_signed_in(&shell.phase) || youtube_signed_in(shell)
+}
+
+/// `None` means that service was not signed in, so it was not asked.
+fn merge_library(
+    spotify: Option<Result<Vec<Playlist>, music::Error>>,
+    youtube: Option<Result<Vec<Playlist>, music::Error>>,
+) -> LibraryLoad {
+    let mut load = LibraryLoad {
+        playlists: Vec::new(),
+        spotify_error: None,
+        youtube_error: None,
+    };
+    if let Some(result) = spotify {
+        match result {
+            Ok(rows) => load.playlists.extend(rows),
+            Err(error) => load.spotify_error = Some(spotify_library_notice(&error.to_string())),
+        }
+    }
+    if let Some(result) = youtube {
+        match result {
+            Ok(rows) => load.playlists.extend(rows),
+            Err(error) => {
+                load.youtube_error = Some(format!("YouTube Music library failed: {error}"));
+            }
+        }
+    }
+    load
+}
+
+fn load_signed_in_libraries(
+    spotify_in: bool,
+    youtube_in: bool,
+    catalogue: &dyn MusicService,
+    library: &dyn LibrarySession,
+) -> LibraryLoad {
+    let spotify = spotify_in.then(|| catalogue.playlists());
+    let youtube = youtube_in.then(|| library.playlists());
+    merge_library(spotify, youtube)
+}
+
+fn playlist_failure(source: Option<Source>, error: &music::Error) -> String {
+    let detail = error.to_string();
+    match source {
+        Some(Source::Spotify) if detail.starts_with("Spotify ") => detail,
+        Some(Source::Spotify) => format!("Spotify playlist failed: {detail}"),
+        Some(Source::YouTubeMusic) | None => format!("YouTube Music playlist failed: {detail}"),
+        Some(Source::Local) => format!("Playlist failed: {detail}"),
+    }
+}
+
+fn sample_library() -> Vec<Playlist> {
+    vec![
+        Playlist {
+            id: "liked-songs".into(),
+            source: Source::Spotify,
+            name: "Liked Songs".into(),
+        },
+        Playlist {
+            id: "sp-low-glow".into(),
+            source: Source::Spotify,
+            name: "Low Glow".into(),
+        },
+        Playlist {
+            id: "sp-harbour".into(),
+            source: Source::Spotify,
+            name: "Harbour".into(),
+        },
+        Playlist {
+            id: "liked-songs".into(),
+            source: Source::YouTubeMusic,
+            name: "Liked songs".into(),
+        },
+        Playlist {
+            id: "yt-weekday".into(),
+            source: Source::YouTubeMusic,
+            name: "Weekday".into(),
+        },
+        Playlist {
+            id: "yt-sessions".into(),
+            source: Source::YouTubeMusic,
+            name: "Sessions".into(),
+        },
+    ]
 }
 
 fn youtube_compact(sign: YtSign) -> (&'static str, Color) {
@@ -1954,9 +2334,25 @@ fn status_note(shell: &Shell) -> Option<&'static str> {
             Some("No matches")
         }
         Pane::Library if shell.library_loading => Some("Loading library…"),
-        Pane::Library if shell.playlists.is_empty() => Some("No playlists"),
+        Pane::Library
+            if shell.playlists.is_empty()
+                && shell.error.is_none()
+                && shell.spotify_error.is_none() =>
+        {
+            if library_accounts_open(shell) {
+                Some("No playlists")
+            } else {
+                Some("Sign in to Spotify or YouTube Music to see your library.")
+            }
+        }
         Pane::Playlist if shell.library_loading => Some("Loading playlist…"),
-        Pane::Playlist if shell.playlist_tracks.is_empty() => Some("This playlist is empty."),
+        Pane::Playlist
+            if shell.playlist_tracks.is_empty()
+                && shell.error.is_none()
+                && shell.spotify_error.is_none() =>
+        {
+            Some("This playlist is empty.")
+        }
         Pane::Search | Pane::Queue | Pane::Library | Pane::Playlist | Pane::Accounts => None,
     }
 }
@@ -2614,13 +3010,18 @@ fn screenshot_seed_renders_search_and_accounts() {
     let mut shell = test_shell(Mode::Screenshot {
         main: PathBuf::from("main.png"),
         accounts: PathBuf::from("main-accounts.png"),
+        library: PathBuf::from("main-library.png"),
     });
     shell.seed_screenshot();
     assert!(!shell.results.is_empty());
     assert!(shell.preview.is_some());
+    assert!(shell.playlists.len() >= 2);
     let _ = Shell::view(&shell);
     shell.pane = Pane::Accounts;
     shell.cookie_open = true;
+    let _ = Shell::view(&shell);
+    shell.pane = Pane::Library;
+    shell.cookie_open = false;
     let _ = Shell::view(&shell);
 }
 
@@ -2723,20 +3124,27 @@ fn track_button(track: &Track) -> Element<'_, Message> {
 }
 
 fn playlist_row(playlist: &Playlist) -> Element<'_, Message> {
-    button(
+    let body = row![
         text(&playlist.name)
             .font(crate::theme::BODY)
             .size(BODY_SIZE)
-            .color(crate::theme::TEXT_PRIMARY),
-    )
-    .on_press(Message::OpenPlaylist {
-        id: playlist.id.clone(),
-        name: playlist.name.clone(),
-    })
-    .width(Fill)
-    .padding([6.0, 0.0])
-    .style(result_button)
-    .into()
+            .color(crate::theme::TEXT_PRIMARY)
+            .width(Fill),
+        source_tag(playlist.source),
+    ]
+    .spacing(ROW_SPACING)
+    .align_y(Vertical::Center)
+    .width(Fill);
+    button(body)
+        .on_press(Message::OpenPlaylist {
+            source: playlist.source,
+            id: playlist.id.clone(),
+            name: playlist.name.clone(),
+        })
+        .width(Fill)
+        .padding([6.0, 0.0])
+        .style(result_button)
+        .into()
 }
 
 fn result_body(track: &Track) -> Element<'_, Message> {

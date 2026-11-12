@@ -23,6 +23,7 @@
 //! Premium. A free account is detected from the Web API profile and never
 //! connected. Search still works; the player falls back to YouTube Music.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -86,6 +87,21 @@ const RATE_LIMIT_RETRY_CAP: Duration = Duration::from_secs(10);
 
 const PROFILE_URL: &str = "https://api.spotify.com/v1/me";
 const SEARCH_URL: &str = "https://api.spotify.com/v1/search";
+const PLAYLISTS_URL: &str = "https://api.spotify.com/v1/me/playlists";
+const SAVED_TRACKS_URL: &str = "https://api.spotify.com/v1/me/tracks";
+
+/// Liked Songs is not a playlist id. The catalogue uses this id, and the
+/// window tells it apart from YouTube Music's liked songs by [`Source`].
+const LIKED_SONGS_ID: &str = "liked-songs";
+
+/// Spotify's maximum page size for these library endpoints.
+const PAGE_LIMIT: &str = "50";
+
+/// User playlists kept from `/v1/me/playlists`. Liked Songs is extra.
+const PLAYLIST_CAP: usize = 500;
+
+/// Tracks kept from one playlist or from Liked Songs.
+const TRACK_CAP: usize = 1_000;
 
 /// Chunks kept queued in rodio. Each chunk is a fraction of a second.
 /// A shorter queue makes skip cut the previous track sooner.
@@ -316,6 +332,211 @@ fn track_from_item(item: &serde_json::Value) -> Option<Track> {
         album,
         duration: Duration::from_millis(duration_ms),
     })
+}
+
+/// One Web API page. `next` is the absolute URL of the following page.
+#[derive(Debug)]
+struct ApiPage<T> {
+    items: Vec<T>,
+    next: Option<String>,
+}
+
+/// Read one `/v1/me/playlists` page. Nothing is fetched.
+///
+/// Rows without a Spotify playlist id are skipped. A blank name becomes
+/// "Untitled playlist". An error payload fails the whole page.
+fn playlists_from_page_json(body: &str) -> Result<ApiPage<Playlist>, Error> {
+    let value = json_value(body)?;
+    let items = page_items(&value)?;
+    let mut playlists = Vec::new();
+    for item in items {
+        if let Some(playlist) = playlist_from_item(item) {
+            playlists.push(playlist);
+        }
+    }
+    Ok(ApiPage {
+        items: playlists,
+        next: page_next(&value),
+    })
+}
+
+/// Read one playlist-items page (`/tracks` or `/items`). Nothing is fetched.
+///
+/// A row may wrap the recording in `track` or in `item`. Episodes, local
+/// files, null entries, and ids the player cannot load are skipped.
+fn tracks_from_playlist_page_json(body: &str) -> Result<ApiPage<Track>, Error> {
+    tracks_from_collection_page(body)
+}
+
+/// Read one `/v1/me/tracks` page. Nothing is fetched.
+///
+/// Saved tracks use the `track` wrapper. Null and unloadable rows are skipped.
+fn tracks_from_saved_page_json(body: &str) -> Result<ApiPage<Track>, Error> {
+    tracks_from_collection_page(body)
+}
+
+fn tracks_from_collection_page(body: &str) -> Result<ApiPage<Track>, Error> {
+    let value = json_value(body)?;
+    let items = page_items(&value)?;
+    let mut tracks = Vec::new();
+    for item in items {
+        if let Some(track) = track_from_collection_item(item) {
+            tracks.push(track);
+        }
+    }
+    Ok(ApiPage {
+        items: tracks,
+        next: page_next(&value),
+    })
+}
+
+fn json_value(body: &str) -> Result<serde_json::Value, Error> {
+    let value: serde_json::Value = serde_json::from_str(body).map_err(brief)?;
+    if let Some(message) = api_error_message(&value) {
+        return Err(brief_message(message));
+    }
+    Ok(value)
+}
+
+fn page_items(value: &serde_json::Value) -> Result<&Vec<serde_json::Value>, Error> {
+    value
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| brief_message("Spotify did not return a page"))
+}
+
+fn page_next(value: &serde_json::Value) -> Option<String> {
+    let next = value.get("next")?.as_str()?.trim();
+    if next.is_empty() {
+        None
+    } else {
+        Some(next.to_string())
+    }
+}
+
+fn playlist_from_item(item: &serde_json::Value) -> Option<Playlist> {
+    if !item.is_object() {
+        return None;
+    }
+    let id = text_field(item, "id");
+    if !playlist_id_ok(&id) {
+        return None;
+    }
+    let name = text_field(item, "name");
+    let name = if name.is_empty() {
+        "Untitled playlist".to_string()
+    } else {
+        name
+    };
+    Some(Playlist {
+        id,
+        source: Source::Spotify,
+        name,
+    })
+}
+
+/// A playlist id that can go in a Spotify URL. Base62, no path characters.
+fn playlist_id_ok(id: &str) -> bool {
+    let len = id.len();
+    (1..=64).contains(&len) && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn track_from_collection_item(item: &serde_json::Value) -> Option<Track> {
+    if item.get("is_local").and_then(serde_json::Value::as_bool) == Some(true) {
+        return None;
+    }
+    let embedded = item
+        .get("item")
+        .filter(|value| !value.is_null())
+        .or_else(|| item.get("track").filter(|value| !value.is_null()))?;
+    let kind = text_field(embedded, "type");
+    if !kind.is_empty() && kind != "track" {
+        return None;
+    }
+    track_from_item(embedded)
+}
+
+/// Walk `first_url`, then each page's `next`, until the list is finished.
+///
+/// Stops at `cap` items, when `next` is missing, when `next` is not an
+/// `https://api.spotify.com/` URL, or when `next` repeats a URL already
+/// requested. The token is only sent to URLs the caller and Spotify named.
+fn collect_pages<T, F>(first_url: &str, cap: usize, mut fetch: F) -> Result<Vec<T>, Error>
+where
+    F: FnMut(&str) -> Result<ApiPage<T>, Error>,
+{
+    if cap == 0 || first_url.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut kept = Vec::new();
+    let mut seen = HashSet::new();
+    let mut cursor = first_url.to_string();
+    loop {
+        if !seen.insert(cursor.clone()) {
+            break;
+        }
+        let page = fetch(&cursor)?;
+        let room = cap.saturating_sub(kept.len());
+        if room == 0 {
+            break;
+        }
+        kept.extend(page.items.into_iter().take(room));
+        if kept.len() >= cap {
+            break;
+        }
+        let Some(next) = page.next.as_deref().and_then(followable_next) else {
+            break;
+        };
+        cursor = next;
+    }
+    Ok(kept)
+}
+
+/// `next` from Spotify, or nothing. Other hosts are not requested.
+fn followable_next(next: &str) -> Option<String> {
+    let next = next.trim();
+    if next.is_empty() || next.chars().any(char::is_control) || next.contains(' ') {
+        return None;
+    }
+    let rest = next.strip_prefix("https://api.spotify.com/")?;
+    if rest.contains('@') {
+        return None;
+    }
+    Some(next.to_string())
+}
+
+fn read_pages<T>(
+    account: &SpotifyAccount,
+    token: &str,
+    first_url: &str,
+    cap: usize,
+    parse: fn(&str) -> Result<ApiPage<T>, Error>,
+) -> Result<Vec<T>, Error> {
+    collect_pages(first_url, cap, |url| {
+        let body = account.http_get(url, token, &[])?;
+        parse(&body)
+    })
+}
+
+fn library_page_url(base: &str) -> String {
+    format!("{base}?limit={PAGE_LIMIT}")
+}
+
+fn signed_out_library() -> Error {
+    brief_message("Spotify is signed out. Sign in to see your library.")
+}
+
+fn liked_songs_row() -> Playlist {
+    Playlist {
+        id: LIKED_SONGS_ID.to_string(),
+        source: Source::Spotify,
+        name: "Liked Songs".to_string(),
+    }
+}
+
+/// Spotify's 404 body. `/items` is current; `/tracks` is the older path.
+fn replied_not_found(error: &Error) -> bool {
+    matches!(error, Error::Unavailable(reason) if reason.contains("replied 404"))
 }
 
 /// A Spotify id the player can load. Invalid ids never reach librespot.
@@ -1220,7 +1441,8 @@ fn restrict_credentials(dir: &Path) {
 }
 
 /// Catalogue backed by the signed-in account. Signed out searches are empty
-/// and do not use the network. Playlists are not part of this pass.
+/// and do not use the network. Library reads use the same token, client, and
+/// 429 handling as search. Signed out library reads do not use the network.
 pub struct SpotifyCatalogue {
     account: SpotifyAccount,
 }
@@ -1253,11 +1475,66 @@ impl MusicService for SpotifyCatalogue {
     }
 
     fn playlists(&self) -> Result<Vec<Playlist>, Error> {
-        Ok(Vec::new())
+        let Some(token) = self.account.bearer()? else {
+            return Err(signed_out_library());
+        };
+        let url = library_page_url(PLAYLISTS_URL);
+        let mut rows = vec![liked_songs_row()];
+        for playlist in read_pages(
+            &self.account,
+            &token,
+            &url,
+            PLAYLIST_CAP,
+            playlists_from_page_json,
+        )? {
+            if playlist.id != LIKED_SONGS_ID {
+                rows.push(playlist);
+            }
+        }
+        Ok(rows)
     }
 
-    fn playlist_tracks(&self, _playlist_id: &str) -> Result<Vec<Track>, Error> {
-        Err(Error::NotFound)
+    fn playlist_tracks(&self, playlist_id: &str) -> Result<Vec<Track>, Error> {
+        if playlist_id != LIKED_SONGS_ID && !playlist_id_ok(playlist_id) {
+            return Err(Error::NotFound);
+        }
+        let Some(token) = self.account.bearer()? else {
+            return Err(signed_out_library());
+        };
+        if playlist_id == LIKED_SONGS_ID {
+            let url = library_page_url(SAVED_TRACKS_URL);
+            return read_pages(
+                &self.account,
+                &token,
+                &url,
+                TRACK_CAP,
+                tracks_from_saved_page_json,
+            );
+        }
+        let items = library_page_url(&format!(
+            "https://api.spotify.com/v1/playlists/{playlist_id}/items"
+        ));
+        match read_pages(
+            &self.account,
+            &token,
+            &items,
+            TRACK_CAP,
+            tracks_from_playlist_page_json,
+        ) {
+            Err(error) if replied_not_found(&error) => {
+                let tracks = library_page_url(&format!(
+                    "https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
+                ));
+                read_pages(
+                    &self.account,
+                    &token,
+                    &tracks,
+                    TRACK_CAP,
+                    tracks_from_playlist_page_json,
+                )
+            }
+            other => other,
+        }
     }
 }
 
@@ -1532,6 +1809,13 @@ mod tests {
     use super::*;
 
     const SEARCH_FIXTURE: &str = include_str!("../tests/fixtures/spotify_search.json");
+    const PLAYLISTS_FIXTURE: &str = include_str!("../tests/fixtures/spotify_playlists_page.json");
+    const PLAYLISTS_NEXT_FIXTURE: &str =
+        include_str!("../tests/fixtures/spotify_playlists_page_2.json");
+    const PLAYLIST_TRACKS_FIXTURE: &str =
+        include_str!("../tests/fixtures/spotify_playlist_tracks_page.json");
+    const SAVED_TRACKS_FIXTURE: &str =
+        include_str!("../tests/fixtures/spotify_saved_tracks_page.json");
     const PREMIUM_FIXTURE: &str = include_str!("../tests/fixtures/spotify_profile_premium.json");
     const FREE_FIXTURE: &str = include_str!("../tests/fixtures/spotify_profile_free.json");
 
@@ -1775,7 +2059,19 @@ mod tests {
         assert!(catalogue.search("   ").expect("blank").is_empty());
         assert!(catalogue.account.runtime.lock().expect("runtime").is_none());
         assert!(!catalogue.account.can_play());
-        assert!(catalogue.playlists().expect("no library").is_empty());
+        let playlists = catalogue.playlists();
+        assert!(
+            matches!(playlists, Err(Error::Unavailable(ref reason)) if reason.contains("signed out")),
+            "{playlists:?}"
+        );
+        assert!(catalogue.account.runtime.lock().expect("runtime").is_none());
+        let liked = catalogue.playlist_tracks(LIKED_SONGS_ID);
+        assert!(
+            matches!(liked, Err(Error::Unavailable(ref reason)) if reason.contains("signed out")),
+            "{liked:?}"
+        );
+        assert_eq!(catalogue.playlist_tracks("../etc"), Err(Error::NotFound));
+        assert!(catalogue.account.runtime.lock().expect("runtime").is_none());
         assert_eq!(
             catalogue.resolve("5sWHDYs0csV6RS48xBl0tH"),
             Err(Error::NotFound)
@@ -1937,6 +2233,9 @@ mod tests {
         for error in [
             profile_from_json(body).expect_err("profile"),
             tracks_from_search_json(body).expect_err("search"),
+            playlists_from_page_json(body).expect_err("playlists"),
+            tracks_from_playlist_page_json(body).expect_err("playlist tracks"),
+            tracks_from_saved_page_json(body).expect_err("saved tracks"),
         ] {
             let Error::Unavailable(reason) = error else {
                 panic!("rate limits are unavailable");
@@ -1944,5 +2243,177 @@ mod tests {
             assert!(reason.contains("limiting requests"), "{reason}");
             assert_human_rate_limit(&reason);
         }
+    }
+
+    #[test]
+    fn playlist_pages_keep_named_lists_and_skip_bad_rows() {
+        let page = playlists_from_page_json(PLAYLISTS_FIXTURE).expect("playlists");
+        assert_eq!(
+            page.next.as_deref(),
+            Some("https://api.spotify.com/v1/me/playlists?offset=50&limit=50")
+        );
+        assert_eq!(page.items.len(), 2);
+        assert!(page.items.iter().all(|row| row.source == Source::Spotify));
+        assert_eq!(page.items[0].id, "37i9dQZF1DXcBWIGoYBM5M");
+        assert_eq!(page.items[0].name, "Low Glow");
+        assert_eq!(page.items[1].name, "Untitled playlist");
+
+        assert!(matches!(
+            playlists_from_page_json("not json"),
+            Err(Error::Unavailable(_))
+        ));
+        assert!(matches!(
+            playlists_from_page_json(r#"{"href":"https://api.spotify.com/v1/me/playlists"}"#),
+            Err(Error::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn playlist_track_pages_keep_tracks_from_either_wrapper() {
+        let page = tracks_from_playlist_page_json(PLAYLIST_TRACKS_FIXTURE).expect("tracks");
+        assert_eq!(page.next, None);
+        assert_eq!(page.items.len(), 2);
+        assert!(
+            page.items
+                .iter()
+                .all(|track| track.source == Source::Spotify)
+        );
+        assert_eq!(page.items[0].id, "5sWHDYs0csV6RS48xBl0tH");
+        assert_eq!(page.items[0].title, "Night Drive");
+        assert_eq!(page.items[0].artists, ["Ada Vega"]);
+        assert_eq!(page.items[0].album.as_deref(), Some("Low Glow"));
+        assert_eq!(page.items[0].duration, Duration::from_secs(192));
+        assert_eq!(page.items[1].title, "Glass House");
+        assert_eq!(page.items[1].artists, ["Ada Vega", "North Line"]);
+        assert_eq!(page.items[1].duration, Duration::from_secs(241));
+        assert!(page.items.iter().all(|track| track.title != "A Podcast"));
+        assert!(
+            page.items
+                .iter()
+                .all(|track| track.title != "On This Computer")
+        );
+        assert!(page.items.iter().all(|track| track.title != "Skipped"));
+    }
+
+    #[test]
+    fn saved_track_pages_keep_liked_songs_and_skip_nulls() {
+        let page = tracks_from_saved_page_json(SAVED_TRACKS_FIXTURE).expect("saved");
+        assert_eq!(
+            page.next.as_deref(),
+            Some("https://api.spotify.com/v1/me/tracks?offset=50&limit=50")
+        );
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].source, Source::Spotify);
+        assert_eq!(page.items[0].title, "Night Drive");
+        assert_eq!(page.items[0].album.as_deref(), Some("Low Glow"));
+        assert_eq!(page.items[0].duration, Duration::from_secs(192));
+    }
+
+    fn first_playlist_page() -> &'static str {
+        "https://api.spotify.com/v1/me/playlists?limit=50"
+    }
+
+    #[test]
+    fn library_pages_follow_next_in_order_and_stop() {
+        let first = first_playlist_page();
+        let second = "https://api.spotify.com/v1/me/playlists?offset=50&limit=50";
+        let mut calls = Vec::new();
+        let playlists = collect_pages(first, PLAYLIST_CAP, |url| {
+            calls.push(url.to_string());
+            let body = if url == first {
+                PLAYLISTS_FIXTURE
+            } else if url == second {
+                PLAYLISTS_NEXT_FIXTURE
+            } else {
+                panic!("unexpected page {url}");
+            };
+            playlists_from_page_json(body)
+        })
+        .expect("pages");
+        assert_eq!(calls, [first, second]);
+        assert_eq!(
+            playlists
+                .iter()
+                .map(|playlist| playlist.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Low Glow", "Untitled playlist", "Harbour"]
+        );
+    }
+
+    #[test]
+    fn library_pages_stop_at_the_cap_without_another_request() {
+        let first = first_playlist_page();
+        let mut calls = Vec::new();
+        let one = collect_pages(first, 1, |url| {
+            calls.push(url.to_string());
+            playlists_from_page_json(if url == first {
+                PLAYLISTS_FIXTURE
+            } else {
+                panic!("the cap stops before the next page");
+            })
+        })
+        .expect("cap");
+        assert_eq!(calls, [first]);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].name, "Low Glow");
+
+        let mut fetched = false;
+        let empty = collect_pages(first, 0, |_url| {
+            fetched = true;
+            playlists_from_page_json(PLAYLISTS_FIXTURE)
+        })
+        .expect("zero cap");
+        assert!(empty.is_empty());
+        assert!(!fetched);
+    }
+
+    #[test]
+    fn library_pages_do_not_follow_a_foreign_or_repeated_next_url() {
+        let first = first_playlist_page();
+        let mut hostile_calls = Vec::new();
+        let kept = collect_pages(first, PLAYLIST_CAP, |url| {
+            hostile_calls.push(url.to_string());
+            if url == first {
+                let mut page = playlists_from_page_json(PLAYLISTS_FIXTURE).expect("first");
+                page.next = Some("https://evil.example/v1/me/playlists".to_string());
+                Ok(page)
+            } else {
+                panic!("a non-Spotify next URL is not requested");
+            }
+        })
+        .expect("hostile");
+        assert_eq!(hostile_calls, [first]);
+        assert_eq!(kept.len(), 2);
+
+        let mut repeated = 0;
+        let stopped = collect_pages(first, PLAYLIST_CAP, |url| {
+            repeated += 1;
+            assert_eq!(url, first);
+            let mut page = playlists_from_page_json(PLAYLISTS_FIXTURE).expect("loop");
+            page.next = Some(first.to_string());
+            Ok(page)
+        })
+        .expect("repeat");
+        assert_eq!(repeated, 1);
+        assert_eq!(stopped.len(), 2);
+    }
+
+    #[test]
+    fn a_rate_limited_library_page_fails_the_walk_and_404_is_the_tracks_fallback() {
+        let failed = collect_pages(first_playlist_page(), PLAYLIST_CAP, |_url| {
+            playlists_from_page_json(
+                r#"{"error":{"status":429,"message":"API rate limit exceeded"}}"#,
+            )
+        });
+        let Err(Error::Unavailable(reason)) = failed else {
+            panic!("a rate-limited page fails the walk");
+        };
+        assert!(reason.contains("limiting requests"), "{reason}");
+        assert_human_rate_limit(&reason);
+
+        let missing = brief_message("Spotify replied 404: Not found");
+        assert!(replied_not_found(&missing));
+        let limited = brief_message("Spotify is limiting requests. Wait a moment and try again.");
+        assert!(!replied_not_found(&limited));
     }
 }

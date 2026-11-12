@@ -5,15 +5,15 @@
 //! is [`crate::youtube_music::YouTubeMusic`]. The play queue is
 //! [`crate::queue::Queue`].
 //!
-//! The window only calls [`MusicService::search`]. Resolve and playlists are
-//! the rest of the v1 contract, so the binary target treats them as dead
-//! until a player uses them.
+//! The window searches and, once an account is signed in, reads that
+//! account's playlists. [`MusicService::resolve`] stays on the trait until a
+//! caller needs one track by id.
 
 #![cfg_attr(
     not(test),
     allow(
         dead_code,
-        reason = "the window only searches; resolve and playlists are the rest of the v1 contract"
+        reason = "resolve stays on the trait until a caller needs one track by id"
     )
 )]
 
