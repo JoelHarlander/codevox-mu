@@ -3,7 +3,7 @@
 CodeVox mU is a native desktop app that will put Spotify and YouTube Music in one player.
 One search, one mixed queue, and mixed playlists.
 It targets Windows, macOS, and Linux.
-The licence is MIT. The UI toolkit is [iced](https://iced.rs). Accounts are still open. YouTube Music tracks play in the window.
+The licence is MIT. The UI toolkit is [iced](https://iced.rs). YouTube Music tracks play in the window. Signing in with a browser cookie shows that account's library and playlists. Spotify sign-in is still open.
 
 See the [decision log](docs/decisions.md) and the [backlog](docs/backlog.md).
 
@@ -16,6 +16,8 @@ cargo run --release
 ```
 
 The window is titled "CodeVox mU". The search box queries the in-memory Spotify mock and YouTube Music, and lists one row per recording, tagged by source, in the CodeVox style. YouTube Music search needs a network. If it fails, the Spotify rows stay and an error line is shown. Clicking a YouTube Music row plays it. A Spotify row is not played; the bar says Spotify playback is coming next.
+
+Sign in to YouTube Music from the button under the title. Paste the Cookie header from music.youtube.com while that browser is signed in. The header has to include SAPISID. The cookie is stored in the OS keyring, or in the per-user config directory when the keyring is unavailable. The library lists playlists, with Liked songs first. Opening a playlist and clicking a track plays it the same way a search hit does. Sign out forgets the cookie. Search itself does not need an account.
 
 ```sh
 cargo run --release -- --smoke
@@ -43,10 +45,11 @@ Windows needs the MSVC build tools. macOS needs the Xcode command line tools.
 `src/theme.rs` is the CodeVox visual style (`design/tokens.json`).
 `src/music.rs` is the service trait, the shared track and playlist types, the mixed queue, and the mock catalogues.
 `src/search.rs` merges per-service search hits into one list and collapses the same recording.
-`src/youtube_music.rs` is unauthenticated YouTube Music song search.
+`src/youtube_music.rs` searches YouTube Music without an account.
+`src/youtube_account.rs` signs in with a browser cookie and reads the library and playlists.
 `src/extract.rs` resolves a YouTube video id to an audio stream.
 `src/player.rs` is play, pause, stop, next, and previous over the mixed queue.
 `src/output.rs` decodes with symphonia and plays through cpal.
 `src/media_controls.rs` is OS media keys and the system now-playing overlay.
 `src/shell.rs` is the iced window.
-A new concern gets its own module when it has real code. Accounts are not in the tree yet.
+A new concern gets its own module when it has real code. Spotify accounts are not in the tree yet.

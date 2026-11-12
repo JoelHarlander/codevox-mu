@@ -12,6 +12,7 @@ mod player;
 mod search;
 mod shell;
 mod theme;
+mod youtube_account;
 mod youtube_music;
 
 use std::process::exit;

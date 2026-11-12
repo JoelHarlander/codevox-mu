@@ -26,6 +26,9 @@ innertube-rs = "0.10.1"
 # Symphonia decodes. cpal plays: WASAPI, CoreAudio, and ALSA.
 # Symphonia itself is MPL-2.0. rodio is MIT OR Apache-2.0.
 rodio = { version = "0.23.0", default-features = false, features = ["playback", "mp4", "wav"] }
+# YouTube Music browser cookies. The OS keyring when the session has one,
+# and a per-user file when it does not.
+keyring = "3"
 # OS media keys and the system overlay. MIT.
 # Linux is MPRIS through libdbus (the default backend). Windows is SMTC.
 # macOS is MPNowPlayingInfoCenter and MPRemoteCommandCenter.
