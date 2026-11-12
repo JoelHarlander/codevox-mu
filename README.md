@@ -15,15 +15,15 @@ Install the current stable Rust toolchain from <https://rustup.rs>. Then:
 cargo run --release
 ```
 
-The window is titled "CodeVox mU". Sign in to Spotify from the control under the title. The browser login uses Spotify's desktop client. The refresh token is stored in the OS cache directory for CodeVox mU, not in this repo. Search asks YouTube Music, and Spotify once you are signed in, and lists one row per recording, tagged by source, in the CodeVox style. Both searches need a network. If one fails, the other rows stay and an error line is shown. A Premium account plays a Spotify row in the window. A free account, or a failed sign-in, plays the YouTube Music match for that title and artist. The bar says so.
+The window is titled "CodeVox mU" and draws its own title bar, so the operating-system frame stays off. A sidebar switches Search, Queue, Library, and Accounts. Search asks YouTube Music, and Spotify once you are signed in, and lists one row per recording, tagged by source, in the CodeVox style. Both searches need a network. If one fails, the other rows stay and the error shows in a dismissible banner. The now-playing bar runs along the bottom of the window. A Premium account plays a Spotify row in the window. A free account, or a failed sign-in, plays the YouTube Music match for that title and artist. The bar says so.
 
-Sign in to YouTube Music from the button under the title. Paste the Cookie header from music.youtube.com while that browser is signed in. The header has to include SAPISID. The cookie is stored in the OS keyring, or in the per-user config directory when the keyring is unavailable. The library lists playlists, with Liked songs first. Opening a playlist and clicking a track plays it the same way a search hit does. Sign out forgets the cookie. Search itself does not need an account.
+Sign in from Accounts. Spotify opens the browser login for Spotify's desktop client. The refresh token is stored in the OS cache directory for CodeVox mU, not in this repo. YouTube Music takes the Cookie header from music.youtube.com while that browser is signed in. The header has to include SAPISID. The cookie is stored in the OS keyring, or in the per-user config directory when the keyring is unavailable. The library lists playlists, with Liked songs first. Opening a playlist and clicking a track plays it the same way a search hit does. Sign out forgets the cookie. Search itself does not need an account. The main screen only shows whether each service is signed in.
 
 ```sh
 cargo run --release -- --smoke
 ```
 
-`--smoke` draws three frames and exits 0. Any other argument is a usage error and exits 2. Continuous integration uses `--smoke` to prove the binary opens a window.
+`--smoke` draws three frames and exits 0. `--screenshot <path.png>` writes that file and a sibling `<name>-accounts.png`, then exits 0. Any other argument is a usage error and exits 2. Continuous integration uses `--smoke` to prove the binary opens a window.
 
 Unsigned installers for Windows, macOS, and Linux are built by the Package workflow and uploaded as Actions artifacts. See [install testing](docs/install-testing.md).
 
