@@ -24,6 +24,7 @@ Status: Done (real screen, 3 OSes) · Built (merged, CI green on 3 OSes, not yet
 | 12 | Synced lyrics | Not started |
 | 13 | Local files | Not started |
 | 14 | Release builds on GitHub Actions for all 3 OSes (artifacts only, no publishing) | Built (package workflow) |
+| 15 | Spotify Connect playback: Premium tracks play on an open Spotify device, with a device picker, seek and volume. In-app librespot audio is disabled (audio key error 0/1, librespot#1649). No open device falls back to the YouTube Music match | In progress |
 
 The ranking puts the playable core (1 to 5) first, so there's something real to test, then system integration (6), then libraries and playlists (7 to 10), then extras (11 to 13).
 
@@ -34,6 +35,7 @@ The ranking puts the playable core (1 to 5) first, so there's something real to 
 - Weekly check-in on Saturdays around 5am Sydney time (11 Nov 2026).
 - Visual style follows CodeVox (11 Nov 2026).
 - Spotify via librespot, with YouTube Music for everyone else (11 Nov 2026).
+- Spotify Connect for Premium playback. In-app librespot audio is disabled (12 Nov 2026).
 
 ## After v1
 

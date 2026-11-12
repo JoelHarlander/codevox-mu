@@ -6,13 +6,13 @@
 //! on a thread named `playback` so stream resolution and the device stay
 //! off the UI thread.
 //!
-//! A Spotify track plays through a [`SpotifyEngine`] when that account can
-//! play. Otherwise the title, artist, and duration are matched on YouTube
-//! Music and that stream plays, with [`SPOTIFY_FALLBACK_NOTE`]. If nothing
-//! matches, the track is skipped and [`SPOTIFY_UNAVAILABLE_NOTE`] is set.
-//! A track librespot cannot decrypt does the same match, with
-//! [`SPOTIFY_KEY_FALLBACK_NOTE`], and stays on screen with
-//! [`SPOTIFY_KEY_UNAVAILABLE_NOTE`] when YouTube Music has no match.
+//! A Spotify track plays through a [`SpotifyEngine`] when that account is
+//! Premium. Connect starts it when a device is open. Otherwise the title,
+//! artist, and duration are matched on YouTube Music. If nothing matches,
+//! the track stays put with [`OPEN_SPOTIFY`] when no device is open, or
+//! [`RECONNECT_PLAYBACK`] when the saved token cannot control playback.
+//! A free account uses [`SPOTIFY_FALLBACK_NOTE`] and
+//! [`SPOTIFY_UNAVAILABLE_NOTE`]. YouTube Music tracks play in-app.
 //! Local files are skipped with an error. A failure to resolve a stream or
 //! open the device is stored on the snapshot. Nothing here panics for those
 //! cases.
@@ -39,12 +39,36 @@ pub const SPOTIFY_UNAVAILABLE_NOTE: &str =
 ///
 /// Spotify stopped giving audio keys to some Premium accounts. librespot 0.8.0
 /// is the newest release, and upstream has no fix. See librespot-org/librespot#1649.
+/// In-app librespot audio is not the playback path. Connect is.
 pub const SPOTIFY_KEY_FALLBACK_NOTE: &str =
     "Spotify couldn't play this track, so it's playing from YouTube Music.";
 
 /// Shown when that match does not exist. The Spotify row stays put.
 pub const SPOTIFY_KEY_UNAVAILABLE_NOTE: &str =
     "Spotify couldn't play this track, and no YouTube Music match was found.";
+
+/// Connect could not find an open device, and YouTube Music is playing instead.
+pub const OPEN_SPOTIFY_FALLBACK: &str =
+    "Playing the YouTube Music match. Open Spotify on this computer or phone to play it there.";
+
+/// No Connect device and no YouTube Music match.
+pub const OPEN_SPOTIFY: &str = "Open Spotify on this computer or phone.";
+
+/// The saved Web API token cannot read or change playback.
+pub const RECONNECT_PLAYBACK: &str = "Reconnect Spotify to enable playback.";
+
+/// YouTube Music is playing because the token cannot control Connect.
+pub const RECONNECT_FALLBACK: &str =
+    "Reconnect Spotify to enable playback. Playing the YouTube Music match.";
+
+/// [`SpotifyEngine::load`] failed because no controllable device is open.
+pub const ERR_NO_DEVICE: &str = "connect: no device";
+
+/// [`SpotifyEngine::load`] was rejected because the account is not Premium.
+pub const ERR_NOT_PREMIUM: &str = "connect: not premium";
+
+/// [`SpotifyEngine::load`] was rejected because the token lacks playback scopes.
+pub const ERR_MISSING_SCOPE: &str = "connect: missing scope";
 
 const LOCAL_UNAVAILABLE: &str = "Local playback is not available yet";
 
@@ -81,6 +105,10 @@ pub struct NowPlaying {
     pub track_id: String,
     /// Tracks that play after this one, front first.
     pub upcoming: Vec<Track>,
+    /// Spotify Connect devices the listener can pick. Empty when none are known.
+    pub devices: Vec<DeviceOption>,
+    /// Volume of the selected device, when it can be set.
+    pub volume: Option<u8>,
 }
 
 impl Default for NowPlaying {
@@ -101,18 +129,34 @@ impl Default for NowPlaying {
             source: None,
             track_id: String::new(),
             upcoming: Vec::new(),
+            devices: Vec::new(),
+            volume: None,
         }
     }
 }
 
-/// Position reported by a Spotify engine.
+/// One Spotify Connect device in the transport.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceOption {
+    pub id: String,
+    pub name: String,
+    pub selected: bool,
+}
+
+/// Position reported by a Spotify engine.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct SpotifyFeed {
     pub position: Duration,
     pub finished: bool,
     pub failed: Option<String>,
-    /// A `Playing` event arrived in this poll.
+    /// A playing observation arrived in this poll.
     pub playing: bool,
+    /// `Some` when this poll read the remote play/pause state.
+    pub remote_playing: Option<bool>,
+    pub remote_id: Option<String>,
+    pub remote_title: Option<String>,
+    pub remote_artist: Option<String>,
+    pub remote_duration: Option<Duration>,
 }
 
 /// In-app Spotify audio. The mock used by tests never opens a device.
@@ -123,6 +167,31 @@ pub trait SpotifyEngine: Send {
     fn pause(&mut self);
     fn stop(&mut self);
     fn poll(&mut self) -> SpotifyFeed;
+
+    /// Refresh the device list. `true` when it changed.
+    fn refresh_devices(&mut self) -> bool {
+        false
+    }
+
+    fn devices(&self) -> Vec<DeviceOption> {
+        Vec::new()
+    }
+
+    fn volume(&self) -> Option<u8> {
+        None
+    }
+
+    fn select_device(&mut self, _id: &str) {}
+
+    fn seek(&mut self, _position: Duration) {}
+
+    fn set_volume(&mut self, _percent: u8) {}
+
+    /// Skip on the open Spotify device when the app queue has nothing next.
+    fn device_next(&mut self) {}
+
+    /// Skip backward on the open Spotify device when the app queue has no history.
+    fn device_previous(&mut self) {}
 }
 
 /// Finds a YouTube Music track for a Spotify row that cannot play.
@@ -180,6 +249,11 @@ pub struct Player<E, S> {
     spotify_position: Duration,
     spotify: Box<dyn SpotifyEngine>,
     matcher: Box<dyn YoutubeMatch>,
+    /// Ignore remote play/pause until this instant, so a click is not undone
+    /// by a player poll that has not caught up.
+    transport_hold: Option<std::time::Instant>,
+    remote_title: Option<String>,
+    remote_artist: Option<String>,
 }
 
 impl<E, S> Player<E, S>
@@ -205,6 +279,9 @@ where
             spotify_position: Duration::ZERO,
             spotify,
             matcher,
+            transport_hold: None,
+            remote_title: None,
+            remote_artist: None,
         }
     }
 
@@ -245,6 +322,23 @@ where
         self.advance();
     }
 
+    pub fn select_device(&mut self, id: String) {
+        self.spotify.select_device(&id);
+    }
+
+    pub fn seek(&mut self, position: Duration) {
+        if self.origin != AudioOrigin::Spotify {
+            return;
+        }
+        self.spotify.seek(position);
+        self.spotify_position = position;
+        self.hold_transport();
+    }
+
+    pub fn set_volume(&mut self, percent: u8) {
+        self.spotify.set_volume(percent);
+    }
+
     /// Play `track` now. A YouTube track replaces whatever is audible. A
     /// Spotify track plays in-app when the account can, and otherwise plays
     /// the YouTube Music match. A click that cannot play anything leaves the
@@ -275,6 +369,7 @@ where
                     self.sink.resume();
                 }
                 self.phase = Phase::Playing;
+                self.hold_transport();
             }
             Phase::Stopped => {
                 let replay_spotify = self
@@ -283,7 +378,7 @@ where
                     .is_some_and(|track| track.source == Source::Spotify);
                 if replay_spotify {
                     if let Some(track) = self.queue.current().cloned() {
-                        let _ = self.load_spotify(&track);
+                        self.replay_spotify(&track);
                     }
                 } else {
                     let _ = self.start_current();
@@ -301,6 +396,7 @@ where
                 self.sink.pause();
             }
             self.phase = Phase::Paused;
+            self.hold_transport();
         }
     }
 
@@ -313,11 +409,17 @@ where
                 AudioOrigin::None => {}
             }
             self.phase = Phase::Stopped;
+            self.hold_transport();
         }
     }
 
     /// Drop the current track and play the next queued one.
     pub fn next(&mut self) {
+        if self.origin == AudioOrigin::Spotify && self.queue.is_empty() {
+            self.spotify.device_next();
+            self.hold_transport();
+            return;
+        }
         self.halt_audio();
         self.queue.forward();
         self.phase = Phase::Idle;
@@ -330,6 +432,11 @@ where
     /// A Spotify entry plays in-app when the account can, and otherwise plays
     /// its YouTube Music match. Local files in the history are skipped.
     pub fn previous(&mut self) {
+        if self.origin == AudioOrigin::Spotify && !self.queue.has_history() {
+            self.spotify.device_previous();
+            self.hold_transport();
+            return;
+        }
         self.halt_audio();
         let retreat = self.queue.back();
         if retreat.skipped_local {
@@ -353,11 +460,13 @@ where
     ///
     /// Returns whether the current track changed.
     pub fn poll(&mut self) -> bool {
+        let devices_changed = self.spotify.refresh_devices();
         if self.origin == AudioOrigin::Spotify
             && matches!(self.phase, Phase::Playing | Phase::Paused)
         {
             let feed = self.spotify.poll();
             self.spotify_position = feed.position;
+            self.apply_remote(&feed);
             if let Some(message) = feed.failed {
                 log::info!("spotify playback failed: {message}");
                 self.spotify.stop();
@@ -367,11 +476,21 @@ where
                 if let Some(track) = self.queue.current().cloned()
                     && track.source == Source::Spotify
                 {
-                    self.play_youtube_match(
-                        &track,
-                        SPOTIFY_KEY_FALLBACK_NOTE,
-                        SPOTIFY_KEY_UNAVAILABLE_NOTE,
-                    );
+                    if message.contains("audio key") {
+                        self.play_youtube_match(
+                            &track,
+                            SPOTIFY_KEY_FALLBACK_NOTE,
+                            SPOTIFY_KEY_UNAVAILABLE_NOTE,
+                        );
+                    } else if let Some(miss) = connect_miss(&message) {
+                        let _ = self.resolve_miss(miss, false);
+                    } else {
+                        self.play_youtube_match(
+                            &track,
+                            SPOTIFY_KEY_FALLBACK_NOTE,
+                            SPOTIFY_KEY_UNAVAILABLE_NOTE,
+                        );
+                    }
                 } else {
                     self.error = Some(format!("Spotify playback failed: {message}"));
                 }
@@ -381,13 +500,14 @@ where
                 self.queue.forward();
                 self.origin = AudioOrigin::None;
                 self.phase = Phase::Idle;
+                self.clear_remote();
                 self.advance();
                 return true;
             }
-            return false;
+            return devices_changed;
         }
         if self.phase != Phase::Playing || !self.sink.finished() {
-            return false;
+            return devices_changed;
         }
         self.queue.forward();
         self.origin = AudioOrigin::None;
@@ -398,13 +518,20 @@ where
 
     pub fn view(&self) -> NowPlaying {
         let (title, artist, source, track_id, has_current) = match self.queue.current() {
-            Some(track) => (
-                track.title.clone(),
-                artist_line(track),
-                Some(track.source),
-                track.id.clone(),
-                true,
-            ),
+            Some(track) => {
+                let remote = self.origin == AudioOrigin::Spotify;
+                let title = self
+                    .remote_title
+                    .clone()
+                    .filter(|_| remote)
+                    .unwrap_or_else(|| track.title.clone());
+                let artist = self
+                    .remote_artist
+                    .clone()
+                    .filter(|artist| remote && !artist.is_empty())
+                    .unwrap_or_else(|| artist_line(track));
+                (title, artist, Some(track.source), track.id.clone(), true)
+            }
             None => (String::new(), String::new(), None, String::new(), false),
         };
         NowPlaying {
@@ -427,6 +554,8 @@ where
             source,
             track_id,
             upcoming: self.queue.upcoming().to_vec(),
+            devices: self.spotify.devices(),
+            volume: self.spotify.volume(),
         }
     }
 
@@ -445,17 +574,26 @@ where
             .is_some_and(|track| track.source == Source::Spotify);
         if replay_spotify {
             if let Some(track) = self.queue.current().cloned() {
-                let _ = self.load_spotify(&track);
+                self.replay_spotify(&track);
             }
         } else {
             let _ = self.start_current();
         }
     }
 
+    fn replay_spotify(&mut self, track: &Track) {
+        match self.start_spotify(track) {
+            SpotifyStart::Playing | SpotifyStart::Failed => {}
+            SpotifyStart::Miss(kind) => {
+                let _ = self.resolve_miss(kind, false);
+            }
+        }
+    }
+
     /// A Spotify track from the history. Same outcome as clicking the row.
     fn play_spotify_from_history(&mut self, track: Track) {
         if self.spotify.can_play() {
-            let _ = self.load_spotify(&track);
+            self.replay_spotify(&track);
             return;
         }
         match self
@@ -567,6 +705,7 @@ where
         self.duration = track.duration;
         self.queue.load(track);
         self.phase = Phase::Stopped;
+        self.clear_remote();
         let started = self.start_current();
         match &started {
             Start::Playing => self.note = note,
@@ -582,62 +721,77 @@ where
     /// A clicked Spotify row. Does not stop the current track unless Spotify
     /// or a YouTube Music match can actually start.
     fn play_spotify_now(&mut self, track: Track) {
-        if self.spotify.can_play() {
-            self.halt_audio();
-            self.queue.remember_current();
-            self.note = None;
-            let _ = self.load_spotify(&track);
+        if !self.spotify.can_play() {
+            match self
+                .matcher
+                .find(&track.title, &track.artists, track.duration)
+            {
+                Ok(Some(matched)) => {
+                    self.halt_audio();
+                    self.queue.remember_current();
+                    self.note = None;
+                    let _ = self.play_stream(matched, Some(SPOTIFY_FALLBACK_NOTE.to_string()));
+                }
+                Ok(None) => {
+                    self.note = Some(SPOTIFY_UNAVAILABLE_NOTE.to_string());
+                }
+                Err(message) => {
+                    self.error = Some(format!("Couldn't find a YouTube Music match: {message}"));
+                    self.note = Some(SPOTIFY_UNAVAILABLE_NOTE.to_string());
+                }
+            }
             return;
         }
-        match self
-            .matcher
-            .find(&track.title, &track.artists, track.duration)
-        {
-            Ok(Some(matched)) => {
-                self.halt_audio();
-                self.queue.remember_current();
-                self.note = None;
-                let _ = self.play_stream(matched, Some(SPOTIFY_FALLBACK_NOTE.to_string()));
-            }
-            Ok(None) => {
-                self.note = Some(SPOTIFY_UNAVAILABLE_NOTE.to_string());
-            }
-            Err(message) => {
-                self.error = Some(format!("Couldn't find a YouTube Music match: {message}"));
-                self.note = Some(SPOTIFY_UNAVAILABLE_NOTE.to_string());
+        self.halt_audio();
+        self.queue.remember_current();
+        self.note = None;
+        match self.start_spotify(&track) {
+            SpotifyStart::Playing | SpotifyStart::Failed => {}
+            SpotifyStart::Miss(kind) => {
+                let _ = self.resolve_miss(kind, false);
             }
         }
     }
 
-    fn load_spotify(&mut self, track: &Track) -> Start {
+    fn start_spotify(&mut self, track: &Track) -> SpotifyStart {
         self.duration = track.duration;
         self.queue.load(track.clone());
         self.spotify_position = Duration::ZERO;
+        self.clear_remote();
         match self.spotify.load(&track.id) {
             Ok(()) => {
                 self.origin = AudioOrigin::Spotify;
                 self.phase = Phase::Playing;
                 self.error = None;
-                Start::Playing
+                self.hold_transport();
+                SpotifyStart::Playing
             }
             Err(message) => {
                 self.origin = AudioOrigin::None;
                 self.phase = Phase::Stopped;
-                self.error = Some(format!("Couldn't play the Spotify track: {message}"));
-                Start::Skip
+                if let Some(kind) = connect_miss(&message) {
+                    SpotifyStart::Miss(kind)
+                } else {
+                    self.error = Some(format!("Couldn't play the Spotify track: {message}"));
+                    SpotifyStart::Failed
+                }
             }
         }
     }
 
     fn advance(&mut self) {
         self.queue.fill_current();
-        let mut skipped_spotify = false;
+        let mut skip_note: Option<&'static str> = None;
         loop {
             let Some(track) = self.queue.current().cloned() else {
                 self.phase = Phase::Idle;
                 self.origin = AudioOrigin::None;
-                if skipped_spotify {
-                    self.note = Some(SPOTIFY_UNAVAILABLE_NOTE.to_string());
+                if let Some(note) = skip_note {
+                    if note == OPEN_SPOTIFY || note == RECONNECT_PLAYBACK {
+                        self.error = Some(note.to_string());
+                    } else {
+                        self.note = Some(note.to_string());
+                    }
                 }
                 return;
             };
@@ -649,16 +803,18 @@ where
                 }
                 Source::Spotify => {
                     if self.spotify.can_play() {
-                        match self.load_spotify(&track) {
-                            Start::Playing => {
-                                self.note =
-                                    skipped_spotify.then(|| SPOTIFY_UNAVAILABLE_NOTE.to_string());
+                        match self.start_spotify(&track) {
+                            SpotifyStart::Playing => {
+                                self.note = skip_note.map(str::to_string);
                                 return;
                             }
-                            Start::Stop => return,
-                            Start::Skip => {
+                            SpotifyStart::Failed => {
                                 self.queue.remove_current();
                             }
+                            SpotifyStart::Miss(kind) => match self.resolve_miss(kind, true) {
+                                Start::Playing | Start::Stop => return,
+                                Start::Skip => skip_note = Some(missing_message(kind)),
+                            },
                         }
                     } else {
                         match self
@@ -678,20 +834,20 @@ where
                                 }
                             }
                             Ok(None) => {
-                                skipped_spotify = true;
+                                skip_note = Some(SPOTIFY_UNAVAILABLE_NOTE);
                                 self.queue.remove_current();
                             }
                             Err(message) => {
                                 self.error =
                                     Some(format!("Couldn't find a YouTube Music match: {message}"));
-                                skipped_spotify = true;
+                                skip_note = Some(SPOTIFY_UNAVAILABLE_NOTE);
                                 self.queue.remove_current();
                             }
                         }
                     }
                 }
                 Source::YouTubeMusic => {
-                    let note = skipped_spotify.then(|| SPOTIFY_UNAVAILABLE_NOTE.to_string());
+                    let note = skip_note.map(str::to_string);
                     match self.play_stream(track, note) {
                         Start::Playing | Start::Stop => return,
                         Start::Skip => {
@@ -702,6 +858,132 @@ where
             }
         }
     }
+
+    fn hold_transport(&mut self) {
+        self.transport_hold = Some(std::time::Instant::now() + Duration::from_secs(2));
+    }
+
+    fn clear_remote(&mut self) {
+        self.remote_title = None;
+        self.remote_artist = None;
+    }
+
+    fn apply_remote(&mut self, feed: &SpotifyFeed) {
+        if feed.remote_title.is_some() {
+            self.remote_title = feed.remote_title.clone();
+            self.remote_artist = feed.remote_artist.clone();
+        }
+        if let Some(duration) = feed.remote_duration
+            && duration > Duration::ZERO
+        {
+            self.duration = duration;
+        }
+        let held = self
+            .transport_hold
+            .is_some_and(|until| std::time::Instant::now() < until);
+        if held {
+            return;
+        }
+        if let Some(playing) = feed.remote_playing {
+            if playing && self.phase == Phase::Paused {
+                self.phase = Phase::Playing;
+            } else if !playing && self.phase == Phase::Playing && !feed.finished {
+                self.phase = Phase::Paused;
+            }
+        }
+    }
+
+    fn resolve_miss(&mut self, kind: ConnectMiss, remove_on_skip: bool) -> Start {
+        let Some(track) = self.queue.current().cloned() else {
+            return Start::Stop;
+        };
+        match self
+            .matcher
+            .find(&track.title, &track.artists, track.duration)
+        {
+            Ok(Some(matched)) => self.play_stream(matched, Some(playing_note(kind).to_string())),
+            Ok(None) => {
+                if remove_on_skip {
+                    self.queue.remove_current();
+                    Start::Skip
+                } else {
+                    self.apply_missing(kind);
+                    Start::Stop
+                }
+            }
+            Err(message) => {
+                log::info!("youtube music match failed: {message}");
+                if remove_on_skip {
+                    self.error = Some(format!("Couldn't find a YouTube Music match: {message}"));
+                    self.queue.remove_current();
+                    Start::Skip
+                } else if missing_is_error(kind) {
+                    self.error = Some(missing_message(kind).to_string());
+                    self.note = None;
+                    Start::Stop
+                } else {
+                    self.error = Some(format!("Couldn't find a YouTube Music match: {message}"));
+                    self.note = Some(missing_message(kind).to_string());
+                    Start::Stop
+                }
+            }
+        }
+    }
+
+    fn apply_missing(&mut self, kind: ConnectMiss) {
+        let message = missing_message(kind);
+        if missing_is_error(kind) {
+            self.error = Some(message.to_string());
+            self.note = None;
+        } else {
+            self.note = Some(message.to_string());
+        }
+    }
+}
+
+enum SpotifyStart {
+    Playing,
+    Failed,
+    Miss(ConnectMiss),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectMiss {
+    NoDevice,
+    NotPremium,
+    MissingScope,
+}
+
+fn connect_miss(message: &str) -> Option<ConnectMiss> {
+    if message == ERR_NO_DEVICE {
+        Some(ConnectMiss::NoDevice)
+    } else if message == ERR_NOT_PREMIUM {
+        Some(ConnectMiss::NotPremium)
+    } else if message == ERR_MISSING_SCOPE {
+        Some(ConnectMiss::MissingScope)
+    } else {
+        None
+    }
+}
+
+fn playing_note(kind: ConnectMiss) -> &'static str {
+    match kind {
+        ConnectMiss::NoDevice => OPEN_SPOTIFY_FALLBACK,
+        ConnectMiss::NotPremium => SPOTIFY_FALLBACK_NOTE,
+        ConnectMiss::MissingScope => RECONNECT_FALLBACK,
+    }
+}
+
+fn missing_message(kind: ConnectMiss) -> &'static str {
+    match kind {
+        ConnectMiss::NoDevice => OPEN_SPOTIFY,
+        ConnectMiss::NotPremium => SPOTIFY_UNAVAILABLE_NOTE,
+        ConnectMiss::MissingScope => RECONNECT_PLAYBACK,
+    }
+}
+
+fn missing_is_error(kind: ConnectMiss) -> bool {
+    matches!(kind, ConnectMiss::NoDevice | ConnectMiss::MissingScope)
 }
 
 fn artist_line(track: &Track) -> String {
@@ -721,6 +1003,9 @@ enum Command {
     MoveLater(usize),
     RemoveQueued(usize),
     RemoveCurrent,
+    SelectDevice(String),
+    Seek(Duration),
+    SetVolume(u8),
 }
 
 /// Handle the window keeps. Commands go to the playback thread.
@@ -811,6 +1096,18 @@ impl Playback {
 
     pub fn remove_current(&self) {
         self.send(Command::RemoveCurrent);
+    }
+
+    pub fn select_device(&self, id: String) {
+        self.send(Command::SelectDevice(id));
+    }
+
+    pub fn seek(&self, position: Duration) {
+        self.send(Command::Seek(position));
+    }
+
+    pub fn set_volume(&self, percent: u8) {
+        self.send(Command::SetVolume(percent));
     }
 
     pub fn now(&self) -> NowPlaying {
@@ -913,6 +1210,9 @@ fn dispatch(
         Command::MoveLater(index) => player.move_later(index),
         Command::RemoveQueued(index) => player.remove_queued(index),
         Command::RemoveCurrent => player.remove_current(),
+        Command::SelectDevice(id) => player.select_device(id),
+        Command::Seek(position) => player.seek(position),
+        Command::SetVolume(percent) => player.set_volume(percent),
     }
 }
 
@@ -933,6 +1233,8 @@ fn loading_now(track: &Track, queue: &Queue) -> NowPlaying {
         source: Some(track.source),
         track_id: track.id.clone(),
         upcoming: queue.upcoming().to_vec(),
+        devices: Vec::new(),
+        volume: None,
     }
 }
 
@@ -1094,6 +1396,7 @@ mod tests {
         failed: Option<String>,
         /// The next poll reports this, once. Models an audio key refusal.
         fail_playback: bool,
+        fail_message: Option<String>,
     }
 
     impl FakeSpotify {
@@ -1109,6 +1412,7 @@ mod tests {
                 finished: false,
                 failed: None,
                 fail_playback: false,
+                fail_message: None,
             }
         }
 
@@ -1132,6 +1436,9 @@ mod tests {
 
         fn load(&mut self, track_id: &str) -> Result<(), String> {
             self.loads.push(track_id.to_string());
+            if let Some(message) = &self.fail_message {
+                return Err(message.clone());
+            }
             if self.fail_load {
                 return Err("track refused".into());
             }
@@ -1164,6 +1471,7 @@ mod tests {
                     .then(|| "audio key error".to_string())
                     .or_else(|| self.failed.clone()),
                 playing: false,
+                ..SpotifyFeed::default()
             }
         }
     }
@@ -1636,6 +1944,53 @@ mod tests {
         assert_eq!(now.note.as_deref(), Some(SPOTIFY_KEY_UNAVAILABLE_NOTE));
         assert!(now.error.is_none(), "{:?}", now.error);
         assert!(player.extractor.calls.is_empty());
+    }
+
+    #[test]
+    fn no_connect_device_plays_the_youtube_match() {
+        let mut engine = FakeSpotify::premium();
+        engine.fail_message = Some(ERR_NO_DEVICE.to_string());
+        let mut matcher = FakeMatch::none();
+        matcher.track = Some(yt("yt-match", "Night Drive (Live)"));
+        let mut player = machine_with(engine, matcher);
+
+        player.play_now(spotify("5sWHDYs0csV6RS48xBl0tH", "Night Drive"));
+
+        let now = player.view();
+        assert_eq!(now.phase, Phase::Playing);
+        assert_eq!(now.title, "Night Drive (Live)");
+        assert_eq!(now.note.as_deref(), Some(OPEN_SPOTIFY_FALLBACK));
+        assert!(now.error.is_none(), "{:?}", now.error);
+        assert_eq!(player.extractor.calls, ["yt-match"]);
+    }
+
+    #[test]
+    fn no_connect_device_without_a_match_asks_to_open_spotify() {
+        let mut engine = FakeSpotify::premium();
+        engine.fail_message = Some(ERR_NO_DEVICE.to_string());
+        let mut player = machine_with(engine, FakeMatch::none());
+
+        player.play_now(spotify("5sWHDYs0csV6RS48xBl0tH", "Night Drive"));
+
+        let now = player.view();
+        assert_eq!(now.phase, Phase::Stopped);
+        assert_eq!(now.title, "Night Drive");
+        assert_eq!(now.source, Some(Source::Spotify));
+        assert_eq!(now.error.as_deref(), Some(OPEN_SPOTIFY));
+        assert!(player.extractor.calls.is_empty());
+    }
+
+    #[test]
+    fn a_missing_playback_scope_asks_to_reconnect() {
+        let mut engine = FakeSpotify::premium();
+        engine.fail_message = Some(ERR_MISSING_SCOPE.to_string());
+        let mut player = machine_with(engine, FakeMatch::none());
+
+        player.play_now(spotify("5sWHDYs0csV6RS48xBl0tH", "Night Drive"));
+
+        let now = player.view();
+        assert_eq!(now.error.as_deref(), Some(RECONNECT_PLAYBACK));
+        assert_eq!(now.title, "Night Drive");
     }
 
     #[test]

@@ -1,23 +1,18 @@
-//! Spotify sign-in and playback through librespot.
+//! Spotify sign-in, catalogue, and Connect playback.
 //!
 //! Web API calls and the PKCE sign-in use CodeVox mU's own client id
 //! ([`web_client_id`]). It is a public PKCE client. There is no client secret.
 //! The desktop id librespot ships is shared by every librespot app, and Spotify
 //! rate-limits that id for Web API calls.
 //!
-//! librespot 0.8 only completes its client-token and login5 steps for an
-//! official Spotify client id. An access token minted for this app's client is
-//! rejected, so playback is a second PKCE login with [`desktop_client_id`].
-//! Premium sign-in opens the browser twice. A free account never starts that
-//! second login.
+//! Premium audio goes through Spotify Connect ([`connect`]): the user's open
+//! Spotify app plays the track. In-app librespot audio is disabled.
+//! Newer accounts fail with audio key error 0/1, and librespot 0.8 has no fix
+//! (librespot-org/librespot#1649). The librespot session code stays compiled
+//! behind [`LIBRESPOT_AUDIO`] so it is not on the playback path.
 //!
-//! Both refresh tokens, and librespot's reusable credentials, are written under
-//! the OS cache directory, mode `0600` where the platform has modes. They are
-//! never written into the repo.
-//!
-//! Playback uses [librespot-playback](https://crates.io/crates/librespot-playback)
-//! (MIT). Its rodio backend links an older `alsa-sys` than the YouTube player,
-//! so decoded PCM is handed to this app's rodio 0.23 device instead.
+//! The Web API refresh token is written under the OS cache directory, mode
+//! `0600` where the platform has modes. It is never written into the repo.
 //!
 //! librespot calls `process::exit` when a session's product info is not
 //! Premium. A free account is detected from the Web API profile and never
@@ -52,6 +47,9 @@ use oauth2::{
 use crate::music::{Error, MusicService, Playlist, Source, Track};
 use crate::player::{SpotifyEngine, SpotifyFeed};
 
+#[path = "connect.rs"]
+mod connect;
+
 /// How long an error row is allowed to get.
 const ERROR_CHARS: usize = 160;
 
@@ -68,8 +66,10 @@ const BROWSER_MESSAGE: &str = "Signed in. You can close this tab and return to C
 const PLAYBACK_BROWSER_MESSAGE: &str =
     "Playback is signed in. You can close this tab and return to CodeVox mU.";
 
-/// Scopes for the Web API sign-in. The library reads are included so the
-/// account is asked once. `streaming` stays on this consent as well.
+/// Scopes for the Web API sign-in. The library reads and the Connect player
+/// scopes are included so the account is asked once. `streaming` stays on
+/// this consent as well. A token saved before the player scopes existed has
+/// to be granted again; see [`AccountPhase::PlaybackReconnect`].
 const SCOPES: &[&str] = &[
     "streaming",
     "user-read-private",
@@ -77,7 +77,15 @@ const SCOPES: &[&str] = &[
     "user-library-read",
     "playlist-read-private",
     "playlist-read-collaborative",
+    SCOPE_READ_PLAYBACK,
+    SCOPE_MODIFY_PLAYBACK,
 ];
+
+const SCOPE_READ_PLAYBACK: &str = "user-read-playback-state";
+const SCOPE_MODIFY_PLAYBACK: &str = "user-modify-playback-state";
+
+/// In-app librespot audio is off. Connect is the playback path.
+const LIBRESPOT_AUDIO: bool = false;
 
 /// The desktop login only mints the token librespot's session accepts.
 const PLAYBACK_SCOPES: &[&str] = &["streaming"];
@@ -118,8 +126,14 @@ const QUEUED_CHUNKS: usize = 8;
 pub enum AccountPhase {
     SignedOut,
     SigningIn,
-    /// Premium. `name` is the display name, or the account id.
+    /// Premium, with the Connect playback scopes. `name` is the display name,
+    /// or the account id.
     SignedIn {
+        name: String,
+    },
+    /// Signed in, but the saved grant cannot start or move playback.
+    /// Search and the library still work. The window asks for a new consent.
+    PlaybackReconnect {
         name: String,
     },
     /// Signed in, and Spotify audio is unavailable. Playback uses YouTube Music.
@@ -145,8 +159,10 @@ pub enum AccountTone {
 pub struct AccountPresentation {
     pub text: String,
     pub tone: AccountTone,
-    /// `true` when the "Sign in to Spotify" control should be pressable.
+    /// `true` when the sign-in control should be pressable.
     pub offer_sign_in: bool,
+    /// `true` when that control should read "Reconnect Spotify".
+    pub reconnect: bool,
 }
 
 /// Label for the account row. Pure: no account and no network.
@@ -156,16 +172,25 @@ pub fn present_account(phase: &AccountPhase) -> AccountPresentation {
             text: "Spotify is signed out.".to_string(),
             tone: AccountTone::Muted,
             offer_sign_in: true,
+            reconnect: false,
         },
         AccountPhase::SigningIn => AccountPresentation {
             text: "Signing in to Spotify…".to_string(),
             tone: AccountTone::Muted,
             offer_sign_in: false,
+            reconnect: false,
         },
         AccountPhase::SignedIn { name } => AccountPresentation {
             text: format!("Signed in as {}", account_name(name)),
             tone: AccountTone::Normal,
             offer_sign_in: false,
+            reconnect: false,
+        },
+        AccountPhase::PlaybackReconnect { .. } => AccountPresentation {
+            text: crate::player::RECONNECT_PLAYBACK.to_string(),
+            tone: AccountTone::Warning,
+            offer_sign_in: true,
+            reconnect: true,
         },
         AccountPhase::NotPremium { name } => AccountPresentation {
             text: format!(
@@ -174,11 +199,13 @@ pub fn present_account(phase: &AccountPhase) -> AccountPresentation {
             ),
             tone: AccountTone::Warning,
             offer_sign_in: false,
+            reconnect: false,
         },
         AccountPhase::Failed { message } => AccountPresentation {
             text: message.clone(),
             tone: AccountTone::Error,
             offer_sign_in: true,
+            reconnect: false,
         },
     }
 }
@@ -909,6 +936,8 @@ struct Inner {
     refresh_token: Option<String>,
     session: Option<Session>,
     premium: bool,
+    /// Both Connect scopes were on the last refreshed token.
+    playback_scopes: bool,
     name: String,
     device_id: String,
     failure: Option<String>,
@@ -923,6 +952,7 @@ impl Inner {
             refresh_token: None,
             session: None,
             premium: false,
+            playback_scopes: false,
             name: String::new(),
             device_id: String::new(),
             failure: None,
@@ -938,22 +968,22 @@ impl Inner {
         if self.refresh_token.is_none() && self.access_token.is_none() {
             return AccountPhase::SignedOut;
         }
-        if self.premium && self.session.is_some() {
-            AccountPhase::SignedIn {
+        if self.refresh_token.is_some() && !self.premium {
+            return AccountPhase::NotPremium {
                 name: self.name.clone(),
-            }
-        } else if self.refresh_token.is_some() && !self.premium {
-            AccountPhase::NotPremium {
-                name: self.name.clone(),
-            }
-        } else if self.failure.is_none() && self.refresh_token.is_some() {
-            // Premium, but the session is not up yet. The caller is still connecting.
-            AccountPhase::SignedIn {
-                name: self.name.clone(),
-            }
-        } else {
-            AccountPhase::SignedOut
+            };
         }
+        if self.premium && !self.playback_scopes {
+            return AccountPhase::PlaybackReconnect {
+                name: self.name.clone(),
+            };
+        }
+        if self.premium && self.playback_scopes {
+            return AccountPhase::SignedIn {
+                name: self.name.clone(),
+            };
+        }
+        AccountPhase::SignedOut
     }
 }
 
@@ -1084,27 +1114,26 @@ impl SpotifyAccount {
             return self.current_phase();
         }
 
-        // Playback is a different client. Do it before saving, so a cancelled
-        // browser does not leave a Premium account with no playback token.
-        let (playback_access, playback_refresh) = if profile.premium {
-            match playback_credentials(playback_refresh_token, !prefer_saved_credentials) {
-                Ok(pair) => pair,
-                Err(error) => {
-                    return self.fail(
-                        epoch,
-                        scrub(
-                            &error,
-                            &[
-                                &refresh_token,
-                                &refreshed.access_token,
-                                playback_refresh_token,
-                            ],
-                        ),
-                    );
-                }
+        let playback_scopes = has_playback_scopes(&refreshed.scopes);
+        let (playback_access, playback_refresh) = match playback_login(
+            profile.premium,
+            playback_refresh_token,
+            !prefer_saved_credentials,
+        ) {
+            Ok(pair) => pair,
+            Err(error) => {
+                return self.fail(
+                    epoch,
+                    scrub(
+                        &error,
+                        &[
+                            &refresh_token,
+                            &refreshed.access_token,
+                            playback_refresh_token,
+                        ],
+                    ),
+                );
             }
-        } else {
-            (String::new(), String::new())
         };
         if !self.still(epoch) {
             return self.current_phase();
@@ -1145,49 +1174,43 @@ impl SpotifyAccount {
         log::info!("spotify sign-in: account saved");
 
         // Free and unknown plans must not reach Session::connect. librespot
-        // exits the process when the product info is not Premium.
+        // exits the process when the product info is not Premium. Connect
+        // does not open a session either way.
         log::info!(
             "spotify sign-in: profile {} ({})",
             profile.name,
             profile.product
         );
-        if !profile.premium {
-            self.commit(epoch, |inner| {
-                inner.access_token = Some(refreshed.access_token.clone());
-                inner.access_until = Some(refreshed.expires_at);
-                inner.refresh_token = Some(refresh_token.clone());
-                inner.session = None;
-                inner.premium = false;
-                inner.name = profile.name.clone();
-                inner.device_id = device_id.clone();
-                inner.failure = None;
-            });
-            return self.current_phase();
-        }
-
-        match self.connect(
+        let session = match self.start_librespot(
+            profile.premium,
             &cache,
             &device_id,
             &playback_access,
             &playback_refresh,
             prefer_saved_credentials,
         ) {
-            Ok(session) => {
-                log::info!("spotify sign-in: playback session connected");
-                self.commit(epoch, |inner| {
-                    inner.access_token = Some(refreshed.access_token.clone());
-                    inner.access_until = Some(refreshed.expires_at);
-                    inner.refresh_token = Some(refresh_token.clone());
-                    inner.session = Some(session);
-                    inner.premium = true;
-                    inner.name = profile.name.clone();
-                    inner.device_id = device_id;
-                    inner.failure = None;
-                });
-                self.current_phase()
-            }
-            Err(error) => self.fail(epoch, error),
+            Ok(session) => session,
+            Err(error) => return self.fail(epoch, error),
+        };
+        if session.is_some() {
+            log::info!("spotify sign-in: playback session connected");
+        } else if profile.premium && playback_scopes {
+            log::info!("spotify sign-in: playback uses Spotify Connect");
+        } else if profile.premium {
+            log::info!("spotify sign-in: playback scopes are missing, reconnect required");
         }
+        self.commit(epoch, |inner| {
+            inner.access_token = Some(refreshed.access_token.clone());
+            inner.access_until = Some(refreshed.expires_at);
+            inner.refresh_token = Some(refresh_token.clone());
+            inner.session = session;
+            inner.premium = profile.premium;
+            inner.playback_scopes = playback_scopes;
+            inner.name = profile.name.clone();
+            inner.device_id = device_id;
+            inner.failure = None;
+        });
+        self.current_phase()
     }
 
     fn connect(
@@ -1236,55 +1259,116 @@ impl SpotifyAccount {
         self.http_get(PROFILE_URL, access_token, &[])
     }
 
+    /// librespot session, or `None` while [`LIBRESPOT_AUDIO`] is off.
+    ///
+    /// The `connect` call stays in this function so the audio path still
+    /// type-checks. It is not run: newer accounts only get audio key errors.
+    #[allow(unreachable_code)]
+    fn start_librespot(
+        &self,
+        premium: bool,
+        cache: &Path,
+        device_id: &str,
+        access_token: &str,
+        refresh_token: &str,
+        prefer_saved_credentials: bool,
+    ) -> Result<Option<Session>, String> {
+        if !premium || !LIBRESPOT_AUDIO {
+            return Ok(None);
+        }
+        self.connect(
+            cache,
+            device_id,
+            access_token,
+            refresh_token,
+            prefer_saved_credentials,
+        )
+        .map(Some)
+    }
+
     fn http_get(
         &self,
         url: &str,
         access_token: &str,
         query: &[(&str, &str)],
     ) -> Result<String, Error> {
+        let query = owned_query(query);
+        self.request(Verb::Get, url, &query, None, access_token)
+            .map(|reply| reply.body)
+    }
+
+    fn request(
+        &self,
+        verb: Verb,
+        url: &str,
+        query: &[(String, String)],
+        body: Option<serde_json::Value>,
+        access_token: &str,
+    ) -> Result<RawReply, Error> {
         let handle = self.handle()?;
         let client = self.http_client()?;
         let url = url.to_string();
         let access_token = access_token.to_string();
-        let query: Vec<(String, String)> = query
-            .iter()
-            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-            .collect();
+        let query = query.to_vec();
+        let verb_name = verb.name();
         let result = handle.block_on(async move {
             let mut retried = false;
             loop {
-                let response = client
-                    .get(&url)
-                    .bearer_auth(&access_token)
-                    .query(&query)
+                let mut builder = match verb {
+                    Verb::Get => client.get(&url),
+                    Verb::Put => client.put(&url),
+                    Verb::Post => client.post(&url),
+                };
+                builder = builder.bearer_auth(&access_token).query(&query);
+                if let Some(body) = &body {
+                    builder = builder.json(body);
+                }
+                let response = builder
                     .send()
                     .await
                     .map_err(|error| scrub(&error.to_string(), &[&access_token]))?;
                 let status = response.status();
-                log::info!("spotify web api {} {}", status.as_u16(), path_for_log(&url));
-                if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    return response
-                        .text()
-                        .await
-                        .map_err(|error| scrub(&error.to_string(), &[&access_token]));
-                }
                 let retry_after = response
                     .headers()
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_owned);
+                log::info!(
+                    "spotify web api {verb_name} {} {}",
+                    status.as_u16(),
+                    path_for_log(&url)
+                );
+                if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    let text = response
+                        .text()
+                        .await
+                        .map_err(|error| scrub(&error.to_string(), &[&access_token]))?;
+                    return Ok(RawReply {
+                        status: status.as_u16(),
+                        body: text,
+                    });
+                }
                 let _ = response.bytes().await;
                 match rate_limit_choice(retry_after.as_deref(), SystemTime::now(), retried) {
                     RateLimitChoice::RetryAfter(delay) => {
+                        log::info!(
+                            "spotify web api {verb_name} 429 {} retrying after {}ms",
+                            path_for_log(&url),
+                            delay.as_millis()
+                        );
                         tokio::time::sleep(delay).await;
                         retried = true;
                     }
-                    RateLimitChoice::GiveUp(message) => return Err(message),
+                    RateLimitChoice::GiveUp(message) => {
+                        log::info!(
+                            "spotify web api {verb_name} 429 {} gave up",
+                            path_for_log(&url)
+                        );
+                        return Err(message);
+                    }
                 }
             }
         });
-        // The async block captured access_token. Rebuild a scrub from the
-        // caller's copy: the error strings were already scrubbed inside.
         result.map_err(brief_message)
     }
 
@@ -1351,10 +1435,52 @@ impl SpotifyAccount {
         let mut guard = self.lock_mut();
         guard.access_token = Some(token.access_token.clone());
         guard.access_until = Some(token.expires_at);
+        guard.playback_scopes = has_playback_scopes(&token.scopes);
         if !token.refresh_token.is_empty() {
             guard.refresh_token = Some(token.refresh_token);
         }
         Ok(Some(token.access_token))
+    }
+
+    fn force_refresh(&self) -> Result<Option<String>, Error> {
+        let refresh = self.lock().refresh_token.clone();
+        let Some(refresh) = refresh else {
+            return Ok(None);
+        };
+        let client = oauth_client()?;
+        let token = client
+            .refresh_token(&refresh)
+            .map_err(|error| brief_message(scrub(&error.to_string(), &[&refresh])))?;
+        let mut guard = self.lock_mut();
+        guard.access_token = Some(token.access_token.clone());
+        guard.access_until = Some(token.expires_at);
+        guard.playback_scopes = has_playback_scopes(&token.scopes);
+        if !token.refresh_token.is_empty() {
+            guard.refresh_token = Some(token.refresh_token.clone());
+        }
+        Ok(Some(token.access_token))
+    }
+
+    fn is_premium(&self) -> bool {
+        self.lock().premium
+    }
+
+    fn has_playback_grant(&self) -> bool {
+        self.lock().playback_scopes
+    }
+
+    fn clear_playback_grant(&self) {
+        self.lock_mut().playback_scopes = false;
+    }
+
+    fn adopt_token(&self, access: &str, refresh: &str, premium: bool, scopes: &[String]) {
+        let mut guard = self.lock_mut();
+        guard.access_token = Some(access.to_string());
+        guard.access_until = Some(Instant::now() + Duration::from_secs(3_000));
+        guard.refresh_token = Some(refresh.to_string());
+        guard.premium = premium;
+        guard.playback_scopes = has_playback_scopes(scopes);
+        guard.failure = None;
     }
 
     fn snapshot_epoch(&self) -> u64 {
@@ -1412,6 +1538,46 @@ impl SpotifyAccount {
 
 fn path_for_log(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
+}
+
+#[derive(Clone, Copy)]
+enum Verb {
+    Get,
+    Put,
+    Post,
+}
+
+impl Verb {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Put => "PUT",
+            Self::Post => "POST",
+        }
+    }
+}
+
+struct RawReply {
+    status: u16,
+    body: String,
+}
+
+fn owned_query(query: &[(&str, &str)]) -> Vec<(String, String)> {
+    query
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect()
+}
+
+fn has_playback_scopes(scopes: &[String]) -> bool {
+    missing_playback_scopes(scopes).is_empty()
+}
+
+fn missing_playback_scopes(scopes: &[String]) -> Vec<&'static str> {
+    [SCOPE_READ_PLAYBACK, SCOPE_MODIFY_PLAYBACK]
+        .into_iter()
+        .filter(|scope| !scopes.iter().any(|got| got == scope))
+        .collect()
 }
 
 type WebClient =
@@ -1606,6 +1772,19 @@ fn playback_oauth_client(open_browser: bool) -> Result<librespot_oauth::OAuthCli
     builder.build().map_err(brief)
 }
 
+/// Desktop playback login. Not called while [`LIBRESPOT_AUDIO`] is off.
+#[allow(unreachable_code)]
+fn playback_login(
+    premium: bool,
+    refresh_token: &str,
+    interactive: bool,
+) -> Result<(String, String), String> {
+    if !premium || !LIBRESPOT_AUDIO {
+        return Ok((String::new(), String::new()));
+    }
+    playback_credentials(refresh_token, interactive)
+}
+
 /// `(access token, refresh token)` for the desktop playback login.
 ///
 /// A saved refresh is used when Spotify still accepts it. Restore never opens
@@ -1768,6 +1947,16 @@ fn map_playlist_access(result: Result<Vec<Track>, Error>) -> Result<Vec<Track>, 
     match result {
         Err(error) if playlist_not_shared(&error) => Err(brief_message(PLAYLIST_NOT_SHARED)),
         other => other,
+    }
+}
+
+/// Playback backend. Connect, unless [`LIBRESPOT_AUDIO`] is turned back on.
+#[allow(unreachable_code)]
+pub fn playback_engine(account: SpotifyAccount) -> Box<dyn SpotifyEngine> {
+    if LIBRESPOT_AUDIO {
+        Box::new(LibrespotEngine::new(account))
+    } else {
+        Box::new(connect::ConnectEngine::new(account))
     }
 }
 
@@ -1961,6 +2150,7 @@ impl SpotifyEngine for LibrespotEngine {
             finished: self.finished,
             failed: self.failed.clone(),
             playing,
+            ..SpotifyFeed::default()
         }
     }
 }
@@ -2148,12 +2338,21 @@ fn self_test_with(
     query: &str,
     mut youtube: impl FnMut(&str) -> Result<Option<usize>, String>,
 ) -> Vec<Check> {
-    const AFTER_REFRESH: [&str; 5] = [
+    const AFTER_REFRESH: [&str; 7] = [
         "profile",
         "playlists",
         "liked songs",
         "playlist tracks",
         "spotify search",
+        "scopes",
+        "connect devices",
+    ];
+    const AFTER_PROFILE: [&str; 5] = [
+        "playlists",
+        "liked songs",
+        "playlist tracks",
+        "spotify search",
+        "connect devices",
     ];
     let mut lines = Vec::new();
     let Some(saved) = saved else {
@@ -2164,6 +2363,8 @@ fn self_test_with(
             "liked songs",
             "playlist tracks",
             "spotify search",
+            "scopes",
+            "connect devices",
         ] {
             lines.push(Check::fail(name, "not signed in"));
         }
@@ -2190,7 +2391,13 @@ fn self_test_with(
         }
     };
     lines.push(Check::pass("refresh", "web token refreshed"));
-    remember_rotated_refresh(&saved, &refreshed.refresh_token);
+    let refresh = if refreshed.refresh_token.is_empty() {
+        saved.refresh_token.clone()
+    } else {
+        refreshed.refresh_token.clone()
+    };
+    remember_rotated_refresh(&saved, &refresh);
+    lines.push(scope_check(&refreshed.scopes));
 
     let profile = match account
         .http_get(PROFILE_URL, &refreshed.access_token, &[])
@@ -2199,7 +2406,7 @@ fn self_test_with(
         Ok(profile) => profile,
         Err(error) => {
             lines.push(Check::fail("profile", error.to_string()));
-            for name in &AFTER_REFRESH[1..] {
+            for name in AFTER_PROFILE {
                 lines.push(Check::fail(name, "profile failed"));
             }
             lines.push(youtube_check(query, &mut youtube));
@@ -2278,17 +2485,158 @@ fn self_test_with(
                     tracks[0].title
                 ),
             ));
-            play_tracks = tracks.into_iter().take(PLAYBACK_ATTEMPTS).collect();
+            play_tracks = tracks.into_iter().take(1).collect();
         }
         Err(error) => lines.push(Check::fail("spotify search", error.to_string())),
     }
 
     lines.push(youtube_check(query, &mut youtube));
-    lines.push(playback_check(&account, &profile, &play_tracks));
+    account.adopt_token(
+        &refreshed.access_token,
+        &refresh,
+        profile.premium,
+        &refreshed.scopes,
+    );
+    lines.extend(connect_checks(&account, &profile, &play_tracks));
     lines
 }
 
-const PLAYBACK_ATTEMPTS: usize = 3;
+fn scope_check(scopes: &[String]) -> Check {
+    let missing = missing_playback_scopes(scopes);
+    if missing.is_empty() {
+        Check::pass(
+            "scopes",
+            "user-read-playback-state and user-modify-playback-state",
+        )
+    } else {
+        Check::fail("scopes", format!("missing {}", missing.join(" and ")))
+    }
+}
+
+fn connect_checks(account: &SpotifyAccount, profile: &Profile, tracks: &[Track]) -> Vec<Check> {
+    if !account.has_playback_grant() {
+        log::info!("spotify connect: skipped, missing playback scopes");
+        return vec![
+            Check::skip("connect devices", "missing playback scopes"),
+            Check::skip("playback", "missing playback scopes"),
+        ];
+    }
+    let devices = match connect::list_devices(account) {
+        Ok(devices) => devices,
+        Err(error) if error == crate::player::ERR_NOT_PREMIUM => {
+            log::info!("spotify connect: devices skipped, account is not Premium");
+            if profile.premium {
+                return vec![
+                    Check::fail("connect devices", error),
+                    Check::fail("playback", "account is not Premium"),
+                ];
+            }
+            return vec![
+                Check::skip("connect devices", "account is not Premium"),
+                Check::skip("playback", "account is not Premium"),
+            ];
+        }
+        Err(error) if error == crate::player::ERR_MISSING_SCOPE => {
+            log::info!("spotify connect: devices refused, missing playback scope");
+            return vec![
+                Check::fail("connect devices", "missing playback scope"),
+                Check::skip("playback", "missing playback scope"),
+            ];
+        }
+        Err(error) => {
+            return vec![
+                Check::fail("connect devices", error.clone()),
+                Check::fail("playback", error),
+            ];
+        }
+    };
+    if devices.is_empty() {
+        log::info!("spotify connect: no device is open");
+        return vec![
+            Check::skip("connect devices", "no Spotify device open"),
+            Check::skip("playback", "no Spotify device open"),
+        ];
+    }
+    let count = devices.len();
+    let device = connect::device_for_playback(&devices, None);
+    let device_line = match device {
+        Some(device) => Check::pass(
+            "connect devices",
+            format!("{count} devices, using {}", device.name),
+        ),
+        None => Check::pass("connect devices", format!("{count} devices")),
+    };
+    if !profile.premium {
+        log::info!("spotify connect: playback skipped, account is not Premium");
+        return vec![
+            device_line,
+            Check::skip("playback", "account is not Premium"),
+        ];
+    }
+    let Some(device) = device else {
+        log::info!("spotify connect: no controllable device");
+        return vec![
+            device_line,
+            Check::skip("playback", "no Spotify device open"),
+        ];
+    };
+    let Some(track) = tracks.first() else {
+        return vec![
+            device_line,
+            Check::fail("playback", "no Spotify search result to play"),
+        ];
+    };
+    let mut engine = connect::ConnectEngine::new(account.clone());
+    engine.select_device(&device.id);
+    let playback = match engine.load(&track.id) {
+        Ok(()) => confirm_then_pause(&mut engine, track),
+        Err(error) if error == crate::player::ERR_NOT_PREMIUM => {
+            Check::skip("playback", "account is not Premium")
+        }
+        Err(error) if error == crate::player::ERR_NO_DEVICE => {
+            Check::skip("playback", "no Spotify device open")
+        }
+        Err(error) => Check::fail("playback", error),
+    };
+    // The device may still be playing if confirmation failed.
+    if playback.status == CheckStatus::Fail {
+        let _ = engine.pause_result();
+    }
+    vec![device_line, playback]
+}
+
+fn confirm_then_pause(engine: &mut connect::ConnectEngine, track: &Track) -> Check {
+    let started = Instant::now();
+    let mut failure = None;
+    let mut playing = false;
+    while started.elapsed() < Duration::from_secs(10) {
+        let feed = engine.poll();
+        if let Some(error) = feed.failed.clone() {
+            failure = Some(error);
+            break;
+        }
+        if feed.remote_playing == Some(true) && feed.remote_id.as_deref() == Some(track.id.as_str())
+        {
+            playing = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    let paused = engine.pause_result();
+    if let Some(error) = failure {
+        return Check::fail("playback", error);
+    }
+    if !playing {
+        return Check::fail("playback", "player did not report the track playing");
+    }
+    match paused {
+        Ok(()) => Check::pass(
+            "playback",
+            format!("\"{}\" playing, then paused", track.title),
+        ),
+        Err(error) => Check::fail("playback", error),
+    }
+}
 
 fn remember_rotated_refresh(saved: &SavedAccount, refresh_token: &str) {
     if refresh_token.is_empty() || refresh_token == saved.refresh_token {
@@ -2366,99 +2714,6 @@ fn playlist_track_page(
         }
     })?;
     track_sample(&body)
-}
-
-fn playback_check(account: &SpotifyAccount, profile: &Profile, tracks: &[Track]) -> Check {
-    if !profile.premium {
-        return Check::skip("playback", "account is not Premium");
-    }
-    if tracks.is_empty() {
-        return Check::fail("playback", "no Spotify search result to play");
-    }
-    match account.restore() {
-        AccountPhase::NotPremium { .. } => Check::skip("playback", "account is not Premium"),
-        AccountPhase::Failed { message } => Check::fail("playback", message),
-        AccountPhase::SignedOut | AccountPhase::SigningIn => {
-            Check::fail("playback", "not signed in")
-        }
-        AccountPhase::SignedIn { .. } => play_attempts(account, tracks),
-    }
-}
-
-fn play_attempts(account: &SpotifyAccount, tracks: &[Track]) -> Check {
-    let mut engine = LibrespotEngine::new(account.clone());
-    let mut failures = Vec::new();
-    for track in tracks.iter().take(PLAYBACK_ATTEMPTS) {
-        match listen_once(&mut engine, &track.id) {
-            Ok(detail) => {
-                return Check::pass("playback", format!("\"{}\": {detail}", track.title));
-            }
-            Err(error) => failures.push(format!("\"{}\": {error}", track.title)),
-        }
-    }
-    Check::fail(
-        "playback",
-        trim_detail(&format!(
-            "tried {}: {}",
-            failures.len(),
-            failures.join("; ")
-        )),
-    )
-}
-
-fn listen_once(engine: &mut LibrespotEngine, track_id: &str) -> Result<String, String> {
-    engine.load(track_id)?;
-    engine.play();
-    let started = Instant::now();
-    let mut saw_playing = false;
-    let mut min_position = None;
-    let mut max_position = Duration::ZERO;
-    let mut failure = None;
-    while started.elapsed() < Duration::from_secs(8) {
-        let feed = engine.poll();
-        if let Some(error) = feed.failed.clone() {
-            failure = Some(error);
-            break;
-        }
-        saw_playing |= feed.playing;
-        min_position = Some(min_position.map_or(feed.position, |current: Duration| {
-            current.min(feed.position)
-        }));
-        if feed.position > max_position {
-            max_position = feed.position;
-        }
-        if saw_playing && min_position.is_some_and(|min| max_position > min) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    engine.stop();
-    if let Some(error) = failure {
-        return Err(error);
-    }
-    let advanced = min_position.is_some_and(|min| max_position > min);
-    if saw_playing && advanced {
-        Ok(format!(
-            "Playing, position advanced {}ms to {}ms",
-            min_position.unwrap_or_default().as_millis(),
-            max_position.as_millis()
-        ))
-    } else if !saw_playing {
-        Err("no Playing event".to_string())
-    } else {
-        Err(format!(
-            "position did not advance (last {}ms)",
-            max_position.as_millis()
-        ))
-    }
-}
-
-fn trim_detail(detail: &str) -> String {
-    let mut brief: String = detail.chars().take(240).collect();
-    if detail.chars().count() > 240 {
-        brief.push('…');
-    }
-    brief
 }
 
 fn youtube_check(
@@ -2676,7 +2931,16 @@ mod tests {
         });
         assert_eq!(failed.tone, AccountTone::Error);
         assert!(failed.offer_sign_in);
+        assert!(!failed.reconnect);
         assert_eq!(failed.text, "browser closed");
+
+        let reconnect = present_account(&AccountPhase::PlaybackReconnect {
+            name: "Ada Vega".into(),
+        });
+        assert_eq!(reconnect.text, crate::player::RECONNECT_PLAYBACK);
+        assert_eq!(reconnect.tone, AccountTone::Warning);
+        assert!(reconnect.offer_sign_in);
+        assert!(reconnect.reconnect);
     }
 
     #[test]
@@ -2878,9 +3142,21 @@ mod tests {
             "user-library-read",
             "playlist-read-private",
             "playlist-read-collaborative",
+            "user-read-playback-state",
+            "user-modify-playback-state",
         ] {
             assert!(SCOPES.contains(&scope), "missing {scope}");
         }
+        assert!(has_playback_scopes(
+            &SCOPES
+                .iter()
+                .map(|scope| (*scope).to_string())
+                .collect::<Vec<_>>()
+        ));
+        assert_eq!(
+            missing_playback_scopes(&["user-read-private".to_string()]),
+            vec!["user-read-playback-state", "user-modify-playback-state"]
+        );
     }
 
     #[test]

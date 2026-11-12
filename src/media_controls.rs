@@ -338,6 +338,8 @@ mod tests {
             source,
             track_id: track_id.to_string(),
             upcoming: Vec::new(),
+            devices: Vec::new(),
+            volume: None,
         }
     }
 

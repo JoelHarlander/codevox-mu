@@ -13,8 +13,8 @@ use std::sync::Arc;
 use iced::alignment::{Horizontal, Vertical};
 use iced::futures::channel::oneshot;
 use iced::widget::{
-    Space, button, column, container, mouse_area, progress_bar, row, scrollable, stack, text,
-    text_input,
+    Space, button, column, container, mouse_area, progress_bar, row, scrollable, slider, stack,
+    text, text_input,
 };
 use iced::window::{self, Direction, Settings};
 use iced::{Background, Border, Color, Element, Fill, Length, Shadow, Size, Subscription, Task};
@@ -183,6 +183,11 @@ enum Message {
     ShowAccounts,
     BackToLibrary,
     DismissNotices,
+    SelectDevice(String),
+    SeekDrag(f32),
+    SeekRelease,
+    VolumeDrag(u8),
+    VolumeRelease,
     /// Press on the custom title bar. Starts an OS window drag.
     DragWindow,
     /// Title-bar double-click, or the maximise / restore button.
@@ -281,6 +286,10 @@ struct Shell {
     preview: Option<player::NowPlaying>,
     /// Playback error the listener dismissed. A new string shows again.
     dismissed_playback_error: Option<String>,
+    /// Seek position while the listener is dragging the Spotify slider.
+    seek_drag: Option<f32>,
+    /// Volume while the listener is dragging the Connect slider.
+    volume_drag: Option<u8>,
     window_id: Option<window::Id>,
     maximized: bool,
     shot_step: ShotStep,
@@ -1101,7 +1110,7 @@ impl Shell {
             Arc::new(spotify::SpotifyCatalogue::new(library_account)),
         );
         shell.playback = player::Playback::start(
-            Box::new(spotify::LibrespotEngine::new(play_account)),
+            spotify::playback_engine(play_account),
             Box::new(YouTubeFallback::new(YouTubeMusic::new())),
         );
         let task = Task::perform(
@@ -1171,6 +1180,8 @@ impl Shell {
             clock_armed: false,
             preview: None,
             dismissed_playback_error: None,
+            seek_drag: None,
+            volume_drag: None,
             window_id: None,
             maximized: false,
             shot_step,
@@ -1202,6 +1213,12 @@ impl Shell {
                         crate::diag::redact(&format!("spotify account: {phase:?}"))
                     );
                     self.phase = phase;
+                    if matches!(
+                        self.phase,
+                        AccountPhase::SignedIn { .. } | AccountPhase::PlaybackReconnect { .. }
+                    ) {
+                        return self.arm_clock();
+                    }
                 } else {
                     log::info!("spotify account: ignored a stale update");
                 }
@@ -1280,6 +1297,36 @@ impl Shell {
             Message::DismissNotices => {
                 self.dismiss_notices();
                 Task::none()
+            }
+            Message::SelectDevice(id) => {
+                self.playback.select_device(id);
+                self.arm_clock()
+            }
+            Message::SeekDrag(ratio) => {
+                self.seek_drag = Some(ratio.clamp(0.0, 1.0));
+                Task::none()
+            }
+            Message::SeekRelease => {
+                let ratio = self.seek_drag.take();
+                let now = self.displayed_now();
+                if let Some(ratio) = ratio
+                    && now.source == Some(Source::Spotify)
+                    && now.duration > std::time::Duration::ZERO
+                {
+                    let position = now.duration.mul_f32(ratio);
+                    self.playback.seek(position);
+                }
+                self.arm_clock()
+            }
+            Message::VolumeDrag(percent) => {
+                self.volume_drag = Some(percent.min(100));
+                Task::none()
+            }
+            Message::VolumeRelease => {
+                if let Some(percent) = self.volume_drag.take() {
+                    self.playback.set_volume(percent);
+                }
+                self.arm_clock()
             }
             Message::DragWindow => self.window_action(window::drag),
             Message::ToggleMaximize => self.window_action(|id| {
@@ -1383,10 +1430,14 @@ impl Shell {
     fn on_tick(&mut self) -> Task<Message> {
         self.clock_armed = false;
         crate::media_controls::publish(&self.playback.now());
-        match self.playback.phase() {
-            Phase::Loading | Phase::Playing => self.arm_clock(),
-            Phase::Idle | Phase::Paused | Phase::Stopped => Task::none(),
-        }
+        let keep = matches!(
+            self.playback.phase(),
+            Phase::Loading | Phase::Playing | Phase::Paused
+        ) || matches!(
+            self.phase,
+            AccountPhase::SignedIn { .. } | AccountPhase::PlaybackReconnect { .. }
+        );
+        if keep { self.arm_clock() } else { Task::none() }
     }
 
     fn submit_cookie(&mut self) -> Task<Message> {
@@ -1831,6 +1882,8 @@ impl Shell {
             source: Some(track.source),
             track_id: track.id,
             upcoming: Vec::new(),
+            devices: Vec::new(),
+            volume: None,
         });
     }
 
@@ -2095,6 +2148,7 @@ fn spotify_compact(phase: &AccountPhase) -> (&'static str, Color) {
         AccountPhase::SignedOut => ("signed out", crate::theme::TEXT_SECONDARY),
         AccountPhase::SigningIn => ("signing in", crate::theme::TEXT_SECONDARY),
         AccountPhase::SignedIn { .. } => ("signed in", crate::theme::TEXT_PRIMARY),
+        AccountPhase::PlaybackReconnect { .. } => ("reconnect to play", crate::theme::WARNING),
         AccountPhase::NotPremium { .. } => ("not Premium", crate::theme::WARNING),
         AccountPhase::Failed { message } if message == SPOTIFY_RENEW_SIGN_IN => {
             ("sign-in needs to be renewed", crate::theme::DESTRUCTIVE)
@@ -2129,7 +2183,9 @@ fn spotify_library_notice(detail: &str) -> String {
 fn spotify_signed_in(phase: &AccountPhase) -> bool {
     matches!(
         phase,
-        AccountPhase::SignedIn { .. } | AccountPhase::NotPremium { .. }
+        AccountPhase::SignedIn { .. }
+            | AccountPhase::PlaybackReconnect { .. }
+            | AccountPhase::NotPremium { .. }
     )
 }
 
@@ -2341,11 +2397,12 @@ fn accounts_view(shell: &Shell) -> Element<'_, Message> {
     .spacing(8)
     .width(Fill);
     if presentation.offer_sign_in {
-        spotify_block = spotify_block.push(transport_button(
-            "Sign in to Spotify",
-            Some(Message::SignIn),
-            true,
-        ));
+        let label = if presentation.reconnect {
+            "Reconnect Spotify"
+        } else {
+            "Sign in to Spotify"
+        };
+        spotify_block = spotify_block.push(transport_button(label, Some(Message::SignIn), true));
     }
 
     let youtube_block = match shell.sign {
@@ -2482,6 +2539,9 @@ fn notice_lines(shell: &Shell) -> Vec<String> {
     if let AccountPhase::Failed { message } = &shell.phase {
         push_notice(&mut lines, message.clone());
     }
+    if let AccountPhase::PlaybackReconnect { .. } = &shell.phase {
+        push_notice(&mut lines, spotify::present_account(&shell.phase).text);
+    }
     if let Some(error) = shell.displayed_now().error
         && shell.dismissed_playback_error.as_ref() != Some(&error)
     {
@@ -2608,12 +2668,25 @@ fn now_playing(shell: &Shell) -> Element<'_, Message> {
             format_duration(now.elapsed),
             format_duration(now.duration)
         );
+        let shown = shell.seek_drag.unwrap_or(ratio);
+        let position: Element<'_, Message> = if now.source == Some(Source::Spotify) {
+            slider(0.0..=1.0, shown, Message::SeekDrag)
+                .step(0.001_f32)
+                .on_release(Message::SeekRelease)
+                .height(6.0)
+                .width(Fill)
+                .style(transport_slider)
+                .into()
+        } else {
+            progress_bar(0.0..=1.0, ratio)
+                .length(Fill)
+                .girth(6.0)
+                .style(transport_progress)
+                .into()
+        };
         bar = bar.push(
             row![
-                progress_bar(0.0..=1.0, ratio)
-                    .length(Fill)
-                    .girth(6.0)
-                    .style(transport_progress),
+                position,
                 text(time)
                     .font(crate::theme::BODY)
                     .size(META_SIZE)
@@ -2622,6 +2695,38 @@ fn now_playing(shell: &Shell) -> Element<'_, Message> {
             .spacing(12)
             .align_y(Vertical::Center),
         );
+    }
+
+    if !now.devices.is_empty() {
+        let mut devices = row![
+            text("Device")
+                .font(crate::theme::BODY)
+                .size(SOURCE_SIZE)
+                .color(crate::theme::TEXT_SECONDARY)
+        ]
+        .spacing(8)
+        .align_y(Vertical::Center);
+        for device in &now.devices {
+            devices = devices.push(device_button(
+                device_label(&device.name),
+                Message::SelectDevice(device.id.clone()),
+                device.selected,
+            ));
+        }
+        if let Some(volume) = now.volume {
+            let shown = f32::from(shell.volume_drag.unwrap_or(volume));
+            devices = devices.push(
+                slider(0.0..=100.0, shown, |value| {
+                    Message::VolumeDrag(value.round().clamp(0.0, 100.0) as u8)
+                })
+                .step(1.0_f32)
+                .on_release(Message::VolumeRelease)
+                .width(120.0)
+                .height(6.0)
+                .style(transport_slider),
+            );
+        }
+        bar = bar.push(devices);
     }
 
     container(bar)
@@ -2797,6 +2902,24 @@ fn transport_button(
         .into()
 }
 
+fn device_button(label: String, message: Message, selected: bool) -> Element<'static, Message> {
+    button(text(label).font(crate::theme::BODY).size(META_SIZE))
+        .on_press(message)
+        .padding([6.0, 10.0])
+        .style(move |_theme, status| transport_button_style(status, selected))
+        .into()
+}
+
+fn device_label(name: &str) -> String {
+    let name = name.trim();
+    let name = if name.is_empty() { "Spotify" } else { name };
+    let mut short: String = name.chars().take(28).collect();
+    if name.chars().count() > 28 {
+        short.push('…');
+    }
+    short
+}
+
 fn window_background(_theme: &iced::Theme) -> container::Style {
     container::Style {
         text_color: Some(crate::theme::TEXT_PRIMARY),
@@ -2867,6 +2990,27 @@ fn transport_progress(_theme: &iced::Theme) -> progress_bar::Style {
             color: Color::TRANSPARENT,
             width: 0.0,
             radius: 0.0.into(),
+        },
+    }
+}
+
+fn transport_slider(_theme: &iced::Theme, _status: slider::Status) -> slider::Style {
+    let empty = mix(crate::theme::DARK_LIGHTER, crate::theme::TEXT_PRIMARY, 0.22);
+    slider::Style {
+        rail: slider::Rail {
+            backgrounds: (crate::theme::ACCENT.into(), empty.into()),
+            width: 4.0,
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 0.0.into(),
+            },
+        },
+        handle: slider::Handle {
+            shape: slider::HandleShape::Circle { radius: 5.0 },
+            background: crate::theme::ACCENT.into(),
+            border_width: 0.0,
+            border_color: Color::TRANSPARENT,
         },
     }
 }
@@ -3091,6 +3235,34 @@ fn spotify_renewal_and_rate_limit_show_on_accounts_and_in_the_banner() {
     );
     assert!(lines.iter().all(|line| !line.contains("429")), "{lines:?}");
     let _ = Shell::view(&shell);
+}
+
+#[test]
+fn reconnect_prompt_stays_visible_until_spotify_is_signed_in_again() {
+    let mut shell = test_shell(Mode::Run);
+    let _ = shell.update(Message::AccountChanged {
+        epoch: 0,
+        phase: AccountPhase::PlaybackReconnect { name: "Ada".into() },
+    });
+    assert_eq!(spotify_compact(&shell.phase).0, "reconnect to play");
+    assert!(spotify_signed_in(&shell.phase));
+    assert!(
+        notice_lines(&shell)
+            .iter()
+            .any(|line| line == "Reconnect Spotify to enable playback.")
+    );
+    let _ = shell.update(Message::ShowAccounts);
+    let _ = Shell::view(&shell);
+    let _ = shell.update(Message::DismissNotices);
+    assert!(matches!(
+        shell.phase,
+        AccountPhase::PlaybackReconnect { .. }
+    ));
+    assert!(
+        notice_lines(&shell)
+            .iter()
+            .any(|line| line == "Reconnect Spotify to enable playback.")
+    );
 }
 
 #[test]

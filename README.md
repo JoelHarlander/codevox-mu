@@ -3,7 +3,7 @@
 CodeVox mU is a native desktop app that will put Spotify and YouTube Music in one player.
 One search, one mixed queue, and mixed playlists.
 It targets Windows, macOS, and Linux.
-The licence is MIT. The UI toolkit is [iced](https://iced.rs). YouTube Music tracks play in the window. Signing in with a browser cookie shows that account's library and playlists. Spotify sign-in uses librespot. Premium accounts play Spotify in the window. Other accounts play the matching YouTube Music track.
+The licence is MIT. The UI toolkit is [iced](https://iced.rs). YouTube Music tracks play in the window. Signing in with a browser cookie shows that account's library and playlists. Spotify sign-in uses the Web API. Premium playback goes through Spotify Connect, on the Spotify app already open on this computer or a phone. Other accounts, and a Premium account with no device open, play the matching YouTube Music track.
 
 See the [decision log](docs/decisions.md) and the [backlog](docs/backlog.md).
 
@@ -15,9 +15,9 @@ Install the current stable Rust toolchain from <https://rustup.rs>. Then:
 cargo run --release
 ```
 
-The window is titled "CodeVox mU" and draws its own title bar, so the operating-system frame stays off. A sidebar switches Search, Queue, Library, and Accounts. Search asks YouTube Music, and Spotify once you are signed in, and lists one row per recording, tagged by source, in the CodeVox style. Both searches need a network. If one fails, the other rows stay and the error shows in a dismissible banner. The now-playing bar runs along the bottom of the window. A Premium account plays a Spotify row in the window. A free account, or a failed sign-in, plays the YouTube Music match for that title and artist. The bar says so.
+The window is titled "CodeVox mU" and draws its own title bar, so the operating-system frame stays off. A sidebar switches Search, Queue, Library, and Accounts. Search asks YouTube Music, and Spotify once you are signed in, and lists one row per recording, tagged by source, in the CodeVox style. Both searches need a network. If one fails, the other rows stay and the error shows in a dismissible banner. The now-playing bar runs along the bottom of the window. A Premium account plays a Spotify row on an open Spotify device. If none is open, or the account is not Premium, the bar plays the YouTube Music match and says so. A saved sign-in from before the playback scopes asks you to reconnect.
 
-Sign in from Accounts. Spotify opens the browser login for CodeVox mU's own Spotify app. A Premium account approves playback as well, which librespot signs in with Spotify's desktop client. Refresh tokens are stored in the OS cache directory for CodeVox mU, not in this repo. A saved sign-in that the app can no longer refresh asks to be renewed, and a rate limit is a short sentence rather than a status code. YouTube Music takes the Cookie header from music.youtube.com while that browser is signed in. The header has to include SAPISID. The cookie is stored in the OS keyring, or in the per-user config directory when the keyring is unavailable. The library lists playlists, with Liked songs first. Opening a playlist and clicking a track plays it the same way a search hit does. Sign out forgets the cookie. Search itself does not need an account. The main screen only shows whether each service is signed in.
+Sign in from Accounts. Spotify opens the browser once, for CodeVox mU's own Spotify app. The grant includes the playback scopes Connect needs. A token saved before those scopes shows "Reconnect Spotify to enable playback." Refresh tokens are stored in the OS cache directory for CodeVox mU, not in this repo. A saved sign-in that the app can no longer refresh asks to be renewed, and a rate limit is a short sentence rather than a status code. YouTube Music takes the Cookie header from music.youtube.com while that browser is signed in. The header has to include SAPISID. The cookie is stored in the OS keyring, or in the per-user config directory when the keyring is unavailable. The library lists playlists, with Liked songs first. Opening a playlist and clicking a track plays it the same way a search hit does. Sign out forgets the cookie. Search itself does not need an account. The main screen only shows whether each service is signed in.
 
 ```sh
 cargo run --release -- --smoke
@@ -47,7 +47,7 @@ Windows needs the MSVC build tools. macOS needs the Xcode command line tools.
 `src/search.rs` merges per-service search hits into one list and collapses the same recording.
 `src/youtube_music.rs` is unauthenticated YouTube Music song search, and the Spotify fallback match.
 `src/youtube_account.rs` signs in with a browser cookie and reads the library and playlists.
-`src/spotify.rs` is Spotify sign-in, search, and librespot playback.
+`src/spotify.rs` is Spotify sign-in, search, and Spotify Connect playback. In-app librespot audio is compiled and not used.
 `src/extract.rs` resolves a YouTube video id to an audio stream.
 `src/player.rs` is play, pause, stop, next, and previous over the mixed queue.
 `src/output.rs` decodes with symphonia and plays through cpal.
