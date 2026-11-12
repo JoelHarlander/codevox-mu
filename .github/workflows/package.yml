@@ -24,6 +24,9 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_PACKAGER_VERSION: "0.11.8"
   CARGO_GENERATE_RPM_VERSION: "0.21.1"
+  # Baked in by build.rs. Empty uses the public id in src/spotify.rs.
+  # Workflow-wide so the packager does not rebuild without it.
+  SPOTIFY_CLIENT_ID: ${{ vars.SPOTIFY_CLIENT_ID }}
 
 jobs:
   linux:
@@ -73,6 +76,8 @@ jobs:
           fi
 
       - name: Build
+        env:
+          SPOTIFY_CLIENT_ID: ${{ vars.SPOTIFY_CLIENT_ID }}
         run: cargo build --locked --release
 
       - name: Strip
@@ -201,6 +206,8 @@ jobs:
           cache-on-failure: true
 
       - name: Build
+        env:
+          SPOTIFY_CLIENT_ID: ${{ vars.SPOTIFY_CLIENT_ID }}
         run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Install cargo-packager
@@ -262,6 +269,8 @@ jobs:
           cache-on-failure: true
 
       - name: Build universal binary
+        env:
+          SPOTIFY_CLIENT_ID: ${{ vars.SPOTIFY_CLIENT_ID }}
         run: |
           set -euo pipefail
           cargo build --locked --release --target aarch64-apple-darwin
