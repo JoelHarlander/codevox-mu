@@ -334,8 +334,10 @@ mod tests {
             can_pause: phase == Phase::Playing,
             can_stop: matches!(phase, Phase::Playing | Phase::Paused),
             can_next: true,
+            can_previous: false,
             source,
             track_id: track_id.to_string(),
+            upcoming: Vec::new(),
         }
     }
 

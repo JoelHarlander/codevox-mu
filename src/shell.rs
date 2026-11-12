@@ -97,6 +97,13 @@ enum Message {
     TogglePlayback,
     StopPlayback,
     NextTrack,
+    PreviousTrack,
+    Enqueue(Track),
+    PlayNext(Track),
+    MoveEarlier(usize),
+    MoveLater(usize),
+    RemoveQueued(usize),
+    RemoveCurrent,
     Tick,
     SignIn,
     AccountChanged {
@@ -817,6 +824,34 @@ impl Shell {
                 self.playback.next();
                 self.arm_clock()
             }
+            Message::PreviousTrack => {
+                self.playback.previous();
+                self.arm_clock()
+            }
+            Message::Enqueue(track) => {
+                self.playback.enqueue(track);
+                self.arm_clock()
+            }
+            Message::PlayNext(track) => {
+                self.playback.play_next(track);
+                self.arm_clock()
+            }
+            Message::MoveEarlier(index) => {
+                self.playback.move_earlier(index);
+                self.arm_clock()
+            }
+            Message::MoveLater(index) => {
+                self.playback.move_later(index);
+                self.arm_clock()
+            }
+            Message::RemoveQueued(index) => {
+                self.playback.remove_queued(index);
+                self.arm_clock()
+            }
+            Message::RemoveCurrent => {
+                self.playback.remove_current();
+                self.arm_clock()
+            }
             Message::Tick => self.on_tick(),
             Message::ShowSignIn => {
                 self.cookie_open = true;
@@ -1277,6 +1312,7 @@ impl Shell {
 
         let content = content
             .push(scrollable(list).width(Fill).height(Fill))
+            .push(queue_panel(shell))
             .push(now_playing(shell))
             .width(Fill)
             .height(Fill);
@@ -1490,12 +1526,19 @@ fn library_track_row(track: &Track) -> Element<'_, Message> {
 }
 
 fn track_button(track: &Track) -> Element<'_, Message> {
-    button(result_body(track))
+    let play = button(result_body(track))
         .on_press(play_message(track))
         .width(Fill)
         .padding([6.0, 0.0])
-        .style(result_button)
-        .into()
+        .style(result_button);
+    row![
+        play,
+        transport_button("Play next", Some(Message::PlayNext(track.clone())), false),
+        transport_button("Queue", Some(Message::Enqueue(track.clone())), false),
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center)
+    .into()
 }
 
 fn playlist_row(playlist: &Playlist) -> Element<'_, Message> {
@@ -1631,8 +1674,13 @@ fn now_playing(shell: &Shell) -> Element<'_, Message> {
             .size(META_SIZE)
             .color(crate::theme::TEXT_TERTIARY),
         transport_button(play_label, play_message, true),
-        transport_button("Next", now.can_next.then_some(Message::NextTrack), false,),
-        transport_button("Stop", now.can_stop.then_some(Message::StopPlayback), false,),
+        transport_button(
+            "Previous",
+            now.can_previous.then_some(Message::PreviousTrack),
+            false,
+        ),
+        transport_button("Next", now.can_next.then_some(Message::NextTrack), false),
+        transport_button("Stop", now.can_stop.then_some(Message::StopPlayback), false),
     ]
     .spacing(8)
     .align_y(Vertical::Center);
@@ -1645,6 +1693,138 @@ fn now_playing(shell: &Shell) -> Element<'_, Message> {
     .width(Fill)
     .padding([10.0, 12.0])
     .style(transport_bar)
+    .into()
+}
+
+fn queue_panel(shell: &Shell) -> Element<'_, Message> {
+    let now = shell.playback.now();
+    let heading = text("Queue")
+        .font(crate::theme::BODY)
+        .size(META_SIZE)
+        .color(crate::theme::TEXT_SECONDARY);
+
+    let mut rows: Vec<Element<'_, Message>> = Vec::new();
+    if !now.title.is_empty() {
+        rows.push(current_row(&now));
+    }
+    let last = now.upcoming.len().saturating_sub(1);
+    for (index, track) in now.upcoming.iter().enumerate() {
+        rows.push(queued_row(index, track, index == last));
+    }
+
+    let body: Element<'_, Message> = if rows.is_empty() {
+        text("Nothing queued")
+            .font(crate::theme::BODY)
+            .size(META_SIZE)
+            .color(crate::theme::TEXT_TERTIARY)
+            .into()
+    } else if now.upcoming.len() > 4 {
+        scrollable(column(rows).spacing(8).width(Fill))
+            .height(180.0)
+            .width(Fill)
+            .into()
+    } else {
+        column(rows).spacing(8).width(Fill).into()
+    };
+
+    container(column![heading, body].spacing(8))
+        .width(Fill)
+        .padding([10.0, 12.0])
+        .style(transport_bar)
+        .into()
+}
+
+fn current_row(now: &player::NowPlaying) -> Element<'static, Message> {
+    let mut details = column![
+        text(now.title.clone())
+            .font(crate::theme::BODY)
+            .size(BODY_SIZE)
+            .color(crate::theme::TEXT_PRIMARY)
+    ]
+    .spacing(2)
+    .width(Fill);
+    if !now.artist.is_empty() {
+        details = details.push(
+            text(now.artist.clone())
+                .font(crate::theme::BODY)
+                .size(META_SIZE)
+                .color(crate::theme::TEXT_SECONDARY),
+        );
+    }
+
+    let mut line = row![
+        text("Now")
+            .font(crate::theme::BODY)
+            .size(SOURCE_SIZE)
+            .color(crate::theme::ACCENT),
+        details,
+    ]
+    .spacing(ROW_SPACING)
+    .align_y(Vertical::Center)
+    .width(Fill);
+    if let Some(source) = now.source {
+        line = line.push(source_tag(source));
+    }
+
+    row![
+        line,
+        transport_button("Remove", Some(Message::RemoveCurrent), false),
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center)
+    .into()
+}
+
+fn queued_row(index: usize, track: &Track, last: bool) -> Element<'static, Message> {
+    let up = (index > 0).then_some(Message::MoveEarlier(index));
+    let down = (!last).then_some(Message::MoveLater(index));
+    row![
+        queue_track_line(track),
+        transport_button("Up", up, false),
+        transport_button("Down", down, false),
+        transport_button("Remove", Some(Message::RemoveQueued(index)), false),
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center)
+    .into()
+}
+
+fn queue_track_line(track: &Track) -> Element<'static, Message> {
+    let mut details = column![
+        text(track.title.clone())
+            .font(crate::theme::BODY)
+            .size(BODY_SIZE)
+            .color(crate::theme::TEXT_PRIMARY)
+    ]
+    .spacing(2)
+    .width(Fill);
+    let subtitle = subtitle(track);
+    if !subtitle.is_empty() {
+        details = details.push(
+            text(subtitle)
+                .font(crate::theme::BODY)
+                .size(META_SIZE)
+                .color(crate::theme::TEXT_SECONDARY),
+        );
+    }
+
+    row![details, source_tag(track.source)]
+        .spacing(ROW_SPACING)
+        .align_y(Vertical::Center)
+        .width(Fill)
+        .into()
+}
+
+fn source_tag(source: Source) -> Element<'static, Message> {
+    let (_, foreground) = source_colors(source);
+    container(
+        text(source.label())
+            .font(crate::theme::BODY)
+            .size(SOURCE_SIZE)
+            .color(foreground),
+    )
+    .padding([3.0, 7.0])
+    .style(source_chip(source))
     .into()
 }
 
