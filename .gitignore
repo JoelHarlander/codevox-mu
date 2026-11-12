@@ -1,1 +1,5 @@
 /target
+# Spotify sign-in writes these under the OS cache directory, never the repo.
+# Ignore them here in case a run is started with a relative cache path.
+credentials.json
+account.json
