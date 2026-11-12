@@ -86,6 +86,13 @@ impl Queue {
         self.tracks.push_back(track);
     }
 
+    /// Put `track` at the front, so [`Queue::next`] yields it first.
+    ///
+    /// Previous-track puts the interrupted song back in front of the queue.
+    pub fn prepend(&mut self, track: Track) {
+        self.tracks.push_front(track);
+    }
+
     pub fn next(&mut self) -> Option<Track> {
         self.tracks.pop_front()
     }

@@ -1,4 +1,5 @@
-//! Play, pause, stop, and skip a mixed [`Queue`](crate::music::Queue).
+//! Play, pause, stop, skip, and return to the previous track in a mixed
+//! [`Queue`](crate::music::Queue).
 //!
 //! The state machine is synchronous and talks to an [`AudioSink`]. Tests
 //! pass a fake sink. The window uses [`Playback`], which owns the machine
@@ -56,6 +57,10 @@ pub struct NowPlaying {
     pub can_pause: bool,
     pub can_stop: bool,
     pub can_next: bool,
+    /// Service the loaded track came from. `None` when nothing is loaded.
+    pub source: Option<Source>,
+    /// Source id of the loaded track. Empty when nothing is loaded.
+    pub track_id: String,
 }
 
 impl Default for NowPlaying {
@@ -72,6 +77,8 @@ impl Default for NowPlaying {
             can_pause: false,
             can_stop: false,
             can_next: false,
+            source: None,
+            track_id: String::new(),
         }
     }
 }
@@ -133,6 +140,8 @@ enum Start {
 /// Queue plus the sink. `E` resolves YouTube ids. `S` makes sound.
 pub struct Player<E, S> {
     queue: Queue,
+    /// Tracks already left, newest at the end. Previous pops this.
+    history: Vec<Track>,
     current: Option<Track>,
     phase: Phase,
     duration: Duration,
@@ -159,6 +168,7 @@ where
     ) -> Self {
         Self {
             queue: Queue::new(),
+            history: Vec::new(),
             current: None,
             phase: Phase::Idle,
             duration: Duration::ZERO,
@@ -197,6 +207,9 @@ where
             }
             Source::YouTubeMusic => {
                 self.halt_audio();
+                if let Some(previous) = self.current.take() {
+                    self.remember(previous);
+                }
                 self.note = None;
                 let _ = self.play_stream(track, None);
             }
@@ -259,9 +272,46 @@ where
     /// Drop the current track and play the next queued one.
     pub fn next(&mut self) {
         self.halt_audio();
-        self.current = None;
+        if let Some(track) = self.current.take() {
+            self.remember(track);
+        }
         self.phase = Phase::Idle;
         self.advance();
+    }
+
+    /// Play the track heard before this one.
+    ///
+    /// With no earlier track, the current one starts again from the beginning.
+    /// Spotify and local entries in the history are skipped, same as next.
+    pub fn previous(&mut self) {
+        self.halt_audio();
+        let displaced = self.current.take();
+        let mut skipped_spotify = false;
+        while let Some(track) = self.history.pop() {
+            match track.source {
+                Source::YouTubeMusic => {
+                    if let Some(current) = displaced {
+                        self.queue.prepend(current);
+                    }
+                    self.note = skipped_spotify.then(|| SPOTIFY_NOTE.to_string());
+                    self.duration = track.duration;
+                    self.current = Some(track);
+                    self.phase = Phase::Stopped;
+                    let _ = self.start_current();
+                    return;
+                }
+                Source::Spotify => skipped_spotify = true,
+                Source::Local => {
+                    self.error = Some(LOCAL_UNAVAILABLE.to_string());
+                }
+            }
+        }
+
+        self.current = displaced;
+        if skipped_spotify {
+            self.note = Some(SPOTIFY_NOTE.to_string());
+        }
+        self.restart_current();
     }
 
     /// When the sink has finished the current track, play the next one.
@@ -279,7 +329,9 @@ where
                 return true;
             }
             if self.phase == Phase::Playing && feed.finished {
-                self.current = None;
+                if let Some(track) = self.current.take() {
+                    self.remember(track);
+                }
                 self.origin = AudioOrigin::None;
                 self.phase = Phase::Idle;
                 self.advance();
@@ -290,7 +342,9 @@ where
         if self.phase != Phase::Playing || !self.sink.finished() {
             return false;
         }
-        self.current = None;
+        if let Some(track) = self.current.take() {
+            self.remember(track);
+        }
         self.origin = AudioOrigin::None;
         self.phase = Phase::Idle;
         self.advance();
@@ -304,6 +358,12 @@ where
             .map(|track| track.title.clone())
             .unwrap_or_default();
         let artist = self.current.as_ref().map(artist_line).unwrap_or_default();
+        let source = self.current.as_ref().map(|track| track.source);
+        let track_id = self
+            .current
+            .as_ref()
+            .map(|track| track.id.clone())
+            .unwrap_or_default();
         NowPlaying {
             title,
             artist,
@@ -320,7 +380,29 @@ where
             can_pause: self.phase == Phase::Playing,
             can_stop: matches!(self.phase, Phase::Playing | Phase::Paused),
             can_next: self.current.is_some() || !self.queue.is_empty(),
+            source,
+            track_id,
         }
+    }
+
+    fn remember(&mut self, track: Track) {
+        self.history.push(track);
+        const LIMIT: usize = 50;
+        if self.history.len() > LIMIT {
+            self.history.remove(0);
+        }
+    }
+
+    fn restart_current(&mut self) {
+        if self.current.is_none() {
+            return;
+        }
+        if !matches!(self.phase, Phase::Playing | Phase::Paused | Phase::Stopped) {
+            return;
+        }
+        self.halt_audio();
+        self.phase = Phase::Stopped;
+        let _ = self.start_current();
     }
 
     fn elapsed(&self) -> Duration {
@@ -521,6 +603,7 @@ enum Command {
     Pause,
     Stop,
     Next,
+    Previous,
 }
 
 /// Handle the window keeps. Commands go to the playback thread.
@@ -583,6 +666,10 @@ impl Playback {
 
     pub fn next(&self) {
         self.send(Command::Next);
+    }
+
+    pub fn previous(&self) {
+        self.send(Command::Previous);
     }
 
     pub fn now(&self) -> NowPlaying {
@@ -679,6 +766,7 @@ fn dispatch(
         Command::Pause => player.pause(),
         Command::Stop => player.stop(),
         Command::Next => player.next(),
+        Command::Previous => player.previous(),
     }
 }
 
@@ -695,6 +783,8 @@ fn loading_now(track: &Track, can_next: bool) -> NowPlaying {
         can_pause: false,
         can_stop: true,
         can_next,
+        source: Some(track.source),
+        track_id: track.id.clone(),
     }
 }
 
@@ -1409,6 +1499,51 @@ mod tests {
     }
 
     #[test]
+    fn previous_returns_to_the_track_that_was_playing() {
+        let mut player = machine(&[], Fail::None);
+        player.enqueue(yt("yt-1", "Kitchen Radio"));
+        player.enqueue(yt("yt-2", "Paper Planes"));
+        player.play();
+        player.next();
+        assert_eq!(player.view().title, "Paper Planes");
+
+        player.previous();
+
+        let now = player.view();
+        assert_eq!(now.phase, Phase::Playing);
+        assert_eq!(now.title, "Kitchen Radio");
+        assert_eq!(now.source, Some(Source::YouTubeMusic));
+        assert_eq!(now.track_id, "yt-1");
+
+        player.next();
+        assert_eq!(player.view().title, "Paper Planes");
+    }
+
+    #[test]
+    fn previous_with_no_history_restarts_the_current_track() {
+        let mut player = machine(&[], Fail::None);
+        player.play_now(yt("yt-1", "Kitchen Radio"));
+        assert_eq!(player.sink.starts, 1);
+
+        player.previous();
+
+        assert_eq!(player.view().title, "Kitchen Radio");
+        assert_eq!(player.view().phase, Phase::Playing);
+        assert_eq!(player.sink.starts, 2);
+        assert_eq!(player.extractor.calls, ["yt-1", "yt-1"]);
+    }
+
+    #[test]
+    fn previous_while_idle_does_nothing() {
+        let mut player = machine(&[], Fail::None);
+        player.previous();
+
+        assert_eq!(player.view().phase, Phase::Idle);
+        assert_eq!(player.sink.starts, 0);
+        assert_eq!(player.sink.stops, 0);
+    }
+
+    #[test]
     fn dormant_playback_accepts_commands_without_audio() {
         let playback = Playback::dormant();
         playback.play_now(yt("yt-1", "Kitchen Radio"));
@@ -1416,6 +1551,7 @@ mod tests {
         playback.pause();
         playback.stop();
         playback.next();
+        playback.previous();
 
         let now = playback.now();
         assert_eq!(now.phase, Phase::Idle);

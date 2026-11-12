@@ -5,6 +5,7 @@
 //! argument fails before a window exists.
 
 mod extract;
+mod media_controls;
 mod music;
 mod output;
 mod player;

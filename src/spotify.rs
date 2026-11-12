@@ -317,11 +317,12 @@ fn cache_dir_from(desktop: Desktop, var: impl Fn(&str) -> Option<String>) -> Opt
     Some(root.join("codevox-mu"))
 }
 
-/// `Path::is_absolute` follows the host. The Windows rule is spelled out so
-/// the path check can be tested on Linux, where a drive letter is not absolute.
+/// `Path::is_absolute` follows the host. Both rules are spelled out so each
+/// desktop's path check can be tested on any host: a drive letter is not
+/// absolute on Linux, and `/home` is not absolute on Windows.
 fn is_absolute_for(desktop: Desktop, path: &Path) -> bool {
     match desktop {
-        Desktop::Linux | Desktop::Mac => path.is_absolute(),
+        Desktop::Linux | Desktop::Mac => path.to_string_lossy().starts_with('/'),
         Desktop::Windows => {
             let text = path.to_string_lossy();
             let bytes = text.as_bytes();
