@@ -45,12 +45,6 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 # Building on Linux needs pkg-config and libdbus-1-dev.
 souvlaki = "0.8.3"
 
-# librespot-core 0.8's build script uses vergen-gitcl 1.0 with the `build`
-# feature. vergen 9.1 switched its vergen-lib dependency to 9.x, which no
-# longer matches that build script. 9.0.6 is the last release that does.
-[build-dependencies]
-vergen = { version = "=9.0.6", default-features = false }
-
 # Unsigned test installers. cargo-packager 0.11.8 reads this table.
 # RPM is not a packager format; cargo-generate-rpm 0.21.1 reads the table below.
 # Both versions are pinned in .github/workflows/package.yml.
@@ -144,3 +138,9 @@ assets = [
 "libXi.so.6()(64bit)" = "*"
 "libdbus-1.so.3()(64bit)" = "*"
 "libasound.so.2()(64bit)" = "*"
+
+# librespot-core 0.8's build script uses vergen-gitcl 1.0 with the `build`
+# feature. vergen 9.1 switched its vergen-lib dependency to 9.x, which no
+# longer matches that build script. 9.0.6 is the last release that does.
+[build-dependencies]
+vergen = { version = "=9.0.6", default-features = false }
