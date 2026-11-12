@@ -15,7 +15,7 @@ Install the current stable Rust toolchain from <https://rustup.rs>. Then:
 cargo run --release
 ```
 
-The window is titled "CodeVox mU". Sign in to Spotify from the control under the title. The browser login uses Spotify's desktop client. The refresh token is stored in the OS cache directory for CodeVox mU, not in this repo. Search asks YouTube Music, and Spotify once you are signed in, and lists matches tagged by source, in the CodeVox style. Both searches need a network. If one fails, the other rows stay and an error line is shown. A Premium account plays a Spotify row in the window. A free account, or a failed sign-in, plays the YouTube Music match for that title and artist. The bar says so.
+The window is titled "CodeVox mU". Sign in to Spotify from the control under the title. The browser login uses Spotify's desktop client. The refresh token is stored in the OS cache directory for CodeVox mU, not in this repo. Search asks YouTube Music, and Spotify once you are signed in, and lists one row per recording, tagged by source, in the CodeVox style. Both searches need a network. If one fails, the other rows stay and an error line is shown. A Premium account plays a Spotify row in the window. A free account, or a failed sign-in, plays the YouTube Music match for that title and artist. The bar says so.
 
 ```sh
 cargo run --release -- --smoke
@@ -42,6 +42,7 @@ Windows needs the MSVC build tools. macOS needs the Xcode command line tools.
 `src/main.rs` parses the invocation.
 `src/theme.rs` is the CodeVox visual style (`design/tokens.json`).
 `src/music.rs` is the service trait, the shared track and playlist types, the mixed queue, and the mock catalogues.
+`src/search.rs` merges per-service search hits into one list and collapses the same recording.
 `src/youtube_music.rs` is unauthenticated YouTube Music song search, and the Spotify fallback match.
 `src/spotify.rs` is Spotify sign-in, search, and librespot playback.
 `src/extract.rs` resolves a YouTube video id to an audio stream.
