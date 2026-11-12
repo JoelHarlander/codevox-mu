@@ -80,3 +80,9 @@ No new crate is GPL-only. Transitive copyleft that is not GPL-only, and the gran
 - priority-queue 2.7.0 is LGPL-3.0-or-later OR MPL-2.0. It is a librespot-core dependency. This project uses the MPL-2.0 grant.
 
 vergen is pinned to 9.0.6. librespot-core's build script uses vergen-gitcl 1.0, and vergen 9.1 no longer type-checks against that script. The pin is a build dependency only.
+
+## 12 Nov 2026 — Spotify Web API uses CodeVox mU's client id
+
+Decided. Web API calls and the PKCE sign-in use CodeVox mU's own public client id (`34edc1e59dcb447db61ea7720733cbde`). There is still no client secret. The id can be replaced at build time with `SPOTIFY_CLIENT_ID`, or at runtime with `CODEVOX_MU_SPOTIFY_CLIENT_ID`.
+
+librespot 0.8.0 keeps the desktop client id (`65b708073fc0480ea92a077233ca87bd`) for playback only. Its client-token and login5 paths reject any other id, so an access token from the Web API app cannot open a session. Premium sign-in therefore runs a second PKCE login with the desktop id, the same split spotify-player uses. A free account never starts that login.

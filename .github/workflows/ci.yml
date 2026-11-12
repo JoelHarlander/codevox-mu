@@ -17,6 +17,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  # Baked in by build.rs. Empty uses the public id in src/spotify.rs.
+  # Set for the whole workflow so clippy, test, and build compile the same id.
+  SPOTIFY_CLIENT_ID: ${{ vars.SPOTIFY_CLIENT_ID }}
 
 jobs:
   ci:
@@ -74,6 +77,8 @@ jobs:
         run: cargo clippy --locked --release --all-targets -- -D warnings
 
       - name: Build
+        env:
+          SPOTIFY_CLIENT_ID: ${{ vars.SPOTIFY_CLIENT_ID }}
         run: cargo build --locked --release
 
       - name: Test
@@ -139,6 +144,8 @@ jobs:
           cache-on-failure: true
 
       - name: Build
+        env:
+          SPOTIFY_CLIENT_ID: ${{ vars.SPOTIFY_CLIENT_ID }}
         run: cargo build --locked --release --target aarch64-pc-windows-msvc
 
       - name: Upload release binary

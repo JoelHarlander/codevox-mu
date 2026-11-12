@@ -1328,7 +1328,7 @@ impl Shell {
                 self.spotify_rows = tracks;
             }
             Err(error) => {
-                self.spotify_error = Some(format!("Spotify search failed: {error}"));
+                self.spotify_error = Some(spotify_search_notice(&error.to_string()));
                 self.spotify_rows.clear();
             }
         }
@@ -1724,7 +1724,25 @@ fn spotify_compact(phase: &AccountPhase) -> (&'static str, Color) {
         AccountPhase::SigningIn => ("signing in", crate::theme::TEXT_SECONDARY),
         AccountPhase::SignedIn { .. } => ("signed in", crate::theme::TEXT_PRIMARY),
         AccountPhase::NotPremium { .. } => ("not Premium", crate::theme::WARNING),
+        AccountPhase::Failed { message } if message == SPOTIFY_RENEW_SIGN_IN => {
+            ("sign-in needs to be renewed", crate::theme::DESTRUCTIVE)
+        }
         AccountPhase::Failed { .. } => ("sign-in failed", crate::theme::DESTRUCTIVE),
+    }
+}
+
+/// Saved Web API credentials that no longer refresh. Spotify writes this sentence.
+const SPOTIFY_RENEW_SIGN_IN: &str = "Spotify sign-in needs to be renewed.";
+
+/// Search failures that are already a full Spotify sentence stay as written.
+///
+/// Rate limits from the Web API are one of those sentences. Other failures
+/// still get a short prefix so the banner says which search failed.
+fn spotify_search_notice(detail: &str) -> String {
+    if detail.starts_with("Spotify ") {
+        detail.to_string()
+    } else {
+        format!("Spotify search failed: {detail}")
     }
 }
 
@@ -2535,6 +2553,42 @@ fn dismissing_a_notice_clears_errors_and_a_failed_sign_in() {
     assert!(shell.spotify_error.is_none());
     assert_eq!(shell.phase, AccountPhase::SignedOut);
     assert!(notice_lines(&shell).is_empty());
+    let _ = Shell::view(&shell);
+}
+
+#[test]
+fn spotify_renewal_and_rate_limit_show_on_accounts_and_in_the_banner() {
+    let mut shell = test_shell(Mode::Run);
+    let _ = shell.update(Message::AccountChanged {
+        epoch: 0,
+        phase: AccountPhase::Failed {
+            message: SPOTIFY_RENEW_SIGN_IN.to_string(),
+        },
+    });
+    assert_eq!(
+        spotify_compact(&shell.phase).0,
+        "sign-in needs to be renewed"
+    );
+    let _ = shell.update(Message::ShowAccounts);
+    assert!(
+        notice_lines(&shell)
+            .iter()
+            .any(|line| line == SPOTIFY_RENEW_SIGN_IN)
+    );
+    let _ = Shell::view(&shell);
+
+    let _ = shell.update(Message::QueryChanged("night".into()));
+    let limited = "Spotify is limiting requests. Wait a moment and try again.";
+    let _ = shell.update(Message::SpotifySearched {
+        generation: shell.generation,
+        result: Err(music::Error::Unavailable(limited.to_string())),
+    });
+    let lines = notice_lines(&shell);
+    assert!(
+        lines.iter().any(|line| line == limited),
+        "banner should show the rate-limit sentence, got {lines:?}"
+    );
+    assert!(lines.iter().all(|line| !line.contains("429")), "{lines:?}");
     let _ = Shell::view(&shell);
 }
 
