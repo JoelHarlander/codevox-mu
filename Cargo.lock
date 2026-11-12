@@ -728,6 +728,7 @@ dependencies = [
  "souvlaki",
  "tokio",
  "vergen",
+ "windows-sys 0.61.2",
  "ytmapi-rs",
 ]
 

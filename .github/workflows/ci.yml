@@ -81,6 +81,35 @@ jobs:
           SPOTIFY_CLIENT_ID: ${{ vars.SPOTIFY_CLIENT_ID }}
         run: cargo build --locked --release
 
+      # A console subsystem (3) is the black window behind the borderless player.
+      # Optional-header subsystem is at the same offset for PE32 and PE32+.
+      - name: PE subsystem is GUI
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "target\release\codevox-mu.exe"
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $path).Path)
+          if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+            throw "codevox-mu: $path is not a PE file"
+          }
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          if ($pe -lt 0 -or ($pe + 96) -gt $bytes.Length) {
+            throw "codevox-mu: $path has a truncated PE header"
+          }
+          if ($bytes[$pe] -ne 0x50 -or $bytes[$pe + 1] -ne 0x45 -or $bytes[$pe + 2] -ne 0 -or $bytes[$pe + 3] -ne 0) {
+            throw "codevox-mu: $path is missing a PE signature"
+          }
+          $magic = [BitConverter]::ToUInt16($bytes, $pe + 24)
+          if ($magic -ne 0x10B -and $magic -ne 0x20B) {
+            throw "codevox-mu: $path has an unexpected optional-header magic ($magic)"
+          }
+          $subsystem = [BitConverter]::ToUInt16($bytes, $pe + 92)
+          if ($subsystem -ne 2) {
+            throw "codevox-mu: expected PE subsystem 2 (GUI), found $subsystem"
+          }
+          Write-Host "codevox-mu: $path PE subsystem $subsystem (GUI)"
+
       - name: Test
         run: cargo test --locked --release
 
@@ -147,6 +176,32 @@ jobs:
         env:
           SPOTIFY_CLIENT_ID: ${{ vars.SPOTIFY_CLIENT_ID }}
         run: cargo build --locked --release --target aarch64-pc-windows-msvc
+
+      - name: PE subsystem is GUI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "target\aarch64-pc-windows-msvc\release\codevox-mu.exe"
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $path).Path)
+          if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+            throw "codevox-mu: $path is not a PE file"
+          }
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          if ($pe -lt 0 -or ($pe + 96) -gt $bytes.Length) {
+            throw "codevox-mu: $path has a truncated PE header"
+          }
+          if ($bytes[$pe] -ne 0x50 -or $bytes[$pe + 1] -ne 0x45 -or $bytes[$pe + 2] -ne 0 -or $bytes[$pe + 3] -ne 0) {
+            throw "codevox-mu: $path is missing a PE signature"
+          }
+          $magic = [BitConverter]::ToUInt16($bytes, $pe + 24)
+          if ($magic -ne 0x10B -and $magic -ne 0x20B) {
+            throw "codevox-mu: $path has an unexpected optional-header magic ($magic)"
+          }
+          $subsystem = [BitConverter]::ToUInt16($bytes, $pe + 92)
+          if ($subsystem -ne 2) {
+            throw "codevox-mu: expected PE subsystem 2 (GUI), found $subsystem"
+          }
+          Write-Host "codevox-mu: $path PE subsystem $subsystem (GUI)"
 
       - name: Upload release binary
         uses: actions/upload-artifact@v4
