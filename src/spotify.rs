@@ -251,6 +251,8 @@ pub fn premium_product(product: &str) -> bool {
 /// A parsed `/v1/me` body. No token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Profile {
+    /// Spotify user id from `/v1/me`. Empty when the body omitted it.
+    pub id: String,
     pub name: String,
     pub product: String,
     pub premium: bool,
@@ -282,6 +284,7 @@ pub fn profile_from_json(body: &str) -> Result<Profile, Error> {
         }
     };
     Ok(Profile {
+        id: text_field(&value, "id"),
         premium: premium_product(&product),
         name,
         product,
@@ -557,6 +560,21 @@ fn liked_songs_row() -> Playlist {
 /// Spotify's 404 body. `/items` is current; `/tracks` is the older path.
 fn replied_not_found(error: &Error) -> bool {
     matches!(error, Error::Unavailable(reason) if reason.contains("replied 404"))
+}
+
+/// Development-mode apps may read items only for playlists the user owns
+/// or collaborates on. Anything else is 403. Shown instead of a raw status.
+pub const PLAYLIST_NOT_SHARED: &str =
+    "Spotify only shares the songs in playlists you own or collaborate on.";
+
+/// `true` for that restriction, whether it is still the raw 403 or the note.
+pub fn playlist_not_shared(error: &Error) -> bool {
+    match error {
+        Error::Unavailable(reason) => {
+            reason == PLAYLIST_NOT_SHARED || reason.contains("replied 403")
+        }
+        Error::NotFound => false,
+    }
 }
 
 /// A Spotify id the player can load. Invalid ids never reach librespot.
@@ -1733,16 +1751,23 @@ impl MusicService for SpotifyCatalogue {
                 let tracks = library_page_url(&format!(
                     "https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
                 ));
-                read_pages(
+                map_playlist_access(read_pages(
                     &self.account,
                     &token,
                     &tracks,
                     TRACK_CAP,
                     tracks_from_playlist_page_json,
-                )
+                ))
             }
-            other => other,
+            other => map_playlist_access(other),
         }
+    }
+}
+
+fn map_playlist_access(result: Result<Vec<Track>, Error>) -> Result<Vec<Track>, Error> {
+    match result {
+        Err(error) if playlist_not_shared(&error) => Err(brief_message(PLAYLIST_NOT_SHARED)),
+        other => other,
     }
 }
 
@@ -2188,18 +2213,25 @@ fn self_test_with(
     ));
 
     let access = refreshed.access_token.as_str();
-    let mut first_playlist = None;
+    let mut openable = Vec::new();
     match account
         .http_get(&library_page_url(PLAYLISTS_URL), access, &[])
-        .and_then(|body| playlist_sample(&body))
+        .and_then(|body| playlist_listings(&body))
     {
-        Ok(sample) => {
-            first_playlist = sample.first;
+        Ok(page) => {
+            openable = page
+                .lists
+                .iter()
+                .filter(|list| playlist_is_openable(&profile.id, list))
+                .cloned()
+                .collect();
             lines.push(Check::pass(
                 "playlists",
                 format!(
-                    "{} playlists, {} on the first page",
-                    sample.total, sample.shown
+                    "{} playlists, {} on the first page, {} readable (you own or collaborate on them)",
+                    page.total,
+                    page.lists.len(),
+                    openable.len()
                 ),
             ));
         }
@@ -2220,38 +2252,9 @@ fn self_test_with(
         Err(error) => lines.push(Check::fail("liked songs", error.to_string())),
     }
 
-    match first_playlist {
-        Some((id, name)) => {
-            let items =
-                library_page_url(&format!("https://api.spotify.com/v1/playlists/{id}/items"));
-            let body = account.http_get(&items, access, &[]).or_else(|error| {
-                if replied_not_found(&error) {
-                    let tracks = library_page_url(&format!(
-                        "https://api.spotify.com/v1/playlists/{id}/tracks"
-                    ));
-                    account.http_get(&tracks, access, &[])
-                } else {
-                    Err(error)
-                }
-            });
-            match body.and_then(|body| track_sample(&body)) {
-                Ok(sample) => lines.push(Check::pass(
-                    "playlist tracks",
-                    format!(
-                        "{name}: {} tracks, {} on the first page",
-                        sample.total, sample.shown
-                    ),
-                )),
-                Err(error) => lines.push(Check::fail("playlist tracks", error.to_string())),
-            }
-        }
-        None => lines.push(Check::skip(
-            "playlist tracks",
-            "no playlist on the first page",
-        )),
-    }
+    lines.push(open_owned_playlist(&account, access, &openable));
 
-    let mut play_id = None;
+    let mut play_tracks = Vec::new();
     match account
         .http_get(
             SEARCH_URL,
@@ -2267,7 +2270,6 @@ fn self_test_with(
             ));
         }
         Ok(tracks) => {
-            play_id = Some(tracks[0].id.clone());
             lines.push(Check::pass(
                 "spotify search",
                 format!(
@@ -2276,14 +2278,17 @@ fn self_test_with(
                     tracks[0].title
                 ),
             ));
+            play_tracks = tracks.into_iter().take(PLAYBACK_ATTEMPTS).collect();
         }
         Err(error) => lines.push(Check::fail("spotify search", error.to_string())),
     }
 
     lines.push(youtube_check(query, &mut youtube));
-    lines.push(playback_check(&account, &profile, play_id.as_deref()));
+    lines.push(playback_check(&account, &profile, &play_tracks));
     lines
 }
+
+const PLAYBACK_ATTEMPTS: usize = 3;
 
 fn remember_rotated_refresh(saved: &SavedAccount, refresh_token: &str) {
     if refresh_token.is_empty() || refresh_token == saved.refresh_token {
@@ -2304,28 +2309,105 @@ fn remember_rotated_refresh(saved: &SavedAccount, refresh_token: &str) {
     }
 }
 
-fn playback_check(account: &SpotifyAccount, profile: &Profile, track_id: Option<&str>) -> Check {
+fn open_owned_playlist(
+    account: &SpotifyAccount,
+    access: &str,
+    openable: &[PlaylistListing],
+) -> Check {
+    if openable.is_empty() {
+        return Check::fail(
+            "playlist tracks",
+            "no playlist you own or collaborate on in the first page",
+        );
+    }
+    let mut refused = 0;
+    for list in openable {
+        match playlist_track_page(account, access, &list.id) {
+            Ok(sample) => {
+                let mut detail = format!(
+                    "\"{}\": {} tracks, {} on the first page",
+                    list.name, sample.total, sample.shown
+                );
+                if refused > 0 {
+                    detail.push_str(&format!(
+                        "; skipped {refused} you own or collaborate on that Spotify would not share"
+                    ));
+                }
+                return Check::pass("playlist tracks", detail);
+            }
+            Err(error) if playlist_not_shared(&error) => refused += 1,
+            Err(error) => return Check::fail("playlist tracks", error.to_string()),
+        }
+    }
+    Check::fail(
+        "playlist tracks",
+        format!(
+            "Spotify would not share the songs in any of the {refused} playlists you own or collaborate on"
+        ),
+    )
+}
+
+fn playlist_track_page(
+    account: &SpotifyAccount,
+    access: &str,
+    playlist_id: &str,
+) -> Result<PageSample, Error> {
+    let items = library_page_url(&format!(
+        "https://api.spotify.com/v1/playlists/{playlist_id}/items"
+    ));
+    let body = account.http_get(&items, access, &[]).or_else(|error| {
+        if replied_not_found(&error) {
+            let tracks = library_page_url(&format!(
+                "https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
+            ));
+            account.http_get(&tracks, access, &[])
+        } else {
+            Err(error)
+        }
+    })?;
+    track_sample(&body)
+}
+
+fn playback_check(account: &SpotifyAccount, profile: &Profile, tracks: &[Track]) -> Check {
     if !profile.premium {
         return Check::skip("playback", "account is not Premium");
     }
-    let Some(track_id) = track_id else {
+    if tracks.is_empty() {
         return Check::fail("playback", "no Spotify search result to play");
-    };
+    }
     match account.restore() {
         AccountPhase::NotPremium { .. } => Check::skip("playback", "account is not Premium"),
         AccountPhase::Failed { message } => Check::fail("playback", message),
         AccountPhase::SignedOut | AccountPhase::SigningIn => {
             Check::fail("playback", "not signed in")
         }
-        AccountPhase::SignedIn { .. } => play_for(account, track_id),
+        AccountPhase::SignedIn { .. } => play_attempts(account, tracks),
     }
 }
 
-fn play_for(account: &SpotifyAccount, track_id: &str) -> Check {
+fn play_attempts(account: &SpotifyAccount, tracks: &[Track]) -> Check {
     let mut engine = LibrespotEngine::new(account.clone());
-    if let Err(error) = engine.load(track_id) {
-        return Check::fail("playback", error);
+    let mut failures = Vec::new();
+    for track in tracks.iter().take(PLAYBACK_ATTEMPTS) {
+        match listen_once(&mut engine, &track.id) {
+            Ok(detail) => {
+                return Check::pass("playback", format!("\"{}\": {detail}", track.title));
+            }
+            Err(error) => failures.push(format!("\"{}\": {error}", track.title)),
+        }
     }
+    Check::fail(
+        "playback",
+        trim_detail(&format!(
+            "tried {}: {}",
+            failures.len(),
+            failures.join("; ")
+        )),
+    )
+}
+
+fn listen_once(engine: &mut LibrespotEngine, track_id: &str) -> Result<String, String> {
+    engine.load(track_id)?;
     engine.play();
     let started = Instant::now();
     let mut saw_playing = false;
@@ -2345,33 +2427,38 @@ fn play_for(account: &SpotifyAccount, track_id: &str) -> Check {
         if feed.position > max_position {
             max_position = feed.position;
         }
+        if saw_playing && min_position.is_some_and(|min| max_position > min) {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(200));
     }
     engine.stop();
     if let Some(error) = failure {
-        return Check::fail("playback", error);
+        return Err(error);
     }
     let advanced = min_position.is_some_and(|min| max_position > min);
     if saw_playing && advanced {
-        Check::pass(
-            "playback",
-            format!(
-                "Playing, position advanced {}ms to {}ms",
-                min_position.unwrap_or_default().as_millis(),
-                max_position.as_millis()
-            ),
-        )
+        Ok(format!(
+            "Playing, position advanced {}ms to {}ms",
+            min_position.unwrap_or_default().as_millis(),
+            max_position.as_millis()
+        ))
     } else if !saw_playing {
-        Check::fail("playback", "no Playing event")
+        Err("no Playing event".to_string())
     } else {
-        Check::fail(
-            "playback",
-            format!(
-                "position did not advance (last {}ms)",
-                max_position.as_millis()
-            ),
-        )
+        Err(format!(
+            "position did not advance (last {}ms)",
+            max_position.as_millis()
+        ))
     }
+}
+
+fn trim_detail(detail: &str) -> String {
+    let mut brief: String = detail.chars().take(240).collect();
+    if detail.chars().count() > 240 {
+        brief.push('…');
+    }
+    brief
 }
 
 fn youtube_check(
@@ -2391,34 +2478,59 @@ fn youtube_check(
 struct PageSample {
     total: usize,
     shown: usize,
-    first: Option<(String, String)>,
 }
 
-fn playlist_sample(body: &str) -> Result<PageSample, Error> {
-    let page = playlists_from_page_json(body)?;
-    let value: serde_json::Value = serde_json::from_str(body).map_err(brief)?;
-    let first = page
-        .items
-        .first()
-        .map(|playlist| (playlist.id.clone(), playlist.name.clone()));
-    Ok(PageSample {
-        total: page_total(&value, page.items.len()),
-        shown: page.items.len(),
-        first,
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlaylistListing {
+    id: String,
+    name: String,
+    owner_id: String,
+    collaborative: bool,
+}
+
+struct PlaylistPage {
+    total: usize,
+    lists: Vec<PlaylistListing>,
+}
+
+fn playlist_is_openable(user_id: &str, list: &PlaylistListing) -> bool {
+    let owned = !user_id.is_empty() && list.owner_id == user_id;
+    owned || list.collaborative
+}
+
+fn playlist_listings(body: &str) -> Result<PlaylistPage, Error> {
+    let value = json_value(body)?;
+    let items = page_items(&value)?;
+    let mut lists = Vec::new();
+    for item in items {
+        let Some(playlist) = playlist_from_item(item) else {
+            continue;
+        };
+        lists.push(PlaylistListing {
+            id: playlist.id,
+            name: playlist.name,
+            owner_id: item
+                .get("owner")
+                .map(|owner| text_field(owner, "id"))
+                .unwrap_or_default(),
+            collaborative: item
+                .get("collaborative")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        });
+    }
+    Ok(PlaylistPage {
+        total: page_total(&value, lists.len()),
+        lists,
     })
 }
 
 fn track_sample(body: &str) -> Result<PageSample, Error> {
     let page = tracks_from_collection_page(body)?;
     let value: serde_json::Value = serde_json::from_str(body).map_err(brief)?;
-    let first = page
-        .items
-        .first()
-        .map(|track| (track.id.clone(), track.title.clone()));
     Ok(PageSample {
         total: page_total(&value, page.items.len()),
         shown: page.items.len(),
-        first,
     })
 }
 
@@ -2469,6 +2581,7 @@ mod tests {
     fn profile_json_reads_premium_and_free_fixtures() {
         let premium = profile_from_json(PREMIUM_FIXTURE).expect("premium profile");
         assert_eq!(premium.name, "Ada Vega");
+        assert_eq!(premium.id, "adavega");
         assert!(premium.premium);
         assert_eq!(premium.product, "premium");
 
@@ -3039,6 +3152,10 @@ mod tests {
 
         let missing = brief_message("Spotify replied 404: Not found");
         assert!(replied_not_found(&missing));
+        let forbidden = brief_message("Spotify replied 403: Forbidden");
+        assert!(playlist_not_shared(&forbidden));
+        assert!(playlist_not_shared(&brief_message(PLAYLIST_NOT_SHARED)));
+        assert!(!playlist_not_shared(&missing));
         let limited = brief_message("Spotify is limiting requests. Wait a moment and try again.");
         assert!(!replied_not_found(&limited));
     }
@@ -3077,6 +3194,27 @@ mod tests {
             !rendered.contains("stopped before it finished"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn selftest_opens_a_playlist_the_user_owns() {
+        let body = r#"{
+            "total": 3,
+            "items": [
+                {"id":"37i9dQZF1DXcBWIGoYBM5M","name":"Today's Top Hits","collaborative":false,"owner":{"id":"spotify"}},
+                {"id":"ownedlist000000000000","name":"Harbour","collaborative":false,"owner":{"id":"adavega"}},
+                {"id":"sharedlist00000000000","name":"With Ada","collaborative":true,"owner":{"id":"friend"}}
+            ]
+        }"#;
+        let page = playlist_listings(body).expect("listings");
+        let openable: Vec<_> = page
+            .lists
+            .iter()
+            .filter(|list| playlist_is_openable("adavega", list))
+            .map(|list| list.name.as_str())
+            .collect();
+        assert_eq!(openable, ["Harbour", "With Ada"]);
+        assert!(!playlist_is_openable("adavega", &page.lists[0]));
     }
 
     #[test]

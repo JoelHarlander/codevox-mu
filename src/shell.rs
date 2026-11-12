@@ -266,6 +266,8 @@ struct Shell {
     playlist_tracks: Vec<Track>,
     playlist_name: String,
     playlist_source: Option<Source>,
+    /// Why this playlist has no tracks. Not an error banner.
+    playlist_note: Option<String>,
     library_loading: bool,
     /// Bumped when a YouTube Music sign-in or library fetch starts, so a
     /// slower reply cannot overwrite a newer one. Spotify sign-in uses
@@ -657,7 +659,7 @@ fn the_library_says_when_both_accounts_are_signed_out() {
     assert!(!shell.library_loading);
     assert!(shell.playlists.is_empty());
     assert_eq!(
-        status_note(&shell),
+        status_note(&shell).as_deref(),
         Some("Sign in to Spotify or YouTube Music to see your library.")
     );
     assert!(notice_lines(&shell).is_empty());
@@ -841,8 +843,31 @@ fn an_empty_signed_in_library_says_there_are_no_playlists() {
         result: Ok(merge_library(Some(Ok(Vec::new())), None)),
     });
     assert!(shell.playlists.is_empty());
-    assert_eq!(status_note(&shell), Some("No playlists"));
+    assert_eq!(status_note(&shell).as_deref(), Some("No playlists"));
     assert!(notice_lines(&shell).is_empty());
+    let _ = Shell::view(&shell);
+}
+
+#[test]
+fn a_playlist_spotify_will_not_share_is_a_note() {
+    let mut shell = test_shell(Mode::Run);
+    shell.pane = Pane::Playlist;
+    shell.library_epoch = 4;
+    shell.playlist_source = Some(Source::Spotify);
+    shell.playlist_name = "Today's Top Hits".into();
+    let _ = shell.update(Message::PlaylistReady {
+        epoch: 4,
+        result: Err(music::Error::Unavailable(
+            spotify::PLAYLIST_NOT_SHARED.to_string(),
+        )),
+    });
+    assert!(shell.error.is_none());
+    assert!(shell.playlist_tracks.is_empty());
+    assert!(notice_lines(&shell).is_empty());
+    assert_eq!(
+        status_note(&shell).as_deref(),
+        Some(spotify::PLAYLIST_NOT_SHARED)
+    );
     let _ = Shell::view(&shell);
 }
 
@@ -881,7 +906,7 @@ fn a_spotify_rate_limit_keeps_the_youtube_library_and_the_sentence() {
     let lines = notice_lines(&shell);
     assert!(lines.iter().any(|line| line == limited), "{lines:?}");
     assert!(lines.iter().all(|line| !line.contains("429")), "{lines:?}");
-    assert_ne!(status_note(&shell), Some("No playlists"));
+    assert_ne!(status_note(&shell).as_deref(), Some("No playlists"));
     let _ = Shell::view(&shell);
 
     let _ = shell.update(Message::OpenPlaylist {
@@ -897,7 +922,10 @@ fn a_spotify_rate_limit_keeps_the_youtube_library_and_the_sentence() {
     assert!(shell.playlist_tracks.is_empty());
     let lines = notice_lines(&shell);
     assert!(lines.iter().any(|line| line == limited), "{lines:?}");
-    assert_ne!(status_note(&shell), Some("This playlist is empty."));
+    assert_ne!(
+        status_note(&shell).as_deref(),
+        Some("This playlist is empty.")
+    );
     let _ = Shell::view(&shell);
 }
 
@@ -1135,6 +1163,7 @@ impl Shell {
             playlist_tracks: Vec::new(),
             playlist_name: String::new(),
             playlist_source: None,
+            playlist_note: None,
             library_loading: false,
             library_epoch: 0,
             restore_started: false,
@@ -1479,6 +1508,7 @@ impl Shell {
         self.playlist_name = name;
         self.playlist_source = Some(source);
         self.playlist_tracks.clear();
+        self.playlist_note = None;
         self.library_loading = true;
         self.error = None;
         self.library_epoch = self.library_epoch.wrapping_add(1);
@@ -1516,10 +1546,17 @@ impl Shell {
         match result {
             Ok(tracks) => {
                 self.playlist_tracks = tracks;
+                self.playlist_note = None;
                 self.error = None;
+            }
+            Err(error) if spotify::playlist_not_shared(&error) => {
+                self.playlist_tracks.clear();
+                self.error = None;
+                self.playlist_note = Some(spotify::PLAYLIST_NOT_SHARED.to_string());
             }
             Err(error) => {
                 self.playlist_tracks.clear();
+                self.playlist_note = None;
                 self.error = Some(playlist_failure(self.playlist_source, &error));
             }
         }
@@ -2388,8 +2425,14 @@ fn cookie_form(shell: &Shell) -> Element<'_, Message> {
     column![help, input, buttons].spacing(8).width(Fill).into()
 }
 
-fn status_note(shell: &Shell) -> Option<&'static str> {
-    match shell.pane {
+fn status_note(shell: &Shell) -> Option<String> {
+    if shell.pane == Pane::Playlist
+        && !shell.library_loading
+        && let Some(note) = &shell.playlist_note
+    {
+        return Some(note.clone());
+    }
+    let fixed = match shell.pane {
         Pane::Search if shell.spotify_pending || shell.youtube_pending => Some("Searching…"),
         Pane::Search if !shell.query.trim().is_empty() && shell.results.is_empty() => {
             Some("No matches")
@@ -2415,7 +2458,8 @@ fn status_note(shell: &Shell) -> Option<&'static str> {
             Some("This playlist is empty.")
         }
         Pane::Search | Pane::Queue | Pane::Library | Pane::Playlist | Pane::Accounts => None,
-    }
+    };
+    fixed.map(str::to_string)
 }
 
 fn notice_banner_if_any(shell: &Shell) -> Option<Element<'static, Message>> {

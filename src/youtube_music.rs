@@ -280,8 +280,8 @@ fn brief(error: impl std::fmt::Display) -> Error {
     brief_message(error.to_string())
 }
 
-/// Plays a Spotify row that librespot cannot, by searching YouTube Music
-/// for the title and artist. The first song is the match.
+/// Plays a Spotify row that librespot cannot. The match is the same
+/// recording: title, primary artist, and duration within three seconds.
 pub struct YouTubeFallback {
     music: YouTubeMusic,
 }
@@ -293,18 +293,42 @@ impl YouTubeFallback {
 }
 
 impl YoutubeMatch for YouTubeFallback {
-    fn find(&mut self, title: &str, artists: &[String]) -> Result<Option<Track>, String> {
+    fn find(
+        &mut self,
+        title: &str,
+        artists: &[String],
+        duration: Duration,
+    ) -> Result<Option<Track>, String> {
         let query = match_query(title, artists);
         if query.is_empty() {
             return Ok(None);
         }
         match self.music.search(&query) {
-            Ok(tracks) => Ok(tracks
-                .into_iter()
-                .find(|track| track.source == Source::YouTubeMusic)),
+            Ok(tracks) => Ok(first_youtube_match(title, artists, duration, &tracks)),
             Err(error) => Err(error.to_string()),
         }
     }
+}
+
+/// The first candidate that is the same recording as the Spotify row.
+pub fn first_youtube_match(
+    title: &str,
+    artists: &[String],
+    duration: Duration,
+    candidates: &[Track],
+) -> Option<Track> {
+    let wanted = Track {
+        id: String::new(),
+        source: Source::Spotify,
+        title: title.to_string(),
+        artists: artists.to_vec(),
+        album: None,
+        duration,
+    };
+    candidates
+        .iter()
+        .find(|track| crate::search::same_recording(&wanted, track))
+        .cloned()
 }
 
 fn brief_message(message: impl Into<String>) -> Error {
@@ -443,6 +467,50 @@ mod tests {
     fn song_search_rejects_malformed_json() {
         let error = YouTubeMusic::tracks_from_song_search_json("not json").expect_err("malformed");
         assert!(matches!(error, Error::Unavailable(_)));
+    }
+
+    #[test]
+    fn a_youtube_match_uses_title_artist_and_duration() {
+        let video = Track {
+            id: "video".into(),
+            source: Source::YouTubeMusic,
+            title: "Lovefool (Official Video)".into(),
+            artists: vec!["The Cardigans".into()],
+            album: None,
+            duration: Duration::from_secs(201),
+        };
+        let remix = Track {
+            id: "remix".into(),
+            source: Source::YouTubeMusic,
+            title: "Lovefool (Remix)".into(),
+            artists: vec!["The Cardigans".into()],
+            album: None,
+            duration: Duration::from_secs(200),
+        };
+        let long = Track {
+            id: "long".into(),
+            source: Source::YouTubeMusic,
+            title: "Lovefool".into(),
+            artists: vec!["The Cardigans".into()],
+            album: None,
+            duration: Duration::from_secs(400),
+        };
+        let matched = first_youtube_match(
+            "Lovefool",
+            &["The Cardigans".into()],
+            Duration::from_secs(200),
+            &[remix, long, video.clone()],
+        );
+        assert_eq!(matched.expect("match").id, video.id);
+        assert!(
+            first_youtube_match(
+                "Lovefool",
+                &["The Cardigans".into()],
+                Duration::from_secs(200),
+                &[]
+            )
+            .is_none()
+        );
     }
 
     #[test]
