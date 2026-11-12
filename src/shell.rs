@@ -21,6 +21,7 @@ use iced::{Background, Border, Color, Element, Fill, Length, Shadow, Size, Subsc
 
 use crate::music::{self, MusicService, Playlist, Source, Track};
 use crate::player::{self, Phase};
+use crate::playlists;
 use crate::search;
 use crate::spotify::{self, AccountPhase};
 use crate::youtube_account::LibrarySession;
@@ -180,6 +181,18 @@ enum Message {
     },
     ShowSearch,
     ShowQueue,
+    ShowMixes,
+    MixDraftChanged(String),
+    CreateMix,
+    OpenMix(String),
+    RenameMix,
+    DeleteMix,
+    AddToMix(Track),
+    RemoveMixTrack(usize),
+    MoveMixEarlier(usize),
+    MoveMixLater(usize),
+    PlayMix,
+    PlayMixFrom(usize),
     ShowAccounts,
     BackToLibrary,
     DismissNotices,
@@ -234,6 +247,10 @@ enum Pane {
     Library,
     Playlist,
     Accounts,
+    /// Saved mixed playlists.
+    Mixes,
+    /// One saved mixed playlist.
+    Mix,
 }
 
 struct Shell {
@@ -273,6 +290,12 @@ struct Shell {
     playlist_source: Option<Source>,
     /// Why this playlist has no tracks. Not an error banner.
     playlist_note: Option<String>,
+    /// Mixed playlists saved on this device.
+    mixes: playlists::Store,
+    /// Playlist that Add writes to, and the one open on the Mix pane.
+    mix_id: Option<String>,
+    mix_draft: String,
+    mix_error: Option<String>,
     library_loading: bool,
     /// Bumped when a YouTube Music sign-in or library fetch starts, so a
     /// slower reply cannot overwrite a newer one. Spotify sign-in uses
@@ -298,6 +321,9 @@ struct Shell {
     screenshot_library: Option<PathBuf>,
     #[cfg(test)]
     last_play: Option<Track>,
+    /// Ids sent to the mixed queue, and the index playback started at.
+    #[cfg(test)]
+    last_mix_play: Option<(Vec<String>, usize)>,
 }
 
 pub fn run(mode: Mode) -> iced::Result {
@@ -1113,6 +1139,9 @@ impl Shell {
             spotify::playback_engine(play_account),
             Box::new(YouTubeFallback::new(YouTubeMusic::new())),
         );
+        // Saved playlists outlive this process. Smoke and screenshots stay
+        // on the empty in-memory store.
+        shell.load_saved_playlists();
         let task = Task::perform(
             account_task("spotify-restore", move || account.restore()),
             |phase| Message::AccountChanged { epoch: 0, phase },
@@ -1173,6 +1202,10 @@ impl Shell {
             playlist_name: String::new(),
             playlist_source: None,
             playlist_note: None,
+            mixes: playlists::Store::memory(),
+            mix_id: None,
+            mix_draft: String::new(),
+            mix_error: None,
             library_loading: false,
             library_epoch: 0,
             restore_started: false,
@@ -1190,6 +1223,8 @@ impl Shell {
             screenshot_library,
             #[cfg(test)]
             last_play: None,
+            #[cfg(test)]
+            last_mix_play: None,
         }
     }
 
@@ -1287,6 +1322,49 @@ impl Shell {
                 self.pane = Pane::Queue;
                 Task::none()
             }
+            Message::ShowMixes => {
+                self.mix_draft.clear();
+                self.pane = Pane::Mixes;
+                Task::none()
+            }
+            Message::MixDraftChanged(name) => {
+                self.mix_draft = name;
+                Task::none()
+            }
+            Message::CreateMix => {
+                self.create_saved();
+                Task::none()
+            }
+            Message::OpenMix(id) => {
+                self.open_saved(id);
+                Task::none()
+            }
+            Message::RenameMix => {
+                self.rename_saved();
+                Task::none()
+            }
+            Message::DeleteMix => {
+                self.delete_saved();
+                Task::none()
+            }
+            Message::AddToMix(track) => {
+                self.add_saved(track);
+                Task::none()
+            }
+            Message::RemoveMixTrack(index) => {
+                self.remove_saved(index);
+                Task::none()
+            }
+            Message::MoveMixEarlier(index) => {
+                self.move_saved(index, false);
+                Task::none()
+            }
+            Message::MoveMixLater(index) => {
+                self.move_saved(index, true);
+                Task::none()
+            }
+            Message::PlayMix => self.play_saved(0),
+            Message::PlayMixFrom(index) => self.play_saved(index),
             Message::ShowAccounts => {
                 self.pane = Pane::Accounts;
                 if self.sign == YtSign::Out {
@@ -1410,6 +1488,160 @@ impl Shell {
                 self.arm_clock()
             }
         }
+    }
+
+    fn load_saved_playlists(&mut self) {
+        match playlists::Store::load_default() {
+            Ok(store) => {
+                self.mix_id = store.playlists().first().map(|item| item.id().to_string());
+                self.mixes = store;
+            }
+            Err(error) => {
+                self.mix_error = Some(error.message().to_string());
+                self.mixes = error.into_store();
+            }
+        }
+    }
+
+    fn selected_mix(&self) -> Option<&playlists::SavedPlaylist> {
+        let id = self.mix_id.as_deref()?;
+        self.mixes.playlist(id)
+    }
+
+    fn create_saved(&mut self) {
+        match self.mixes.create(&self.mix_draft) {
+            Ok(id) => {
+                self.mix_error = None;
+                self.mix_id = Some(id);
+                self.show_saved();
+            }
+            Err(error) => self.mix_error = Some(error),
+        }
+    }
+
+    fn open_saved(&mut self, id: String) {
+        if self.mixes.playlist(&id).is_none() {
+            return;
+        }
+        self.mix_id = Some(id);
+        self.mix_error = None;
+        self.show_saved();
+    }
+
+    fn show_saved(&mut self) {
+        self.mix_draft = self
+            .selected_mix()
+            .map(|playlist| playlist.name().to_string())
+            .unwrap_or_default();
+        self.pane = Pane::Mix;
+    }
+
+    fn rename_saved(&mut self) {
+        let Some(id) = self.mix_id.clone() else {
+            return;
+        };
+        match self.mixes.rename(&id, &self.mix_draft) {
+            Ok(()) => self.mix_error = None,
+            Err(error) => self.mix_error = Some(error),
+        }
+    }
+
+    fn delete_saved(&mut self) {
+        let Some(id) = self.mix_id.clone() else {
+            return;
+        };
+        match self.mixes.delete(&id) {
+            Ok(()) => {
+                self.mix_error = None;
+                self.mix_id = self
+                    .mixes
+                    .playlists()
+                    .first()
+                    .map(|playlist| playlist.id().to_string());
+                self.mix_draft.clear();
+                self.pane = Pane::Mixes;
+            }
+            Err(error) => self.mix_error = Some(error),
+        }
+    }
+
+    fn add_saved(&mut self, track: Track) {
+        let id = match self.mix_target() {
+            Ok(id) => id,
+            Err(error) => {
+                self.mix_error = Some(error);
+                return;
+            }
+        };
+        match self.mixes.add_track(&id, track) {
+            Ok(()) => self.mix_error = None,
+            Err(error) => self.mix_error = Some(error),
+        }
+    }
+
+    /// The open playlist, otherwise the first saved one.
+    ///
+    /// With nothing saved, Add creates a playlist named Playlist.
+    fn mix_target(&mut self) -> Result<String, String> {
+        if let Some(id) = self.mix_id.clone()
+            && self.mixes.playlist(&id).is_some()
+        {
+            return Ok(id);
+        }
+        if let Some(existing) = self.mixes.playlists().first() {
+            let id = existing.id().to_string();
+            self.mix_id = Some(id.clone());
+            return Ok(id);
+        }
+        let id = self.mixes.create("Playlist")?;
+        self.mix_id = Some(id.clone());
+        Ok(id)
+    }
+
+    fn remove_saved(&mut self, index: usize) {
+        self.edit_saved(|store, id| store.remove_track(&id, index));
+    }
+
+    fn move_saved(&mut self, index: usize, later: bool) {
+        self.edit_saved(|store, id| {
+            if later {
+                store.move_later(&id, index)
+            } else {
+                store.move_earlier(&id, index)
+            }
+        });
+    }
+
+    fn edit_saved(
+        &mut self,
+        edit: impl FnOnce(&mut playlists::Store, String) -> Result<(), String>,
+    ) {
+        let Some(id) = self.mix_id.clone() else {
+            return;
+        };
+        match edit(&mut self.mixes, id) {
+            Ok(()) => self.mix_error = None,
+            Err(error) => self.mix_error = Some(error),
+        }
+    }
+
+    fn play_saved(&mut self, index: usize) -> Task<Message> {
+        let Some(tracks) = self
+            .selected_mix()
+            .map(|playlist| playlist.tracks().to_vec())
+        else {
+            return Task::none();
+        };
+        if index >= tracks.len() {
+            return Task::none();
+        }
+        #[cfg(test)]
+        {
+            self.last_mix_play =
+                Some((tracks.iter().map(|track| track.id.clone()).collect(), index));
+        }
+        self.playback.play_list(tracks, index);
+        self.arm_clock()
     }
 
     /// Redraw while a track is loading or playing. One sleeping thread per
@@ -1828,6 +2060,7 @@ impl Shell {
     fn dismiss_notices(&mut self) {
         self.error = None;
         self.spotify_error = None;
+        self.mix_error = None;
         if matches!(self.phase, AccountPhase::Failed { .. }) {
             self.phase = AccountPhase::SignedOut;
         }
@@ -1880,7 +2113,8 @@ impl Shell {
             can_next: true,
             can_previous: true,
             source: Some(track.source),
-            track_id: track.id,
+            track_id: track.id.clone(),
+            loaded: Some(track),
             upcoming: Vec::new(),
             devices: Vec::new(),
             volume: None,
@@ -2061,6 +2295,11 @@ fn sidebar(shell: &Shell) -> Element<'_, Message> {
             "Library",
             Message::ShowLibrary,
             matches!(shell.pane, Pane::Library | Pane::Playlist),
+        ),
+        nav_item(
+            "Playlists",
+            Message::ShowMixes,
+            matches!(shell.pane, Pane::Mixes | Pane::Mix),
         ),
         nav_item(
             "Accounts",
@@ -2297,6 +2536,12 @@ fn main_column(shell: &Shell) -> Element<'_, Message> {
     if shell.pane == Pane::Search {
         header = header.push(search_input(shell));
     }
+    if shell.pane == Pane::Mixes {
+        header = header.push(create_saved_row(shell));
+    }
+    if shell.pane == Pane::Mix {
+        header = header.push(saved_toolbar(shell));
+    }
     if let Some(note) = status_note(shell) {
         header = header.push(status_text(note, crate::theme::TEXT_SECONDARY));
     }
@@ -2331,6 +2576,34 @@ fn main_column(shell: &Shell) -> Element<'_, Message> {
             .height(Fill)
             .width(Fill)
             .into(),
+        Pane::Mixes => scrollable(
+            column(shell.mixes.playlists().iter().map(saved_row))
+                .spacing(RESULT_SPACING)
+                .width(Fill),
+        )
+        .height(Fill)
+        .width(Fill)
+        .into(),
+        Pane::Mix => {
+            let tracks = shell
+                .selected_mix()
+                .map(|playlist| playlist.tracks())
+                .unwrap_or(&[]);
+            let last = tracks.len().saturating_sub(1);
+            scrollable(
+                column(
+                    tracks
+                        .iter()
+                        .enumerate()
+                        .map(|(index, track)| saved_track_row(index, track, index == last)),
+                )
+                .spacing(RESULT_SPACING)
+                .width(Fill),
+            )
+            .height(Fill)
+            .width(Fill)
+            .into()
+        }
     };
 
     container(
@@ -2352,6 +2625,11 @@ fn pane_title(shell: &Shell) -> Element<'_, Message> {
         Pane::Queue => "Queue".to_string(),
         Pane::Library => "Library".to_string(),
         Pane::Accounts => "Accounts".to_string(),
+        Pane::Mixes => "Playlists".to_string(),
+        Pane::Mix => shell
+            .selected_mix()
+            .map(|playlist| playlist.name().to_string())
+            .unwrap_or_else(|| "Playlist".to_string()),
         Pane::Playlist if shell.playlist_name.is_empty() => "Playlist".to_string(),
         Pane::Playlist => shell.playlist_name.clone(),
     };
@@ -2362,6 +2640,14 @@ fn pane_title(shell: &Shell) -> Element<'_, Message> {
     if shell.pane == Pane::Playlist {
         row![
             transport_button("Back", Some(Message::BackToLibrary), false),
+            heading,
+        ]
+        .spacing(12)
+        .align_y(Vertical::Center)
+        .into()
+    } else if shell.pane == Pane::Mix {
+        row![
+            transport_button("Back", Some(Message::ShowMixes), false),
             heading,
         ]
         .spacing(12)
@@ -2514,7 +2800,21 @@ fn status_note(shell: &Shell) -> Option<String> {
         {
             Some("This playlist is empty.")
         }
-        Pane::Search | Pane::Queue | Pane::Library | Pane::Playlist | Pane::Accounts => None,
+        Pane::Mixes if shell.mixes.playlists().is_empty() => Some("No playlists yet."),
+        Pane::Mix
+            if shell
+                .selected_mix()
+                .is_none_or(|playlist| playlist.tracks().is_empty()) =>
+        {
+            Some("This playlist is empty.")
+        }
+        Pane::Search
+        | Pane::Queue
+        | Pane::Library
+        | Pane::Playlist
+        | Pane::Accounts
+        | Pane::Mixes
+        | Pane::Mix => None,
     };
     fixed.map(str::to_string)
 }
@@ -2534,6 +2834,9 @@ fn notice_lines(shell: &Shell) -> Vec<String> {
         push_notice(&mut lines, error.clone());
     }
     if let Some(error) = &shell.error {
+        push_notice(&mut lines, error.clone());
+    }
+    if let Some(error) = &shell.mix_error {
         push_notice(&mut lines, error.clone());
     }
     if let AccountPhase::Failed { message } = &shell.phase {
@@ -2745,7 +3048,7 @@ fn progress_ratio(now: &player::NowPlaying) -> Option<f32> {
 }
 
 fn queue_view(shell: &Shell) -> Element<'_, Message> {
-    let now = shell.playback.now();
+    let now = shell.displayed_now();
     let mut rows: Vec<Element<'_, Message>> = Vec::new();
     if !now.title.is_empty() {
         rows.push(current_row(&now));
@@ -3188,14 +3491,16 @@ fn dismissing_a_notice_clears_errors_and_a_failed_sign_in() {
     let mut shell = test_shell(Mode::Run);
     shell.error = Some("YouTube Music search failed: timed out".into());
     shell.spotify_error = Some("Spotify replied 429: API rate limit exceeded".into());
+    shell.mix_error = Some("Could not save playlists: denied".into());
     shell.phase = AccountPhase::Failed {
         message: "browser closed".into(),
     };
-    assert_eq!(notice_lines(&shell).len(), 3);
+    assert_eq!(notice_lines(&shell).len(), 4);
     let _ = Shell::view(&shell);
     let _ = shell.update(Message::DismissNotices);
     assert!(shell.error.is_none());
     assert!(shell.spotify_error.is_none());
+    assert!(shell.mix_error.is_none());
     assert_eq!(shell.phase, AccountPhase::SignedOut);
     assert!(notice_lines(&shell).is_empty());
     let _ = Shell::view(&shell);
@@ -3279,6 +3584,144 @@ fn accounts_holds_sign_in_and_the_other_panes_stay_reachable() {
 
     let _ = shell.update(Message::ShowQueue);
     assert_eq!(shell.pane, Pane::Queue);
+    let _ = Shell::view(&shell);
+
+    let _ = shell.update(Message::ShowMixes);
+    assert_eq!(shell.pane, Pane::Mixes);
+    let _ = Shell::view(&shell);
+}
+
+#[test]
+fn mixed_playlists_can_be_edited_and_played_from_the_other_panes() {
+    let mut shell = test_shell(Mode::Run);
+    let spotify = Track {
+        id: "sp-night".into(),
+        source: Source::Spotify,
+        title: "Night Drive".into(),
+        artists: vec!["Ada Vega".into()],
+        album: Some("Low Glow".into()),
+        duration: std::time::Duration::from_secs(192),
+    };
+    let youtube = Track {
+        id: "yt-paper".into(),
+        source: Source::YouTubeMusic,
+        title: "Paper Boats".into(),
+        artists: vec!["Jonah Reed".into()],
+        album: None,
+        duration: std::time::Duration::from_secs(164),
+    };
+
+    let _ = shell.update(Message::MixDraftChanged("   ".into()));
+    let _ = shell.update(Message::CreateMix);
+    assert!(shell.mixes.playlists().is_empty());
+    assert!(
+        shell
+            .mix_error
+            .as_deref()
+            .is_some_and(|error| error.contains("Name"))
+    );
+
+    let _ = shell.update(Message::AddToMix(spotify.clone()));
+    assert_eq!(shell.mixes.playlists().len(), 1);
+    assert_eq!(shell.mixes.playlists()[0].name(), "Playlist");
+    assert_eq!(
+        shell.mixes.playlists()[0].tracks(),
+        std::slice::from_ref(&spotify)
+    );
+
+    let _ = shell.update(Message::MixDraftChanged("  Night   Drive ".into()));
+    let _ = shell.update(Message::CreateMix);
+    assert_eq!(shell.pane, Pane::Mix);
+    assert!(shell.mix_error.is_none());
+    let night = shell
+        .mixes
+        .playlists()
+        .iter()
+        .find(|playlist| playlist.name() == "Night Drive")
+        .expect("created")
+        .id()
+        .to_string();
+    let _ = shell.update(Message::AddToMix(youtube.clone()));
+    let _ = shell.update(Message::AddToMix(spotify.clone()));
+    assert_eq!(
+        shell.mixes.playlist(&night).expect("night").tracks(),
+        &[youtube.clone(), spotify.clone()]
+    );
+    let _ = Shell::view(&shell);
+
+    let _ = shell.update(Message::MoveMixLater(0));
+    assert_eq!(
+        shell
+            .mixes
+            .playlist(&night)
+            .expect("night")
+            .tracks()
+            .iter()
+            .map(|track| track.id.as_str())
+            .collect::<Vec<_>>(),
+        ["sp-night", "yt-paper"]
+    );
+    let _ = shell.update(Message::PlayMixFrom(1));
+    let (ids, index) = shell.last_mix_play.clone().expect("played from a track");
+    assert_eq!(ids, ["sp-night", "yt-paper"]);
+    assert_eq!(index, 1);
+    let _ = shell.update(Message::PlayMix);
+    assert_eq!(
+        shell.last_mix_play.as_ref().map(|(_ids, index)| *index),
+        Some(0)
+    );
+
+    shell.results = vec![search::SearchRow {
+        track: youtube.clone(),
+        also: Vec::new(),
+    }];
+    shell.pane = Pane::Search;
+    let _ = Shell::view(&shell);
+    shell.playlist_tracks = vec![spotify.clone()];
+    shell.playlist_name = "Harbour".into();
+    shell.pane = Pane::Playlist;
+    let _ = Shell::view(&shell);
+    shell.preview = Some(player::NowPlaying {
+        title: spotify.title.clone(),
+        artist: spotify.artists.join(", "),
+        phase: Phase::Playing,
+        elapsed: std::time::Duration::from_secs(4),
+        duration: spotify.duration,
+        error: None,
+        note: None,
+        can_play: false,
+        can_pause: true,
+        can_stop: true,
+        can_next: true,
+        can_previous: true,
+        source: Some(Source::Spotify),
+        track_id: spotify.id.clone(),
+        loaded: Some(spotify.clone()),
+        upcoming: vec![youtube.clone()],
+        devices: Vec::new(),
+        volume: None,
+    });
+    shell.pane = Pane::Queue;
+    let _ = Shell::view(&shell);
+    shell.preview = None;
+
+    let _ = shell.update(Message::OpenMix(night.clone()));
+    let _ = shell.update(Message::RemoveMixTrack(0));
+    assert_eq!(
+        shell.mixes.playlist(&night).expect("night").tracks(),
+        std::slice::from_ref(&youtube)
+    );
+    let _ = shell.update(Message::MixDraftChanged("Late".into()));
+    let _ = shell.update(Message::RenameMix);
+    assert_eq!(shell.mixes.playlist(&night).expect("night").name(), "Late");
+    let _ = shell.update(Message::ShowMixes);
+    assert_eq!(shell.pane, Pane::Mixes);
+    let _ = Shell::view(&shell);
+    shell.mix_id = Some(night);
+    let _ = shell.update(Message::DeleteMix);
+    assert_eq!(shell.pane, Pane::Mixes);
+    assert_eq!(shell.mixes.playlists().len(), 1);
+    assert_eq!(shell.mixes.playlists()[0].name(), "Playlist");
     let _ = Shell::view(&shell);
 }
 
@@ -3424,6 +3867,93 @@ fn track_button(track: &Track) -> Element<'_, Message> {
         play,
         transport_button("Play next", Some(Message::PlayNext(track.clone())), false),
         transport_button("Queue", Some(Message::Enqueue(track.clone())), false),
+        transport_button("Add", Some(Message::AddToMix(track.clone())), false),
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center)
+    .into()
+}
+
+fn create_saved_row(shell: &Shell) -> Element<'_, Message> {
+    row![
+        name_field("Playlist name", &shell.mix_draft),
+        transport_button("Create", Some(Message::CreateMix), true),
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center)
+    .width(Fill)
+    .into()
+}
+
+fn saved_toolbar(shell: &Shell) -> Element<'_, Message> {
+    let has_tracks = shell
+        .selected_mix()
+        .is_some_and(|playlist| !playlist.tracks().is_empty());
+    row![
+        name_field("Playlist name", &shell.mix_draft),
+        transport_button("Rename", Some(Message::RenameMix), false),
+        transport_button("Play", has_tracks.then_some(Message::PlayMix), true),
+        transport_button("Delete", Some(Message::DeleteMix), false),
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center)
+    .width(Fill)
+    .into()
+}
+
+fn name_field<'a>(placeholder: &'static str, value: &'a str) -> Element<'a, Message> {
+    text_input(placeholder, value)
+        .on_input(Message::MixDraftChanged)
+        .padding([10.0, 12.0])
+        .size(BODY_SIZE)
+        .font(crate::theme::BODY)
+        .width(Fill)
+        .style(search_field)
+        .into()
+}
+
+fn saved_row(playlist: &playlists::SavedPlaylist) -> Element<'_, Message> {
+    let count = playlist.tracks().len();
+    let tracks = if count == 1 {
+        "1 track".to_string()
+    } else {
+        format!("{count} tracks")
+    };
+    let body = row![
+        text(playlist.name())
+            .font(crate::theme::BODY)
+            .size(BODY_SIZE)
+            .color(crate::theme::TEXT_PRIMARY)
+            .width(Fill),
+        text(tracks)
+            .font(crate::theme::BODY)
+            .size(META_SIZE)
+            .color(crate::theme::TEXT_TERTIARY),
+    ]
+    .spacing(ROW_SPACING)
+    .align_y(Vertical::Center)
+    .width(Fill);
+    button(body)
+        .on_press(Message::OpenMix(playlist.id().to_string()))
+        .width(Fill)
+        .padding([6.0, 0.0])
+        .style(result_button)
+        .into()
+}
+
+fn saved_track_row(index: usize, track: &Track, last: bool) -> Element<'_, Message> {
+    let play = button(result_body(track))
+        .on_press(Message::PlayMixFrom(index))
+        .width(Fill)
+        .padding([6.0, 0.0])
+        .style(result_button);
+    let up = (index > 0).then_some(Message::MoveMixEarlier(index));
+    let down = (!last).then_some(Message::MoveMixLater(index));
+    row![
+        play,
+        transport_button("Up", up, false),
+        transport_button("Down", down, false),
+        transport_button("Remove", Some(Message::RemoveMixTrack(index)), false),
     ]
     .spacing(8)
     .align_y(Vertical::Center)
@@ -3532,6 +4062,7 @@ fn current_row(now: &player::NowPlaying) -> Element<'static, Message> {
 
     row![
         line,
+        transport_button("Add", now.loaded.clone().map(Message::AddToMix), false,),
         transport_button("Remove", Some(Message::RemoveCurrent), false),
     ]
     .spacing(8)
@@ -3546,6 +4077,7 @@ fn queued_row(index: usize, track: &Track, last: bool) -> Element<'static, Messa
         queue_track_line(track),
         transport_button("Up", up, false),
         transport_button("Down", down, false),
+        transport_button("Add", Some(Message::AddToMix(track.clone())), false),
         transport_button("Remove", Some(Message::RemoveQueued(index)), false),
     ]
     .spacing(8)

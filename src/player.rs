@@ -103,6 +103,11 @@ pub struct NowPlaying {
     pub source: Option<Source>,
     /// Source id of the loaded track. Empty when nothing is loaded.
     pub track_id: String,
+    /// The loaded track, when there is one.
+    ///
+    /// The queue view saves this into a mixed playlist. The title and artist
+    /// strings are not enough: playback needs the source id and the artist list.
+    pub loaded: Option<Track>,
     /// Tracks that play after this one, front first.
     pub upcoming: Vec<Track>,
     /// Spotify Connect devices the listener can pick. Empty when none are known.
@@ -128,6 +133,7 @@ impl Default for NowPlaying {
             can_previous: false,
             source: None,
             track_id: String::new(),
+            loaded: None,
             upcoming: Vec::new(),
             devices: Vec::new(),
             volume: None,
@@ -517,7 +523,8 @@ where
     }
 
     pub fn view(&self) -> NowPlaying {
-        let (title, artist, source, track_id, has_current) = match self.queue.current() {
+        let loaded = self.queue.current().cloned();
+        let (title, artist, source, track_id) = match &loaded {
             Some(track) => {
                 let remote = self.origin == AudioOrigin::Spotify;
                 let title = self
@@ -530,10 +537,11 @@ where
                     .clone()
                     .filter(|artist| remote && !artist.is_empty())
                     .unwrap_or_else(|| artist_line(track));
-                (title, artist, Some(track.source), track.id.clone(), true)
+                (title, artist, Some(track.source), track.id.clone())
             }
-            None => (String::new(), String::new(), None, String::new(), false),
+            None => (String::new(), String::new(), None, String::new()),
         };
+        let has_current = loaded.is_some();
         NowPlaying {
             title,
             artist,
@@ -553,10 +561,58 @@ where
             can_previous: self.queue.can_back(),
             source,
             track_id,
+            loaded,
             upcoming: self.queue.upcoming().to_vec(),
             devices: self.spotify.devices(),
             volume: self.spotify.volume(),
         }
+    }
+
+    /// Replace the queue so `tracks[index]` is loaded.
+    ///
+    /// Tracks before `index` stay reachable with previous. The tracks after
+    /// it stay upcoming. [`Self::start_staged`] starts playback.
+    fn stage_list(&mut self, tracks: Vec<Track>, index: usize) -> bool {
+        self.halt_audio();
+        self.note = None;
+        self.error = None;
+        self.origin = AudioOrigin::None;
+        self.queue.start_from(tracks, index);
+        self.queue.fill_current();
+        if let Some(duration) = self.queue.current().map(|track| track.duration) {
+            self.duration = duration;
+            self.phase = Phase::Loading;
+            true
+        } else {
+            self.duration = Duration::ZERO;
+            self.phase = Phase::Idle;
+            false
+        }
+    }
+
+    /// Play the track [`Self::stage_list`] promoted, then the tracks after it.
+    fn start_staged(&mut self) {
+        if self.queue.current().is_none() {
+            self.phase = Phase::Idle;
+            return;
+        }
+        self.advance();
+    }
+
+    /// Play a saved playlist through this queue, starting at `index`.
+    ///
+    /// The window reaches the same two steps through [`Playback::play_list`],
+    /// which can publish a loading snapshot between them. Tests call this.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "tests play a playlist without the playback thread"
+        )
+    )]
+    pub fn play_from_list(&mut self, tracks: Vec<Track>, index: usize) {
+        self.stage_list(tracks, index);
+        self.start_staged();
     }
 
     fn restart_current(&mut self) {
@@ -1006,6 +1062,11 @@ enum Command {
     SelectDevice(String),
     Seek(Duration),
     SetVolume(u8),
+    /// Play `tracks` through the queue, starting at `index`.
+    PlayList {
+        tracks: Vec<Track>,
+        index: usize,
+    },
 }
 
 /// Handle the window keeps. Commands go to the playback thread.
@@ -1108,6 +1169,11 @@ impl Playback {
 
     pub fn set_volume(&self, percent: u8) {
         self.send(Command::SetVolume(percent));
+    }
+
+    /// Play `tracks` through the mixed queue, starting at `index`.
+    pub fn play_list(&self, tracks: Vec<Track>, index: usize) {
+        self.send(Command::PlayList { tracks, index });
     }
 
     pub fn now(&self) -> NowPlaying {
@@ -1213,6 +1279,16 @@ fn dispatch(
         Command::SelectDevice(id) => player.select_device(id),
         Command::Seek(position) => player.seek(position),
         Command::SetVolume(percent) => player.set_volume(percent),
+        Command::PlayList { tracks, index } => {
+            if player.stage_list(tracks, index) {
+                let mut now = player.view();
+                now.can_play = false;
+                now.can_pause = false;
+                now.can_stop = true;
+                write_snapshot(snapshot, now);
+            }
+            player.start_staged();
+        }
     }
 }
 
@@ -1232,6 +1308,7 @@ fn loading_now(track: &Track, queue: &Queue) -> NowPlaying {
         can_previous: queue.can_back(),
         source: Some(track.source),
         track_id: track.id.clone(),
+        loaded: Some(track.clone()),
         upcoming: queue.upcoming().to_vec(),
         devices: Vec::new(),
         volume: None,
@@ -2153,6 +2230,7 @@ mod tests {
         playback.move_later(0);
         playback.remove_queued(0);
         playback.remove_current();
+        playback.play_list(vec![yt("yt-4", "From here")], 0);
 
         let now = playback.now();
         assert_eq!(now.phase, Phase::Idle);
@@ -2189,5 +2267,69 @@ mod tests {
         );
         player.previous();
         assert_eq!(player.view().title, "Kitchen Radio");
+    }
+
+    #[test]
+    fn play_from_list_starts_in_the_mixed_queue() {
+        let mut player = machine_with(FakeSpotify::premium(), FakeMatch::none());
+        player.play_from_list(Vec::new(), 0);
+        assert_eq!(player.view().phase, Phase::Idle);
+        player.play_from_list(vec![yt("yt-only", "Only")], 3);
+        assert!(player.view().loaded.is_none());
+        assert!(player.view().upcoming.is_empty());
+
+        player.play_from_list(
+            vec![
+                yt("yt-a", "Kitchen Radio"),
+                spotify("sp-b", "Night Drive"),
+                yt("yt-c", "Paper Planes"),
+            ],
+            1,
+        );
+        let now = player.view();
+        assert_eq!(now.phase, Phase::Playing);
+        assert_eq!(now.track_id, "sp-b");
+        assert_eq!(now.source, Some(Source::Spotify));
+        assert_eq!(
+            now.loaded.as_ref().map(|track| track.id.as_str()),
+            Some("sp-b")
+        );
+        let upcoming: Vec<_> = now.upcoming.iter().map(|track| track.id.as_str()).collect();
+        assert_eq!(upcoming, ["yt-c"]);
+
+        player.previous();
+        let now = player.view();
+        assert_eq!(now.track_id, "yt-a");
+        assert_eq!(
+            now.loaded.as_ref().map(|track| track.source),
+            Some(Source::YouTubeMusic)
+        );
+        let upcoming: Vec<_> = now.upcoming.iter().map(|track| track.id.as_str()).collect();
+        assert_eq!(upcoming, ["sp-b", "yt-c"]);
+
+        player.next();
+        assert_eq!(player.view().track_id, "sp-b");
+        assert_eq!(player.view().source, Some(Source::Spotify));
+    }
+
+    #[test]
+    fn play_from_list_sends_a_spotify_track_through_connect() {
+        let state = Arc::new(Mutex::new(FakeSpotify::premium()));
+        let mut player = Player::new(
+            FakeExtractor {
+                fail: HashSet::new(),
+                calls: Vec::new(),
+            },
+            FakeSink::new(Fail::None),
+            Box::new(SharedSpotify(Arc::clone(&state))),
+            Box::new(FakeMatch::none()),
+        );
+        player.play_from_list(
+            vec![yt("yt-a", "Kitchen Radio"), spotify("sp-b", "Night Drive")],
+            1,
+        );
+        assert_eq!(player.view().source, Some(Source::Spotify));
+        assert_eq!(state.lock().expect("spotify").loads, ["sp-b"]);
+        assert!(player.extractor.calls.is_empty());
     }
 }

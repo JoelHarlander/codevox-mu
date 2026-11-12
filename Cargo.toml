@@ -19,6 +19,8 @@ ytmapi-rs = { version = "0.3.4", default-features = false, features = ["rustls"]
 # extraction run here, off the UI thread.
 tokio = { version = "1.52", features = ["rt-multi-thread", "time", "net"] }
 # The theme test reads design/tokens.json. Search re-reads the InnerTube body.
+# Playlists use serde's derive for the versioned JSON file.
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # `--screenshot` writes the window's RGBA buffer to a PNG file.
 png = "0.17"

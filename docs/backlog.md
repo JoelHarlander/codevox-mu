@@ -1,6 +1,6 @@
 # Backlog
 
-Ranked milestones to v1. Updated 12 Nov 2026. Every run starts from this list, top first.
+Ranked milestones to v1. Updated 13 Nov 2026. Every run starts from this list, top first.
 
 **Done means working on a real screen on all 3 OSes.** That is Windows 11, macOS (Apple Silicon and Intel) and Linux, from the CI-built installer. Green CI plus a smoke run is only "Built". An item is "Done" once someone has used it on a real screen on each OS, and that person is named in the item.
 
@@ -12,13 +12,13 @@ Status: Done (real screen, 3 OSes) · Built (merged, CI green on 3 OSes, not yet
 |---|-----------|--------|
 | 1 | YouTube Music search and playback: search, click a result, it plays, with pause, resume and next | Built (PR #8, #9) |
 | 2 | Installers: Windows x64 and Arm (NSIS, zip), macOS universal dmg, Linux AppImage, deb and rpm, all unsigned, from CI | Built (PR #7) |
-| 3 | Spotify sign-in and playback via librespot (Premium), with free accounts falling back to the matched YouTube Music track | Built (PR #12, YouTube Music fallback included) |
+| 3 | Spotify sign-in and playback via librespot (Premium), with free accounts falling back to the matched YouTube Music track | Built (PR #12, #22). Sign-in, library and search work on Windows (rry selftest, 12 Nov). In-app Spotify audio is blocked by a Spotify-side audio-key change (librespot-org/librespot#1649, no fix), so Spotify tracks play via the matched YouTube Music track (PR #22) |
 | 4 | One search across both services: merged, de-duplicated results tagged by source | Built (PR #14) |
 | 5 | Mixed queue: add, reorder and remove tracks from either service, with next and previous across sources | Built |
 | 6 | OS media keys and media controls: Windows SMTC, macOS Now Playing, Linux MPRIS | Built (PR #11) |
 | 7 | Spotify library: playlists and liked songs | Built |
 | 8 | YouTube Music sign-in: library and playlists | Built (PR #15, cookie sign-in; first page of each playlist only) |
-| 9 | Mixed playlists: create, save locally, and play tracks from both services | Not started |
+| 9 | Mixed playlists: create, save locally, and play tracks from both services | In progress (PR #24) |
 | 10 | Playlist import from Spotify or YouTube Music into a mixed playlist | Not started |
 | 11 | Tray icon or mini player | Not started |
 | 12 | Synced lyrics | Not started |

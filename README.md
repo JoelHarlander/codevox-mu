@@ -43,12 +43,14 @@ Windows needs the MSVC build tools. macOS needs the Xcode command line tools.
 
 `src/main.rs` parses the invocation.
 `src/theme.rs` is the CodeVox visual style (`design/tokens.json`).
-`src/music.rs` is the service trait, the shared track and playlist types, the mixed queue, and the mock catalogues.
+`src/music.rs` is the service trait, the shared track and playlist types, and the mock catalogues.
 `src/search.rs` merges per-service search hits into one list and collapses the same recording.
 `src/youtube_music.rs` is unauthenticated YouTube Music song search, and the Spotify fallback match.
 `src/youtube_account.rs` signs in with a browser cookie and reads the library and playlists.
 `src/spotify.rs` is Spotify sign-in, search, and Spotify Connect playback. In-app librespot audio is compiled and not used.
 `src/extract.rs` resolves a YouTube video id to an audio stream.
+`src/queue.rs` is the mixed play order.
+`src/playlists.rs` saves mixed playlists in the per-user data directory.
 `src/player.rs` is play, pause, stop, next, and previous over the mixed queue.
 `src/output.rs` decodes with symphonia and plays through cpal.
 `src/media_controls.rs` is OS media keys and the system now-playing overlay.
