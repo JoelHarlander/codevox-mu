@@ -1,18 +1,23 @@
 //! The native window.
 //!
-//! One iced window is the whole interface today. Search asks Spotify and
-//! YouTube Music on background threads, then keeps one row per recording.
-//! Choosing a row asks the playback thread to play it. A browser cookie
-//! signs in to YouTube Music and opens that account's library. The window
-//! does not know how a catalogue is fetched or how a stream is decoded.
+//! One borderless iced window is the whole interface. A title bar, a sidebar,
+//! the open pane, and a now-playing bar fill that window. Search asks Spotify
+//! and YouTube Music on background threads, then keeps one row per recording.
+//! Choosing a row asks the playback thread to play it. Spotify and YouTube
+//! Music sign-in live on the Accounts pane. The window does not know how a
+//! catalogue is fetched or how a stream is decoded.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use iced::alignment::{Horizontal, Vertical};
 use iced::futures::channel::oneshot;
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
-use iced::window::{self, Settings};
-use iced::{Background, Border, Color, Element, Fill, Shadow, Size, Subscription, Task};
+use iced::widget::{
+    Space, button, column, container, mouse_area, progress_bar, row, scrollable, stack, text,
+    text_input,
+};
+use iced::window::{self, Direction, Settings};
+use iced::{Background, Border, Color, Element, Fill, Length, Shadow, Size, Subscription, Task};
 
 use crate::music::{self, MusicService, Playlist, Source, Track};
 use crate::player::{self, Phase};
@@ -31,23 +36,33 @@ type SignIn = Arc<dyn Fn() -> AccountPhase + Send + Sync>;
 /// Window title. This is the product name, not a window-manager default.
 const TITLE: &str = "CodeVox mU";
 
-/// Logical pixels. Large enough that a short result list is readable on a laptop.
-const WINDOW_SIZE: Size = Size::new(960.0, 640.0);
+/// Logical pixels. Large enough for the sidebar, a result list, and the bar.
+const WINDOW_SIZE: Size = Size::new(1120.0, 740.0);
 
-const PAGE_PADDING: f32 = 28.0;
-const PANEL_PADDING: f32 = 24.0;
-const PANEL_SPACING: f32 = 14.0;
-const PANEL_MAX_WIDTH: f32 = 720.0;
-const HEADING_SIZE: f32 = 22.0;
+/// Keeps the title bar, sidebar, and transport from collapsing together.
+const MIN_WINDOW_SIZE: Size = Size::new(880.0, 560.0);
+
+const TITLE_BAR_HEIGHT: f32 = 48.0;
+const SIDEBAR_WIDTH: f32 = 196.0;
+const CONTENT_PADDING: f32 = 20.0;
+const HEADING_SIZE: f32 = 18.0;
 const BODY_SIZE: f32 = 14.0;
 const META_SIZE: f32 = 12.0;
 const SOURCE_SIZE: f32 = 11.0;
-const RESULT_SPACING: f32 = 14.0;
-const ROW_SPACING: f32 = 16.0;
+const RESULT_SPACING: f32 = 8.0;
+const ROW_SPACING: f32 = 12.0;
+const SECTION_SPACING: f32 = 14.0;
 
-/// The one accent mark on the search surface. Short, so it reads as a rule.
-const ACCENT_MARK_WIDTH: f32 = 28.0;
-const ACCENT_MARK_HEIGHT: f32 = 2.0;
+/// Invisible resize strips. Corners sit above the edges so diagonal grabs win.
+const RESIZE_EDGE: f32 = 6.0;
+const RESIZE_CORNER: f32 = 10.0;
+
+/// Frames to present before a headless screenshot, so the first capture is painted.
+const SHOT_FRAME_DELAY: u32 = 3;
+
+/// Brand mark in the title bar. A short vertical accent, not a second line.
+const ACCENT_MARK_WIDTH: f32 = 3.0;
+const ACCENT_MARK_HEIGHT: f32 = 16.0;
 
 /// `--smoke` exits once this many frames have been drawn.
 ///
@@ -72,11 +87,30 @@ const SMOKE_TIMEOUT_EXIT_CODE: i32 = 1;
 /// How the window should live.
 ///
 /// `Smoke` draws a bounded number of frames and exits.
+/// `Screenshot` writes the main view and the Accounts view, then exits.
 /// `Run` stays open until the window is closed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mode {
     Run,
     Smoke,
+    Screenshot { main: PathBuf, accounts: PathBuf },
+}
+
+/// Which headless capture just finished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Capture {
+    Main,
+    Accounts,
+}
+
+/// Progress of `--screenshot`. `Idle` is every other mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShotStep {
+    Idle,
+    Main,
+    MainPending,
+    Accounts,
+    AccountsPending,
 }
 
 #[derive(Debug, Clone)]
@@ -134,7 +168,25 @@ enum Message {
         result: Result<Vec<Track>, music::Error>,
     },
     ShowSearch,
+    ShowQueue,
+    ShowAccounts,
     BackToLibrary,
+    DismissNotices,
+    /// Press on the custom title bar. Starts an OS window drag.
+    DragWindow,
+    /// Title-bar double-click, or the maximise / restore button.
+    ToggleMaximize,
+    MinimizeWindow,
+    CloseWindow,
+    Resize(Direction),
+    /// The window exists. Screenshot mode records the id and does not attach media keys.
+    WindowOpened(window::Id),
+    WindowResized(window::Id),
+    Maximized(bool),
+    Captured {
+        kind: Capture,
+        result: Result<(), String>,
+    },
     /// The window exists, so OS media controls can attach to it.
     BindMedia(window::Id),
     /// `hwnd` is the native handle on Windows. Other platforms pass `None`.
@@ -152,8 +204,10 @@ enum YtSign {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pane {
     Search,
+    Queue,
     Library,
     Playlist,
+    Accounts,
 }
 
 struct Shell {
@@ -198,17 +252,31 @@ struct Shell {
     playback: player::Playback,
     /// A clock tick is already waiting. Keeps the 200 ms timer from stacking.
     clock_armed: bool,
+    /// Sample transport for `--screenshot` only. Run and smoke leave this empty.
+    preview: Option<player::NowPlaying>,
+    /// Playback error the listener dismissed. A new string shows again.
+    dismissed_playback_error: Option<String>,
+    window_id: Option<window::Id>,
+    maximized: bool,
+    shot_step: ShotStep,
+    screenshot_main: Option<PathBuf>,
+    screenshot_accounts: Option<PathBuf>,
     #[cfg(test)]
     last_play: Option<Track>,
 }
 
 pub fn run(mode: Mode) -> iced::Result {
-    let mut application = iced::application(move || Shell::boot(mode), Shell::update, Shell::view)
-        .title(TITLE)
-        .theme(Shell::theme)
-        .window(window_settings())
-        .subscription(Shell::subscription)
-        .default_font(crate::theme::FALLBACK);
+    let boot_mode = mode.clone();
+    let mut application = iced::application(
+        move || Shell::boot(boot_mode.clone()),
+        Shell::update,
+        Shell::view,
+    )
+    .title(TITLE)
+    .theme(Shell::theme)
+    .window(window_settings())
+    .subscription(Shell::subscription)
+    .default_font(crate::theme::FALLBACK);
 
     for face in crate::theme::FONTS {
         application = application.font(face);
@@ -217,14 +285,19 @@ pub fn run(mode: Mode) -> iced::Result {
     application.run()
 }
 
-/// Size, position, and close behaviour are product choices.
+/// Borderless on every OS. The shell draws the title bar and the resize edges.
 ///
-/// Decorations, the icon, and blur stay on iced's defaults until there is a
-/// reason to override that platform chrome.
+/// `transparent` stays off: the fill is the token background, not a glass window.
+/// macOS traffic lights stay hidden with the decorations. The custom minimise,
+/// maximise, and close buttons are the window controls on all three platforms.
 fn window_settings() -> Settings {
     Settings {
         size: WINDOW_SIZE,
+        min_size: Some(MIN_WINDOW_SIZE),
         position: window::Position::Centered,
+        resizable: true,
+        decorations: false,
+        transparent: false,
         exit_on_close_request: true,
         ..Settings::default()
     }
@@ -239,15 +312,15 @@ enum SmokeFrame {
     Ignore,
 }
 
-/// Ends the process if smoke is still alive after [`SMOKE_TIMEOUT`].
+/// Ends the process if a headless mode is still alive after [`SMOKE_TIMEOUT`].
 ///
 /// The thread is detached. A normal exit returns from `main` and the
 /// process dies before this wakes up. `Run` mode must not call it.
-fn arm_smoke_timeout() {
-    std::thread::spawn(|| {
+fn arm_headless_timeout(label: &'static str) {
+    std::thread::spawn(move || {
         std::thread::sleep(SMOKE_TIMEOUT);
         eprintln!(
-            "codevox-mu smoke: timed out after {}s without exiting",
+            "codevox-mu {label}: timed out after {}s without exiting",
             SMOKE_TIMEOUT.as_secs()
         );
         let _ = std::io::Write::flush(&mut std::io::stderr());
@@ -699,7 +772,7 @@ fn test_shell(mode: Mode) -> Shell {
 impl Shell {
     fn boot(mode: Mode) -> (Self, Task<Message>) {
         if mode == Mode::Smoke {
-            arm_smoke_timeout();
+            arm_headless_timeout("smoke");
             // No account restore, no librespot player, no YouTube client.
             // Typing during the three frames would still stay off the network.
             let shell = Self::with_services(
@@ -709,6 +782,20 @@ impl Shell {
                 Arc::new(|| AccountPhase::SignedOut),
                 Arc::new(ClosedLibrary),
             );
+            return (shell, Task::none());
+        }
+
+        if matches!(mode, Mode::Screenshot { .. }) {
+            arm_headless_timeout("screenshot");
+            // Offline catalogue, so the two captures show the layout without a network.
+            let mut shell = Self::with_services(
+                mode,
+                Arc::new(|query| music::MockService::spotify().search(query)),
+                Arc::new(|query| music::MockService::youtube_music().search(query)),
+                Arc::new(|| AccountPhase::SignedOut),
+                Arc::new(ClosedLibrary),
+            );
+            shell.seed_screenshot();
             return (shell, Task::none());
         }
 
@@ -745,6 +832,18 @@ impl Shell {
         sign_in: SignIn,
         library: Arc<dyn LibrarySession>,
     ) -> Self {
+        let shot_step = match &mode {
+            Mode::Screenshot { .. } => ShotStep::Main,
+            Mode::Run | Mode::Smoke => ShotStep::Idle,
+        };
+        let screenshot_main = match &mode {
+            Mode::Screenshot { main, .. } => Some(main.clone()),
+            Mode::Run | Mode::Smoke => None,
+        };
+        let screenshot_accounts = match &mode {
+            Mode::Screenshot { accounts, .. } => Some(accounts.clone()),
+            Mode::Run | Mode::Smoke => None,
+        };
         Self {
             mode,
             frame_count: 0,
@@ -776,6 +875,13 @@ impl Shell {
             restore_started: false,
             playback: player::Playback::dormant(),
             clock_armed: false,
+            preview: None,
+            dismissed_playback_error: None,
+            window_id: None,
+            maximized: false,
+            shot_step,
+            screenshot_main,
+            screenshot_accounts,
             #[cfg(test)]
             last_play: None,
         }
@@ -855,9 +961,47 @@ impl Shell {
             Message::Tick => self.on_tick(),
             Message::ShowSignIn => {
                 self.cookie_open = true;
+                self.pane = Pane::Accounts;
                 self.error = None;
                 Task::none()
             }
+            Message::ShowQueue => {
+                self.pane = Pane::Queue;
+                Task::none()
+            }
+            Message::ShowAccounts => {
+                self.pane = Pane::Accounts;
+                if self.sign == YtSign::Out {
+                    self.cookie_open = true;
+                }
+                Task::none()
+            }
+            Message::DismissNotices => {
+                self.dismiss_notices();
+                Task::none()
+            }
+            Message::DragWindow => self.window_action(window::drag),
+            Message::ToggleMaximize => self.window_action(|id| {
+                window::toggle_maximize(id).chain(window::is_maximized(id).map(Message::Maximized))
+            }),
+            Message::MinimizeWindow => self.window_action(|id| window::minimize(id, true)),
+            Message::CloseWindow => self.window_action(window::close),
+            Message::Resize(direction) => {
+                self.window_action(move |id| window::drag_resize(id, direction))
+            }
+            Message::WindowOpened(id) => {
+                self.window_id = Some(id);
+                Task::none()
+            }
+            Message::WindowResized(id) => {
+                self.window_id = Some(id);
+                window::is_maximized(id).map(Message::Maximized)
+            }
+            Message::Maximized(maximized) => {
+                self.maximized = maximized;
+                Task::none()
+            }
+            Message::Captured { kind, result } => self.finish_capture(kind, result),
             Message::CancelSignIn => {
                 self.cookie_open = false;
                 self.cookie_draft.clear();
@@ -902,10 +1046,13 @@ impl Shell {
                 self.error = None;
                 Task::none()
             }
-            Message::BindMedia(id) => Task::batch([
-                crate::media_controls::read_handle(id).map(Message::MediaBound),
-                self.restore_saved_sign_in(),
-            ]),
+            Message::BindMedia(id) => {
+                self.window_id = Some(id);
+                Task::batch([
+                    crate::media_controls::read_handle(id).map(Message::MediaBound),
+                    self.restore_saved_sign_in(),
+                ])
+            }
             Message::MediaBound(hwnd) => {
                 crate::media_controls::attach(hwnd);
                 Task::none()
@@ -1181,7 +1328,7 @@ impl Shell {
                 self.spotify_rows = tracks;
             }
             Err(error) => {
-                self.spotify_error = Some(format!("Spotify search failed: {error}"));
+                self.spotify_error = Some(spotify_search_notice(&error.to_string()));
                 self.spotify_rows.clear();
             }
         }
@@ -1217,16 +1364,18 @@ impl Shell {
     }
 
     fn on_frame(&mut self) -> Task<Message> {
-        // Frames are only subscribed in smoke mode. A frame in any other
-        // mode means the subscription and the mode have drifted.
-        assert!(matches!(self.mode, Mode::Smoke));
-
-        match self.smoke_frame() {
-            SmokeFrame::Continue | SmokeFrame::Ignore => Task::none(),
-            SmokeFrame::RequestExit => {
-                eprintln!("codevox-mu smoke: rendered {SMOKE_FRAME_COUNT_LIMIT} frames, exiting");
-                iced::exit()
-            }
+        match &self.mode {
+            Mode::Smoke => match self.smoke_frame() {
+                SmokeFrame::Continue | SmokeFrame::Ignore => Task::none(),
+                SmokeFrame::RequestExit => {
+                    eprintln!(
+                        "codevox-mu smoke: rendered {SMOKE_FRAME_COUNT_LIMIT} frames, exiting"
+                    );
+                    iced::exit()
+                }
+            },
+            Mode::Screenshot { .. } => self.on_screenshot_frame(),
+            Mode::Run => Task::none(),
         }
     }
 
@@ -1251,12 +1400,19 @@ impl Shell {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        match self.mode {
+        match &self.mode {
             // Smoke must not open a D-Bus session or a media-controls handle.
             Mode::Smoke => window::frames().map(|_| Message::Frame),
+            // Screenshot paints, captures, switches pane, captures, and exits.
+            // No media keys and no account restore.
+            Mode::Screenshot { .. } => Subscription::batch([
+                window::frames().map(|_| Message::Frame),
+                window::open_events().map(Message::WindowOpened),
+            ]),
             Mode::Run => Subscription::batch([
                 crate::media_controls::events().map(Message::Media),
                 window::open_events().map(Message::BindMedia),
+                window::resize_events().map(|(id, _size)| Message::WindowResized(id)),
             ]),
         }
     }
@@ -1265,162 +1421,508 @@ impl Shell {
         crate::theme::theme()
     }
 
+    fn displayed_now(&self) -> player::NowPlaying {
+        self.preview.clone().unwrap_or_else(|| self.playback.now())
+    }
+
+    fn dismiss_notices(&mut self) {
+        self.error = None;
+        self.spotify_error = None;
+        if matches!(self.phase, AccountPhase::Failed { .. }) {
+            self.phase = AccountPhase::SignedOut;
+        }
+        if let Some(error) = self.displayed_now().error {
+            self.dismissed_playback_error = Some(error);
+        }
+    }
+
+    fn window_action(
+        &self,
+        action: impl Fn(window::Id) -> Task<Message> + Send + 'static,
+    ) -> Task<Message> {
+        if let Some(id) = self.window_id {
+            action(id)
+        } else {
+            window::latest().and_then(action)
+        }
+    }
+
+    /// Offline rows and a sample transport, so the headless captures show the layout.
+    fn seed_screenshot(&mut self) {
+        self.query = "night".into();
+        self.spotify_rows = music::MockService::spotify()
+            .search("night")
+            .unwrap_or_default();
+        self.youtube_rows = music::MockService::youtube_music()
+            .search("night")
+            .unwrap_or_default();
+        self.publish_results();
+        let Some(track) = self
+            .youtube_rows
+            .first()
+            .cloned()
+            .or_else(|| self.spotify_rows.first().cloned())
+        else {
+            return;
+        };
+        self.preview = Some(player::NowPlaying {
+            title: track.title.clone(),
+            artist: track.artists.join(", "),
+            phase: Phase::Playing,
+            elapsed: std::time::Duration::from_secs(48),
+            duration: track.duration,
+            error: None,
+            note: None,
+            can_play: false,
+            can_pause: true,
+            can_stop: true,
+            can_next: true,
+            can_previous: true,
+            source: Some(track.source),
+            track_id: track.id,
+            upcoming: Vec::new(),
+        });
+    }
+
+    fn on_screenshot_frame(&mut self) -> Task<Message> {
+        if self.exit_requested {
+            return Task::none();
+        }
+        self.frame_count = self.frame_count.saturating_add(1);
+        let Some(id) = self.window_id else {
+            return Task::none();
+        };
+        let ready = matches!(self.shot_step, ShotStep::Main | ShotStep::Accounts)
+            && self.frame_count >= SHOT_FRAME_DELAY;
+        if !ready {
+            return Task::none();
+        }
+        let (kind, path) = match self.shot_step {
+            ShotStep::Main => (Capture::Main, self.screenshot_main.clone()),
+            ShotStep::Accounts => (Capture::Accounts, self.screenshot_accounts.clone()),
+            ShotStep::Idle | ShotStep::MainPending | ShotStep::AccountsPending => {
+                return Task::none();
+            }
+        };
+        let Some(path) = path else {
+            eprintln!("codevox-mu screenshot: missing output path");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            std::process::exit(1);
+        };
+        self.shot_step = match kind {
+            Capture::Main => ShotStep::MainPending,
+            Capture::Accounts => ShotStep::AccountsPending,
+        };
+        window::screenshot(id).map(move |shot| {
+            let result = write_png(&path, shot.rgba.as_ref(), shot.size.width, shot.size.height);
+            Message::Captured { kind, result }
+        })
+    }
+
+    fn finish_capture(&mut self, kind: Capture, result: Result<(), String>) -> Task<Message> {
+        if let Err(error) = result {
+            eprintln!("codevox-mu screenshot: {error}");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            std::process::exit(1);
+        }
+        match kind {
+            Capture::Main => {
+                if let Some(path) = &self.screenshot_main {
+                    eprintln!("codevox-mu screenshot: wrote {}", path.display());
+                }
+                self.pane = Pane::Accounts;
+                self.cookie_open = true;
+                self.frame_count = 0;
+                self.shot_step = ShotStep::Accounts;
+                Task::none()
+            }
+            Capture::Accounts => {
+                if let Some(path) = &self.screenshot_accounts {
+                    eprintln!("codevox-mu screenshot: wrote {}", path.display());
+                }
+                self.exit_requested = true;
+                eprintln!("codevox-mu screenshot: accounts view saved, exiting");
+                iced::exit()
+            }
+        }
+    }
+
     fn view(shell: &Self) -> Element<'_, Message> {
-        let heading = text(TITLE)
-            .font(crate::theme::HEADING)
-            .size(HEADING_SIZE)
-            .color(crate::theme::TEXT_PRIMARY);
-        let accent = container(
-            Space::new()
-                .width(ACCENT_MARK_WIDTH)
-                .height(ACCENT_MARK_HEIGHT),
-        )
-        .style(accent_mark);
-        let input = text_input("Search tracks", &shell.query)
-            .on_input(Message::QueryChanged)
-            .padding([10.0, 12.0])
-            .size(BODY_SIZE)
-            .font(crate::theme::BODY)
-            .style(search_field);
+        let layout = column![
+            title_bar(shell),
+            horizontal_rule(),
+            row![sidebar(shell), vertical_rule(), main_column(shell)]
+                .width(Fill)
+                .height(Fill),
+            horizontal_rule(),
+            now_playing(shell),
+        ]
+        .width(Fill)
+        .height(Fill);
 
-        let list = match shell.pane {
-            Pane::Search => column(shell.results.iter().map(result_row)),
-            Pane::Library => column(shell.playlists.iter().map(playlist_row)),
-            Pane::Playlist => column(shell.playlist_tracks.iter().map(library_track_row)),
-        }
-        .spacing(RESULT_SPACING)
-        .width(Fill);
-        let mut content = column![heading, accent, account_row(shell), account_controls(shell)]
-            .spacing(PANEL_SPACING);
-        if shell.pane == Pane::Search {
-            content = content.push(input);
-        }
-        if shell.cookie_open && shell.sign == YtSign::Out {
-            content = content.push(cookie_form(shell));
-        }
-        if shell.pane == Pane::Playlist && !shell.playlist_name.is_empty() {
-            content = content.push(
-                text(&shell.playlist_name)
-                    .font(crate::theme::BODY)
-                    .size(BODY_SIZE)
-                    .color(crate::theme::TEXT_PRIMARY),
-            );
-        }
-        if let Some(status) = status_line(shell) {
-            content = content.push(status);
-        }
-
-        let content = content
-            .push(scrollable(list).width(Fill).height(Fill))
-            .push(queue_panel(shell))
-            .push(now_playing(shell))
+        let framed = stack([layout.into(), resize_overlay()])
             .width(Fill)
             .height(Fill);
-        let panel = container(content)
-            .padding(PANEL_PADDING)
-            .width(Fill)
-            .height(Fill)
-            .max_width(PANEL_MAX_WIDTH)
-            .style(crate::theme::panel);
 
-        container(panel)
-            .padding(PAGE_PADDING)
+        container(framed)
             .width(Fill)
             .height(Fill)
-            .align_x(Horizontal::Center)
+            .style(window_background)
             .into()
     }
 }
 
-fn account_row(shell: &Shell) -> Element<'_, Message> {
-    let presentation = spotify::present_account(&shell.phase);
-    let color = match presentation.tone {
-        spotify::AccountTone::Muted => crate::theme::TEXT_SECONDARY,
-        spotify::AccountTone::Normal => crate::theme::TEXT_PRIMARY,
-        spotify::AccountTone::Warning => crate::theme::WARNING,
-        spotify::AccountTone::Error => crate::theme::DESTRUCTIVE,
+fn title_bar(shell: &Shell) -> Element<'_, Message> {
+    let brand = row![
+        container(
+            Space::new()
+                .width(ACCENT_MARK_WIDTH)
+                .height(ACCENT_MARK_HEIGHT)
+        )
+        .style(accent_mark),
+        text(TITLE)
+            .font(crate::theme::HEADING)
+            .size(15.0)
+            .color(crate::theme::TEXT_PRIMARY),
+    ]
+    .spacing(10)
+    .align_y(Vertical::Center);
+
+    let drag = mouse_area(
+        container(brand)
+            .width(Fill)
+            .height(Fill)
+            .align_y(Vertical::Center),
+    )
+    .on_press(Message::DragWindow)
+    .on_double_click(Message::ToggleMaximize)
+    .interaction(iced::mouse::Interaction::Grab);
+
+    let maximize = if shell.maximized { "Restore" } else { "Max" };
+    let buttons = row![
+        caption_button("Min", Message::MinimizeWindow, false),
+        caption_button(maximize, Message::ToggleMaximize, false),
+        caption_button("Close", Message::CloseWindow, true),
+    ]
+    .spacing(6)
+    .align_y(Vertical::Center);
+
+    container(
+        row![drag, buttons]
+            .align_y(Vertical::Center)
+            .width(Fill)
+            .height(Fill),
+    )
+    .width(Fill)
+    .height(TITLE_BAR_HEIGHT)
+    .padding([0.0, 16.0])
+    .style(title_bar_style)
+    .into()
+}
+
+fn sidebar(shell: &Shell) -> Element<'_, Message> {
+    let nav = column![
+        nav_item(
+            "Search",
+            Message::ShowSearch,
+            matches!(shell.pane, Pane::Search),
+        ),
+        nav_item(
+            "Queue",
+            Message::ShowQueue,
+            matches!(shell.pane, Pane::Queue),
+        ),
+        nav_item(
+            "Library",
+            Message::ShowLibrary,
+            matches!(shell.pane, Pane::Library | Pane::Playlist),
+        ),
+        nav_item(
+            "Accounts",
+            if shell.sign == YtSign::Out {
+                Message::ShowSignIn
+            } else {
+                Message::ShowAccounts
+            },
+            matches!(shell.pane, Pane::Accounts),
+        ),
+    ]
+    .spacing(4)
+    .width(Fill);
+
+    container(
+        column![nav, Space::new().height(Fill), compact_accounts(shell)]
+            .spacing(12)
+            .width(Fill)
+            .height(Fill),
+    )
+    .padding(12)
+    .width(SIDEBAR_WIDTH)
+    .height(Fill)
+    .style(sidebar_style)
+    .into()
+}
+
+fn nav_item(label: &'static str, message: Message, selected: bool) -> Element<'static, Message> {
+    let mark = container(Space::new().width(2.0).height(16.0))
+        .width(2.0)
+        .style(move |_theme| {
+            if selected {
+                container::background(crate::theme::ACCENT)
+            } else {
+                container::Style::default()
+            }
+        });
+    row![
+        mark,
+        button(text(label).font(crate::theme::BODY).size(BODY_SIZE))
+            .on_press(message)
+            .width(Fill)
+            .padding([8.0, 10.0])
+            .style(move |_theme, status| nav_style(status, selected)),
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center)
+    .into()
+}
+
+fn compact_accounts(shell: &Shell) -> Element<'_, Message> {
+    let (spotify, spotify_color) = spotify_compact(&shell.phase);
+    let (youtube, youtube_color) = youtube_compact(shell.sign);
+    column![
+        compact_line("Spotify", spotify, spotify_color),
+        compact_line("YouTube Music", youtube, youtube_color),
+    ]
+    .spacing(10)
+    .width(Fill)
+    .into()
+}
+
+fn compact_line(
+    service: &'static str,
+    state: &'static str,
+    color: Color,
+) -> Element<'static, Message> {
+    column![
+        text(service)
+            .font(crate::theme::BODY)
+            .size(SOURCE_SIZE)
+            .color(crate::theme::TEXT_SECONDARY),
+        text(state)
+            .font(crate::theme::BODY)
+            .size(SOURCE_SIZE)
+            .color(color),
+    ]
+    .spacing(1)
+    .width(Fill)
+    .into()
+}
+
+fn spotify_compact(phase: &AccountPhase) -> (&'static str, Color) {
+    match phase {
+        AccountPhase::SignedOut => ("signed out", crate::theme::TEXT_SECONDARY),
+        AccountPhase::SigningIn => ("signing in", crate::theme::TEXT_SECONDARY),
+        AccountPhase::SignedIn { .. } => ("signed in", crate::theme::TEXT_PRIMARY),
+        AccountPhase::NotPremium { .. } => ("not Premium", crate::theme::WARNING),
+        AccountPhase::Failed { message } if message == SPOTIFY_RENEW_SIGN_IN => {
+            ("sign-in needs to be renewed", crate::theme::DESTRUCTIVE)
+        }
+        AccountPhase::Failed { .. } => ("sign-in failed", crate::theme::DESTRUCTIVE),
+    }
+}
+
+/// Saved Web API credentials that no longer refresh. Spotify writes this sentence.
+const SPOTIFY_RENEW_SIGN_IN: &str = "Spotify sign-in needs to be renewed.";
+
+/// Search failures that are already a full Spotify sentence stay as written.
+///
+/// Rate limits from the Web API are one of those sentences. Other failures
+/// still get a short prefix so the banner says which search failed.
+fn spotify_search_notice(detail: &str) -> String {
+    if detail.starts_with("Spotify ") {
+        detail.to_string()
+    } else {
+        format!("Spotify search failed: {detail}")
+    }
+}
+
+fn youtube_compact(sign: YtSign) -> (&'static str, Color) {
+    match sign {
+        YtSign::Out => ("signed out", crate::theme::TEXT_SECONDARY),
+        YtSign::Busy => ("signing in", crate::theme::TEXT_SECONDARY),
+        YtSign::In => ("signed in", crate::theme::TEXT_PRIMARY),
+    }
+}
+
+fn main_column(shell: &Shell) -> Element<'_, Message> {
+    let mut header = column![].spacing(SECTION_SPACING).width(Fill);
+    if let Some(banner) = notice_banner_if_any(shell) {
+        header = header.push(banner);
+    }
+    header = header.push(pane_title(shell));
+    if shell.pane == Pane::Search {
+        header = header.push(search_input(shell));
+    }
+    if let Some(note) = status_note(shell) {
+        header = header.push(status_text(note, crate::theme::TEXT_SECONDARY));
+    }
+
+    let body = match shell.pane {
+        Pane::Search => scrollable(
+            column(shell.results.iter().map(result_row))
+                .spacing(RESULT_SPACING)
+                .width(Fill),
+        )
+        .height(Fill)
+        .width(Fill)
+        .into(),
+        Pane::Queue => queue_view(shell),
+        Pane::Library => scrollable(
+            column(shell.playlists.iter().map(playlist_row))
+                .spacing(RESULT_SPACING)
+                .width(Fill),
+        )
+        .height(Fill)
+        .width(Fill)
+        .into(),
+        Pane::Playlist => scrollable(
+            column(shell.playlist_tracks.iter().map(library_track_row))
+                .spacing(RESULT_SPACING)
+                .width(Fill),
+        )
+        .height(Fill)
+        .width(Fill)
+        .into(),
+        Pane::Accounts => scrollable(accounts_view(shell))
+            .height(Fill)
+            .width(Fill)
+            .into(),
     };
-    let label = text(presentation.text)
+
+    container(
+        column![header, body]
+            .spacing(SECTION_SPACING)
+            .width(Fill)
+            .height(Fill),
+    )
+    .padding(CONTENT_PADDING)
+    .width(Fill)
+    .height(Fill)
+    .style(main_surface)
+    .into()
+}
+
+fn pane_title(shell: &Shell) -> Element<'_, Message> {
+    let words = match shell.pane {
+        Pane::Search => "Search".to_string(),
+        Pane::Queue => "Queue".to_string(),
+        Pane::Library => "Library".to_string(),
+        Pane::Accounts => "Accounts".to_string(),
+        Pane::Playlist if shell.playlist_name.is_empty() => "Playlist".to_string(),
+        Pane::Playlist => shell.playlist_name.clone(),
+    };
+    let heading = text(words)
+        .font(crate::theme::HEADING)
+        .size(HEADING_SIZE)
+        .color(crate::theme::TEXT_PRIMARY);
+    if shell.pane == Pane::Playlist {
+        row![
+            transport_button("Back", Some(Message::BackToLibrary), false),
+            heading,
+        ]
+        .spacing(12)
+        .align_y(Vertical::Center)
+        .into()
+    } else {
+        heading.into()
+    }
+}
+
+fn search_input(shell: &Shell) -> Element<'_, Message> {
+    text_input("Search tracks", &shell.query)
+        .on_input(Message::QueryChanged)
+        .padding([10.0, 12.0])
+        .size(BODY_SIZE)
         .font(crate::theme::BODY)
-        .size(META_SIZE)
-        .color(color);
-    let mut line = row![label].spacing(12).align_y(Vertical::Center);
+        .style(search_field)
+        .into()
+}
+
+fn accounts_view(shell: &Shell) -> Element<'_, Message> {
+    let presentation = spotify::present_account(&shell.phase);
+    let mut spotify_block = column![
+        text("Spotify")
+            .font(crate::theme::BODY_MEDIUM)
+            .size(META_SIZE)
+            .color(crate::theme::TEXT_SECONDARY),
+        text(presentation.text)
+            .font(crate::theme::BODY)
+            .size(BODY_SIZE)
+            .color(tone_color(presentation.tone)),
+    ]
+    .spacing(8)
+    .width(Fill);
     if presentation.offer_sign_in {
-        line = line.push(transport_button(
+        spotify_block = spotify_block.push(transport_button(
             "Sign in to Spotify",
             Some(Message::SignIn),
             true,
         ));
     }
-    line.into()
-}
 
-fn status_line(shell: &Shell) -> Option<Element<'_, Message>> {
-    let mut lines: Vec<Element<'_, Message>> = Vec::new();
-    if let Some(error) = &shell.spotify_error {
-        lines.push(status_text(error, crate::theme::DESTRUCTIVE));
-    }
-    if let Some(error) = &shell.error {
-        lines.push(status_text(error, crate::theme::DESTRUCTIVE));
-    }
-
-    if lines.is_empty() {
-        let note = match shell.pane {
-            Pane::Search
-                if !shell.spotify_pending
-                    && !shell.youtube_pending
-                    && !shell.query.trim().is_empty()
-                    && shell.results.is_empty() =>
-            {
-                Some("No matches")
-            }
-            Pane::Library if !shell.library_loading && shell.playlists.is_empty() => {
-                Some("No playlists")
-            }
-            Pane::Playlist if !shell.library_loading && shell.playlist_tracks.is_empty() => {
-                Some("This playlist is empty.")
-            }
-            _ => None,
-        };
-        if let Some(note) = note {
-            lines.push(status_text(note, crate::theme::TEXT_SECONDARY));
-        }
-    }
-
-    match lines.len() {
-        0 => None,
-        1 => lines.pop(),
-        _ => Some(column(lines).spacing(4).into()),
-    }
-}
-
-fn account_controls(shell: &Shell) -> Element<'_, Message> {
-    let controls = match (shell.pane, shell.sign, shell.cookie_open) {
-        (Pane::Search, YtSign::In, _) => row![
-            transport_button("Library", Some(Message::ShowLibrary), true),
-            transport_button("Sign out", Some(Message::SignOut), false),
-        ],
-        (Pane::Search, YtSign::Busy, _) => {
-            return text("Signing in to YouTube Music…")
+    let youtube_block = match shell.sign {
+        YtSign::In => column![
+            section_label("YouTube Music"),
+            text("Signed in.")
                 .font(crate::theme::BODY)
-                .size(META_SIZE)
-                .color(crate::theme::TEXT_SECONDARY)
-                .into();
-        }
-        (Pane::Search, YtSign::Out, false) => {
-            row![transport_button("Sign in", Some(Message::ShowSignIn), true)]
-        }
-        (Pane::Library, _, _) => row![
-            transport_button("Back", Some(Message::ShowSearch), false),
+                .size(BODY_SIZE)
+                .color(crate::theme::TEXT_PRIMARY),
             transport_button("Sign out", Some(Message::SignOut), false),
-        ],
-        (Pane::Playlist, _, _) => row![
-            transport_button("Back", Some(Message::BackToLibrary), false),
-            transport_button("Sign out", Some(Message::SignOut), false),
-        ],
-        (Pane::Search, YtSign::Out, true) => row![],
+        ]
+        .spacing(8)
+        .width(Fill),
+        YtSign::Busy => column![
+            section_label("YouTube Music"),
+            text("Signing in to YouTube Music…")
+                .font(crate::theme::BODY)
+                .size(BODY_SIZE)
+                .color(crate::theme::TEXT_SECONDARY),
+        ]
+        .spacing(8)
+        .width(Fill),
+        YtSign::Out => column![
+            section_label("YouTube Music"),
+            text("Signed out.")
+                .font(crate::theme::BODY)
+                .size(BODY_SIZE)
+                .color(crate::theme::TEXT_SECONDARY),
+            cookie_form(shell),
+        ]
+        .spacing(8)
+        .width(Fill),
     };
-    controls.spacing(8).into()
+
+    column![spotify_block, youtube_block]
+        .spacing(28)
+        .width(Fill)
+        .into()
+}
+
+fn section_label(label: &'static str) -> Element<'static, Message> {
+    text(label)
+        .font(crate::theme::BODY_MEDIUM)
+        .size(META_SIZE)
+        .color(crate::theme::TEXT_SECONDARY)
+        .into()
+}
+
+fn tone_color(tone: spotify::AccountTone) -> Color {
+    match tone {
+        spotify::AccountTone::Muted => crate::theme::TEXT_SECONDARY,
+        spotify::AccountTone::Normal => crate::theme::TEXT_PRIMARY,
+        spotify::AccountTone::Warning => crate::theme::WARNING,
+        spotify::AccountTone::Error => crate::theme::DESTRUCTIVE,
+    }
 }
 
 fn cookie_form(shell: &Shell) -> Element<'_, Message> {
@@ -1442,15 +1944,694 @@ fn cookie_form(shell: &Shell) -> Element<'_, Message> {
         transport_button("Cancel", Some(Message::CancelSignIn), false),
     ]
     .spacing(8);
-    column![help, input, buttons].spacing(8).into()
+    column![help, input, buttons].spacing(8).width(Fill).into()
 }
 
-fn status_text(label: impl Into<String>, color: iced::Color) -> Element<'static, Message> {
+fn status_note(shell: &Shell) -> Option<&'static str> {
+    match shell.pane {
+        Pane::Search if shell.spotify_pending || shell.youtube_pending => Some("Searching…"),
+        Pane::Search if !shell.query.trim().is_empty() && shell.results.is_empty() => {
+            Some("No matches")
+        }
+        Pane::Library if shell.library_loading => Some("Loading library…"),
+        Pane::Library if shell.playlists.is_empty() => Some("No playlists"),
+        Pane::Playlist if shell.library_loading => Some("Loading playlist…"),
+        Pane::Playlist if shell.playlist_tracks.is_empty() => Some("This playlist is empty."),
+        Pane::Search | Pane::Queue | Pane::Library | Pane::Playlist | Pane::Accounts => None,
+    }
+}
+
+fn notice_banner_if_any(shell: &Shell) -> Option<Element<'static, Message>> {
+    let lines = notice_lines(shell);
+    if lines.is_empty() {
+        None
+    } else {
+        Some(notice_banner(lines))
+    }
+}
+
+fn notice_lines(shell: &Shell) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(error) = &shell.spotify_error {
+        push_notice(&mut lines, error.clone());
+    }
+    if let Some(error) = &shell.error {
+        push_notice(&mut lines, error.clone());
+    }
+    if let AccountPhase::Failed { message } = &shell.phase {
+        push_notice(&mut lines, message.clone());
+    }
+    if let Some(error) = shell.displayed_now().error
+        && shell.dismissed_playback_error.as_ref() != Some(&error)
+    {
+        push_notice(&mut lines, error);
+    }
+    lines
+}
+
+fn push_notice(lines: &mut Vec<String>, line: String) {
+    if !line.is_empty() && !lines.iter().any(|existing| existing == &line) {
+        lines.push(line);
+    }
+}
+
+fn notice_banner(lines: Vec<String>) -> Element<'static, Message> {
+    let messages = column(lines.into_iter().map(|line| {
+        text(line)
+            .font(crate::theme::BODY)
+            .size(META_SIZE)
+            .color(crate::theme::DESTRUCTIVE)
+            .width(Fill)
+            .into()
+    }))
+    .spacing(4)
+    .width(Fill);
+
+    container(
+        row![
+            messages,
+            transport_button("Dismiss", Some(Message::DismissNotices), false),
+        ]
+        .spacing(12)
+        .align_y(Vertical::Center),
+    )
+    .padding([10.0, 12.0])
+    .width(Fill)
+    .style(notice_style)
+    .into()
+}
+
+fn status_text(label: impl Into<String>, color: Color) -> Element<'static, Message> {
     text(label.into())
         .font(crate::theme::BODY)
         .size(META_SIZE)
         .color(color)
         .into()
+}
+
+fn now_playing(shell: &Shell) -> Element<'_, Message> {
+    let now = shell.displayed_now();
+    let idle = now.title.is_empty();
+    let title = if idle {
+        "Nothing playing".to_string()
+    } else {
+        now.title.clone()
+    };
+    let title_color = if idle {
+        crate::theme::TEXT_SECONDARY
+    } else {
+        crate::theme::TEXT_PRIMARY
+    };
+
+    let mut title_row = row![
+        text(title)
+            .font(crate::theme::BODY)
+            .size(BODY_SIZE)
+            .color(title_color)
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center);
+    if let Some(source) = now.source {
+        title_row = title_row.push(source_tag(source));
+    }
+
+    let mut details = column![title_row].spacing(2).width(Fill);
+    if !now.artist.is_empty() {
+        details = details.push(
+            text(now.artist.clone())
+                .font(crate::theme::BODY)
+                .size(META_SIZE)
+                .color(crate::theme::TEXT_SECONDARY),
+        );
+    }
+    if let Some(note) = now.note.clone() {
+        details = details.push(
+            text(note)
+                .font(crate::theme::BODY)
+                .size(META_SIZE)
+                .color(crate::theme::WARNING),
+        );
+    }
+
+    let (play_label, play_message) = if now.can_pause {
+        ("Pause", Some(Message::TogglePlayback))
+    } else if now.can_play {
+        ("Play", Some(Message::TogglePlayback))
+    } else {
+        ("Play", None)
+    };
+    let controls = row![
+        transport_button(
+            "Prev",
+            now.can_previous.then_some(Message::PreviousTrack),
+            false,
+        ),
+        transport_button(play_label, play_message, true),
+        transport_button("Next", now.can_next.then_some(Message::NextTrack), false),
+        transport_button("Stop", now.can_stop.then_some(Message::StopPlayback), false),
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center);
+
+    let mut bar = column![
+        row![details, controls]
+            .spacing(ROW_SPACING)
+            .align_y(Vertical::Center)
+    ]
+    .spacing(8)
+    .width(Fill);
+
+    if let Some(ratio) = progress_ratio(&now) {
+        let time = format!(
+            "{} / {}",
+            format_duration(now.elapsed),
+            format_duration(now.duration)
+        );
+        bar = bar.push(
+            row![
+                progress_bar(0.0..=1.0, ratio)
+                    .length(Fill)
+                    .girth(6.0)
+                    .style(transport_progress),
+                text(time)
+                    .font(crate::theme::BODY)
+                    .size(META_SIZE)
+                    .color(crate::theme::TEXT_TERTIARY),
+            ]
+            .spacing(12)
+            .align_y(Vertical::Center),
+        );
+    }
+
+    container(bar)
+        .width(Fill)
+        .padding([12.0, 16.0])
+        .style(transport_bar)
+        .into()
+}
+
+fn progress_ratio(now: &player::NowPlaying) -> Option<f32> {
+    let total = now.duration.as_secs_f32();
+    if total <= 0.0 {
+        return None;
+    }
+    Some((now.elapsed.as_secs_f32() / total).clamp(0.0, 1.0))
+}
+
+fn queue_view(shell: &Shell) -> Element<'_, Message> {
+    let now = shell.playback.now();
+    let mut rows: Vec<Element<'_, Message>> = Vec::new();
+    if !now.title.is_empty() {
+        rows.push(current_row(&now));
+    }
+    let last = now.upcoming.len().saturating_sub(1);
+    for (index, track) in now.upcoming.iter().enumerate() {
+        rows.push(queued_row(index, track, index == last));
+    }
+    if rows.is_empty() {
+        text("Nothing queued")
+            .font(crate::theme::BODY)
+            .size(META_SIZE)
+            .color(crate::theme::TEXT_TERTIARY)
+            .into()
+    } else {
+        scrollable(column(rows).spacing(8).width(Fill))
+            .height(Fill)
+            .width(Fill)
+            .into()
+    }
+}
+
+fn resize_overlay() -> Element<'static, Message> {
+    // Edges first, corners last, so a corner grab wins where the strips meet.
+    stack([
+        resize_grip(
+            Direction::North,
+            Fill,
+            RESIZE_EDGE,
+            Horizontal::Center,
+            Vertical::Top,
+        ),
+        resize_grip(
+            Direction::South,
+            Fill,
+            RESIZE_EDGE,
+            Horizontal::Center,
+            Vertical::Bottom,
+        ),
+        resize_grip(
+            Direction::West,
+            RESIZE_EDGE,
+            Fill,
+            Horizontal::Left,
+            Vertical::Center,
+        ),
+        resize_grip(
+            Direction::East,
+            RESIZE_EDGE,
+            Fill,
+            Horizontal::Right,
+            Vertical::Center,
+        ),
+        resize_grip(
+            Direction::NorthWest,
+            RESIZE_CORNER,
+            RESIZE_CORNER,
+            Horizontal::Left,
+            Vertical::Top,
+        ),
+        resize_grip(
+            Direction::NorthEast,
+            RESIZE_CORNER,
+            RESIZE_CORNER,
+            Horizontal::Right,
+            Vertical::Top,
+        ),
+        resize_grip(
+            Direction::SouthWest,
+            RESIZE_CORNER,
+            RESIZE_CORNER,
+            Horizontal::Left,
+            Vertical::Bottom,
+        ),
+        resize_grip(
+            Direction::SouthEast,
+            RESIZE_CORNER,
+            RESIZE_CORNER,
+            Horizontal::Right,
+            Vertical::Bottom,
+        ),
+    ])
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+
+fn resize_grip(
+    direction: Direction,
+    width: impl Into<Length>,
+    height: impl Into<Length>,
+    align_x: Horizontal,
+    align_y: Vertical,
+) -> Element<'static, Message> {
+    let cursor = resize_cursor(direction);
+    container(
+        mouse_area(Space::new().width(width).height(height))
+            .on_press(Message::Resize(direction))
+            .interaction(cursor),
+    )
+    .width(Fill)
+    .height(Fill)
+    .align_x(align_x)
+    .align_y(align_y)
+    .into()
+}
+
+fn resize_cursor(direction: Direction) -> iced::mouse::Interaction {
+    match direction {
+        Direction::North | Direction::South => iced::mouse::Interaction::ResizingVertically,
+        Direction::East | Direction::West => iced::mouse::Interaction::ResizingHorizontally,
+        Direction::NorthEast | Direction::SouthWest => {
+            iced::mouse::Interaction::ResizingDiagonallyUp
+        }
+        Direction::NorthWest | Direction::SouthEast => {
+            iced::mouse::Interaction::ResizingDiagonallyDown
+        }
+    }
+}
+
+fn horizontal_rule() -> Element<'static, Message> {
+    container(Space::new().width(Fill).height(1.0))
+        .width(Fill)
+        .height(1.0)
+        .style(hairline_fill)
+        .into()
+}
+
+fn vertical_rule() -> Element<'static, Message> {
+    container(Space::new().width(1.0).height(Fill))
+        .width(1.0)
+        .height(Fill)
+        .style(hairline_fill)
+        .into()
+}
+
+fn caption_button(label: &'static str, message: Message, close: bool) -> Element<'static, Message> {
+    button(text(label).font(crate::theme::BODY).size(META_SIZE))
+        .on_press(message)
+        .padding([5.0, 10.0])
+        .style(move |_theme, status| caption_style(status, close))
+        .into()
+}
+
+fn transport_button(
+    label: &'static str,
+    message: Option<Message>,
+    primary: bool,
+) -> Element<'static, Message> {
+    button(text(label).font(crate::theme::BODY).size(META_SIZE))
+        .on_press_maybe(message)
+        .padding([6.0, 10.0])
+        .style(move |_theme, status| transport_button_style(status, primary))
+        .into()
+}
+
+fn window_background(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        text_color: Some(crate::theme::TEXT_PRIMARY),
+        background: Some(crate::theme::BACKGROUND.into()),
+        ..container::Style::default()
+    }
+}
+
+fn title_bar_style(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        text_color: Some(crate::theme::TEXT_PRIMARY),
+        background: Some(crate::theme::PANEL.into()),
+        ..container::Style::default()
+    }
+}
+
+fn sidebar_style(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        text_color: Some(crate::theme::TEXT_PRIMARY),
+        background: Some(crate::theme::PANEL.into()),
+        ..container::Style::default()
+    }
+}
+
+fn main_surface(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        text_color: Some(crate::theme::TEXT_PRIMARY),
+        background: Some(crate::theme::BACKGROUND.into()),
+        ..container::Style::default()
+    }
+}
+
+fn hairline_fill(_theme: &iced::Theme) -> container::Style {
+    container::background(crate::theme::HAIRLINE)
+}
+
+fn notice_style(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        text_color: Some(crate::theme::DESTRUCTIVE),
+        background: Some(crate::theme::DARK_LIGHT.into()),
+        border: Border {
+            color: crate::theme::DESTRUCTIVE,
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        shadow: Shadow {
+            blur_radius: crate::theme::GLOW,
+            ..Shadow::default()
+        },
+        ..container::Style::default()
+    }
+}
+
+fn transport_bar(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        text_color: Some(crate::theme::TEXT_PRIMARY),
+        background: Some(crate::theme::DARK_LIGHT.into()),
+        ..container::Style::default()
+    }
+}
+
+fn transport_progress(_theme: &iced::Theme) -> progress_bar::Style {
+    progress_bar::Style {
+        // The empty track has to read on DARK_LIGHT. DARK_LIGHTER alone disappears.
+        background: mix(crate::theme::DARK_LIGHTER, crate::theme::TEXT_PRIMARY, 0.22).into(),
+        bar: crate::theme::ACCENT.into(),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: 0.0.into(),
+        },
+    }
+}
+
+fn nav_style(status: button::Status, selected: bool) -> button::Style {
+    let (background, text_color) = match (selected, status) {
+        (_, button::Status::Disabled) => (None, crate::theme::TEXT_TERTIARY),
+        (true, button::Status::Pressed) => {
+            (Some(crate::theme::DARK_LIGHT), crate::theme::TEXT_PRIMARY)
+        }
+        (true, button::Status::Hovered) => (
+            Some(mix(
+                crate::theme::DARK_LIGHT,
+                crate::theme::TEXT_PRIMARY,
+                0.08,
+            )),
+            crate::theme::TEXT_PRIMARY,
+        ),
+        (true, button::Status::Active) => {
+            (Some(crate::theme::DARK_LIGHT), crate::theme::TEXT_PRIMARY)
+        }
+        (false, button::Status::Pressed) => {
+            (Some(crate::theme::DARK_LIGHT), crate::theme::TEXT_PRIMARY)
+        }
+        (false, button::Status::Hovered) => {
+            (Some(crate::theme::DARK_LIGHTER), crate::theme::TEXT_PRIMARY)
+        }
+        (false, button::Status::Active) => (None, crate::theme::TEXT_SECONDARY),
+    };
+    flat_button(
+        background.map(Background::Color),
+        text_color,
+        Color::TRANSPARENT,
+    )
+}
+
+fn caption_style(status: button::Status, close: bool) -> button::Style {
+    let (background, text_color) = if close {
+        match status {
+            button::Status::Disabled => (crate::theme::DARK_LIGHT, crate::theme::TEXT_TERTIARY),
+            button::Status::Active => (crate::theme::DARK_LIGHTER, crate::theme::TEXT_PRIMARY),
+            button::Status::Hovered => (crate::theme::DESTRUCTIVE, crate::theme::TEXT_PRIMARY),
+            button::Status::Pressed => (
+                mix(crate::theme::DESTRUCTIVE, crate::theme::BACKGROUND, 0.28),
+                crate::theme::TEXT_PRIMARY,
+            ),
+        }
+    } else {
+        match status {
+            button::Status::Disabled => (crate::theme::DARK_LIGHT, crate::theme::TEXT_TERTIARY),
+            button::Status::Active => (crate::theme::DARK_LIGHTER, crate::theme::TEXT_PRIMARY),
+            button::Status::Hovered => (
+                mix(crate::theme::DARK_LIGHTER, crate::theme::TEXT_PRIMARY, 0.14),
+                crate::theme::TEXT_PRIMARY,
+            ),
+            button::Status::Pressed => (crate::theme::DARK_LIGHT, crate::theme::TEXT_PRIMARY),
+        }
+    };
+    flat_button(
+        Some(Background::Color(background)),
+        text_color,
+        crate::theme::HAIRLINE,
+    )
+}
+
+fn transport_button_style(status: button::Status, primary: bool) -> button::Style {
+    let (background, text_color) = match (primary, status) {
+        (_, button::Status::Disabled) => (crate::theme::DARK_LIGHT, crate::theme::TEXT_TERTIARY),
+        (true, button::Status::Active) => (crate::theme::ACCENT, crate::theme::ON_ACCENT),
+        (true, button::Status::Hovered) => (
+            mix(crate::theme::ACCENT, crate::theme::TEXT_PRIMARY, 0.16),
+            crate::theme::ON_ACCENT,
+        ),
+        (true, button::Status::Pressed) => (
+            mix(crate::theme::ACCENT, crate::theme::BACKGROUND, 0.22),
+            crate::theme::ON_ACCENT,
+        ),
+        (false, button::Status::Active) => (crate::theme::DARK_LIGHTER, crate::theme::TEXT_PRIMARY),
+        (false, button::Status::Hovered) => (
+            mix(crate::theme::DARK_LIGHTER, crate::theme::TEXT_PRIMARY, 0.12),
+            crate::theme::TEXT_PRIMARY,
+        ),
+        (false, button::Status::Pressed) => (crate::theme::DARK_LIGHT, crate::theme::TEXT_PRIMARY),
+    };
+    flat_button(
+        Some(Background::Color(background)),
+        text_color,
+        crate::theme::HAIRLINE,
+    )
+}
+
+fn result_button(_theme: &iced::Theme, status: button::Status) -> button::Style {
+    let background = match status {
+        button::Status::Hovered => Some(Background::Color(crate::theme::DARK_LIGHTER)),
+        button::Status::Pressed => Some(Background::Color(crate::theme::DARK_LIGHT)),
+        button::Status::Active | button::Status::Disabled => None,
+    };
+    flat_button(background, crate::theme::TEXT_PRIMARY, Color::TRANSPARENT)
+}
+
+fn flat_button(background: Option<Background>, text_color: Color, border: Color) -> button::Style {
+    button::Style {
+        background,
+        text_color,
+        border: Border {
+            color: border,
+            width: if border == Color::TRANSPARENT {
+                0.0
+            } else {
+                1.0
+            },
+            radius: 0.0.into(),
+        },
+        shadow: Shadow {
+            blur_radius: crate::theme::GLOW,
+            ..Shadow::default()
+        },
+        snap: false,
+    }
+}
+
+fn mix(from: Color, to: Color, amount: f32) -> Color {
+    Color {
+        r: from.r + (to.r - from.r) * amount,
+        g: from.g + (to.g - from.g) * amount,
+        b: from.b + (to.b - from.b) * amount,
+        a: from.a + (to.a - from.a) * amount,
+    }
+}
+
+fn write_png(path: &Path, rgba: &[u8], width: u32, height: u32) -> Result<(), String> {
+    if width == 0 || height == 0 {
+        return Err("screenshot was empty".into());
+    }
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "screenshot is too large".to_string())?;
+    if rgba.len() < expected {
+        return Err(format!(
+            "screenshot is {} bytes, expected {expected}",
+            rgba.len()
+        ));
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let file = std::fs::File::create(path).map_err(|error| error.to_string())?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|error| error.to_string())?;
+    writer
+        .write_image_data(&rgba[..expected])
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[test]
+fn the_window_is_borderless_opaque_and_has_a_minimum_size() {
+    let settings = window_settings();
+    assert!(!settings.decorations);
+    assert!(!settings.transparent);
+    assert!(settings.resizable);
+    let min = settings.min_size.expect("minimum size");
+    assert!(min.width >= 800.0 && min.height >= 500.0);
+    assert!(settings.size.width >= min.width);
+    assert!(settings.size.height >= min.height);
+}
+
+#[test]
+fn dismissing_a_notice_clears_errors_and_a_failed_sign_in() {
+    let mut shell = test_shell(Mode::Run);
+    shell.error = Some("YouTube Music search failed: timed out".into());
+    shell.spotify_error = Some("Spotify replied 429: API rate limit exceeded".into());
+    shell.phase = AccountPhase::Failed {
+        message: "browser closed".into(),
+    };
+    assert_eq!(notice_lines(&shell).len(), 3);
+    let _ = Shell::view(&shell);
+    let _ = shell.update(Message::DismissNotices);
+    assert!(shell.error.is_none());
+    assert!(shell.spotify_error.is_none());
+    assert_eq!(shell.phase, AccountPhase::SignedOut);
+    assert!(notice_lines(&shell).is_empty());
+    let _ = Shell::view(&shell);
+}
+
+#[test]
+fn spotify_renewal_and_rate_limit_show_on_accounts_and_in_the_banner() {
+    let mut shell = test_shell(Mode::Run);
+    let _ = shell.update(Message::AccountChanged {
+        epoch: 0,
+        phase: AccountPhase::Failed {
+            message: SPOTIFY_RENEW_SIGN_IN.to_string(),
+        },
+    });
+    assert_eq!(
+        spotify_compact(&shell.phase).0,
+        "sign-in needs to be renewed"
+    );
+    let _ = shell.update(Message::ShowAccounts);
+    assert!(
+        notice_lines(&shell)
+            .iter()
+            .any(|line| line == SPOTIFY_RENEW_SIGN_IN)
+    );
+    let _ = Shell::view(&shell);
+
+    let _ = shell.update(Message::QueryChanged("night".into()));
+    let limited = "Spotify is limiting requests. Wait a moment and try again.";
+    let _ = shell.update(Message::SpotifySearched {
+        generation: shell.generation,
+        result: Err(music::Error::Unavailable(limited.to_string())),
+    });
+    let lines = notice_lines(&shell);
+    assert!(
+        lines.iter().any(|line| line == limited),
+        "banner should show the rate-limit sentence, got {lines:?}"
+    );
+    assert!(lines.iter().all(|line| !line.contains("429")), "{lines:?}");
+    let _ = Shell::view(&shell);
+}
+
+#[test]
+fn accounts_holds_sign_in_and_the_other_panes_stay_reachable() {
+    let mut shell = test_shell(Mode::Run);
+    let _ = shell.update(Message::ShowAccounts);
+    assert_eq!(shell.pane, Pane::Accounts);
+    assert!(shell.cookie_open);
+    let _ = Shell::view(&shell);
+
+    let _ = shell.update(Message::ShowSearch);
+    assert_eq!(shell.pane, Pane::Search);
+    let _ = Shell::view(&shell);
+
+    let _ = shell.update(Message::ShowQueue);
+    assert_eq!(shell.pane, Pane::Queue);
+    let _ = Shell::view(&shell);
+}
+
+#[test]
+fn screenshot_seed_renders_search_and_accounts() {
+    let mut shell = test_shell(Mode::Screenshot {
+        main: PathBuf::from("main.png"),
+        accounts: PathBuf::from("main-accounts.png"),
+    });
+    shell.seed_screenshot();
+    assert!(!shell.results.is_empty());
+    assert!(shell.preview.is_some());
+    let _ = Shell::view(&shell);
+    shell.pane = Pane::Accounts;
+    shell.cookie_open = true;
+    let _ = Shell::view(&shell);
+}
+
+#[test]
+fn write_png_creates_a_png_file() {
+    let dir = std::env::temp_dir().join(format!("codevox-mu-png-{}", std::process::id()));
+    let path = dir.join("pixel.png");
+    write_png(&path, &[0xFF, 0x6A, 0x00, 0xFF], 1, 1).expect("png");
+    let bytes = std::fs::read(&path).expect("read");
+    assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn search_task(
@@ -1602,138 +2783,6 @@ fn result_body(track: &Track) -> Element<'_, Message> {
     .into()
 }
 
-fn now_playing(shell: &Shell) -> Element<'_, Message> {
-    let now = shell.playback.now();
-    let idle = now.title.is_empty();
-    let title = if idle {
-        "Nothing playing".to_string()
-    } else {
-        now.title.clone()
-    };
-    let title_color = if idle {
-        crate::theme::TEXT_SECONDARY
-    } else {
-        crate::theme::TEXT_PRIMARY
-    };
-
-    let mut details = column![
-        text(title)
-            .font(crate::theme::BODY)
-            .size(BODY_SIZE)
-            .color(title_color)
-    ]
-    .spacing(2)
-    .width(Fill);
-
-    if !now.artist.is_empty() {
-        details = details.push(
-            text(now.artist.clone())
-                .font(crate::theme::BODY)
-                .size(META_SIZE)
-                .color(crate::theme::TEXT_SECONDARY),
-        );
-    }
-    if let Some(note) = now.note.clone() {
-        details = details.push(
-            text(note)
-                .font(crate::theme::BODY)
-                .size(META_SIZE)
-                .color(crate::theme::WARNING),
-        );
-    }
-    if let Some(error) = now.error.clone() {
-        details = details.push(
-            text(error)
-                .font(crate::theme::BODY)
-                .size(META_SIZE)
-                .color(crate::theme::DESTRUCTIVE),
-        );
-    }
-
-    let time = match now.phase {
-        Phase::Loading => "Loading".to_string(),
-        Phase::Idle if idle => String::new(),
-        _ => format!(
-            "{} / {}",
-            format_duration(now.elapsed),
-            format_duration(now.duration)
-        ),
-    };
-
-    let (play_label, play_message) = if now.can_pause {
-        ("Pause", Some(Message::TogglePlayback))
-    } else if now.can_play {
-        ("Play", Some(Message::TogglePlayback))
-    } else {
-        ("Play", None)
-    };
-
-    let controls = row![
-        text(time)
-            .font(crate::theme::BODY)
-            .size(META_SIZE)
-            .color(crate::theme::TEXT_TERTIARY),
-        transport_button(play_label, play_message, true),
-        transport_button(
-            "Previous",
-            now.can_previous.then_some(Message::PreviousTrack),
-            false,
-        ),
-        transport_button("Next", now.can_next.then_some(Message::NextTrack), false),
-        transport_button("Stop", now.can_stop.then_some(Message::StopPlayback), false),
-    ]
-    .spacing(8)
-    .align_y(Vertical::Center);
-
-    container(
-        row![details, controls]
-            .spacing(ROW_SPACING)
-            .align_y(Vertical::Center),
-    )
-    .width(Fill)
-    .padding([10.0, 12.0])
-    .style(transport_bar)
-    .into()
-}
-
-fn queue_panel(shell: &Shell) -> Element<'_, Message> {
-    let now = shell.playback.now();
-    let heading = text("Queue")
-        .font(crate::theme::BODY)
-        .size(META_SIZE)
-        .color(crate::theme::TEXT_SECONDARY);
-
-    let mut rows: Vec<Element<'_, Message>> = Vec::new();
-    if !now.title.is_empty() {
-        rows.push(current_row(&now));
-    }
-    let last = now.upcoming.len().saturating_sub(1);
-    for (index, track) in now.upcoming.iter().enumerate() {
-        rows.push(queued_row(index, track, index == last));
-    }
-
-    let body: Element<'_, Message> = if rows.is_empty() {
-        text("Nothing queued")
-            .font(crate::theme::BODY)
-            .size(META_SIZE)
-            .color(crate::theme::TEXT_TERTIARY)
-            .into()
-    } else if now.upcoming.len() > 4 {
-        scrollable(column(rows).spacing(8).width(Fill))
-            .height(180.0)
-            .width(Fill)
-            .into()
-    } else {
-        column(rows).spacing(8).width(Fill).into()
-    };
-
-    container(column![heading, body].spacing(8))
-        .width(Fill)
-        .padding([10.0, 12.0])
-        .style(transport_bar)
-        .into()
-}
-
 fn current_row(now: &player::NowPlaying) -> Element<'static, Message> {
     let mut details = column![
         text(now.title.clone())
@@ -1826,89 +2875,6 @@ fn source_tag(source: Source) -> Element<'static, Message> {
     .padding([3.0, 7.0])
     .style(source_chip(source))
     .into()
-}
-
-fn transport_button(
-    label: &'static str,
-    message: Option<Message>,
-    primary: bool,
-) -> Element<'static, Message> {
-    button(text(label).font(crate::theme::BODY).size(META_SIZE))
-        .on_press_maybe(message)
-        .padding([6.0, 10.0])
-        .style(move |_theme, status| transport_button_style(status, primary))
-        .into()
-}
-
-fn transport_bar(_theme: &iced::Theme) -> container::Style {
-    container::Style {
-        text_color: Some(crate::theme::TEXT_PRIMARY),
-        background: Some(crate::theme::DARK_LIGHT.into()),
-        border: Border {
-            color: crate::theme::HAIRLINE,
-            width: 1.0,
-            radius: 0.0.into(),
-        },
-        shadow: Shadow {
-            blur_radius: crate::theme::GLOW,
-            ..Shadow::default()
-        },
-        ..container::Style::default()
-    }
-}
-
-fn transport_button_style(status: button::Status, primary: bool) -> button::Style {
-    let (background, text_color) = if primary {
-        (crate::theme::ACCENT, crate::theme::ON_ACCENT)
-    } else {
-        (crate::theme::DARK_LIGHTER, crate::theme::TEXT_PRIMARY)
-    };
-    let (background, text_color) = match status {
-        button::Status::Disabled => (crate::theme::DARK_LIGHT, crate::theme::TEXT_TERTIARY),
-        button::Status::Hovered | button::Status::Pressed if !primary => {
-            (crate::theme::DARK_LIGHTER, crate::theme::TEXT_PRIMARY)
-        }
-        button::Status::Hovered | button::Status::Pressed => (background, text_color),
-        button::Status::Active => (background, text_color),
-    };
-
-    button::Style {
-        background: Some(Background::Color(background)),
-        text_color,
-        border: Border {
-            color: crate::theme::HAIRLINE,
-            width: 1.0,
-            radius: 0.0.into(),
-        },
-        shadow: Shadow {
-            blur_radius: crate::theme::GLOW,
-            ..Shadow::default()
-        },
-        snap: false,
-    }
-}
-
-fn result_button(_theme: &iced::Theme, status: button::Status) -> button::Style {
-    let background = match status {
-        button::Status::Hovered | button::Status::Pressed => {
-            Some(Background::Color(crate::theme::DARK_LIGHTER))
-        }
-        button::Status::Active | button::Status::Disabled => None,
-    };
-    button::Style {
-        background,
-        text_color: crate::theme::TEXT_PRIMARY,
-        border: Border {
-            color: Color::TRANSPARENT,
-            width: 0.0,
-            radius: 0.0.into(),
-        },
-        shadow: Shadow {
-            blur_radius: crate::theme::GLOW,
-            ..Shadow::default()
-        },
-        snap: false,
-    }
 }
 
 async fn wait(duration: std::time::Duration) {

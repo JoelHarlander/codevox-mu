@@ -20,6 +20,8 @@ ytmapi-rs = { version = "0.3.4", default-features = false, features = ["rustls"]
 tokio = { version = "1.52", features = ["rt-multi-thread", "time", "net"] }
 # The theme test reads design/tokens.json. Search re-reads the InnerTube body.
 serde_json = "1"
+# `--screenshot` writes the window's RGBA buffer to a PNG file.
+png = "0.17"
 # YouTube audio URLs. MIT. rustls, no OpenSSL.
 # rustypipe is GPL-3.0 and is not a dependency. See src/extract.rs.
 innertube-rs = "0.10.1"

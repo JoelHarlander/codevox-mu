@@ -27,31 +27,68 @@ fn main() -> iced::Result {
         Ok(mode) => shell::run(mode),
         Err(argument) => {
             eprintln!("codevox-mu: unknown argument: {argument}");
-            eprintln!("usage: codevox-mu [--smoke]");
+            eprintln!("usage: codevox-mu [--smoke | --screenshot <path.png>]");
             exit(USAGE_EXIT_CODE);
         }
     }
 }
 
-/// Accepts no arguments, or one or more `--smoke` flags.
+/// Accepts no arguments, one or more `--smoke` flags, or one `--screenshot` path.
 ///
-/// The first unknown argument is returned so the caller can show it.
+/// `--screenshot <path.png>` writes the main view there and the Accounts view
+/// beside it as `<name>-accounts.png`. The first unknown argument is returned
+/// so the caller can show it.
 fn invocation(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<shell::Mode, String> {
     let mut arguments = args.into_iter();
     // The first value is the program name, not an option.
     let _program = arguments.next();
     let mut mode = shell::Mode::Run;
+    let mut saw_smoke = false;
 
-    for argument in arguments {
+    while let Some(argument) = arguments.next() {
         let argument = argument.as_ref();
         if argument == "--smoke" {
+            if matches!(mode, shell::Mode::Screenshot { .. }) {
+                return Err(argument.to_string());
+            }
+            saw_smoke = true;
             mode = shell::Mode::Smoke;
+        } else if argument == "--screenshot" {
+            if saw_smoke {
+                return Err(argument.to_string());
+            }
+            let Some(path) = arguments.next() else {
+                return Err(argument.to_string());
+            };
+            let path = path.as_ref();
+            if path.is_empty() || path.starts_with("--") {
+                return Err(path.to_string());
+            }
+            let main = std::path::PathBuf::from(path);
+            let accounts = accounts_screenshot_path(&main);
+            mode = shell::Mode::Screenshot { main, accounts };
         } else {
             return Err(argument.to_string());
         }
     }
 
     Ok(mode)
+}
+
+/// Accounts view for a `--screenshot` path: `main.png` becomes `main-accounts.png`.
+fn accounts_screenshot_path(main: &std::path::Path) -> std::path::PathBuf {
+    let mut name = main.file_stem().unwrap_or_default().to_os_string();
+    name.push("-accounts");
+    if let Some(extension) = main.extension() {
+        name.push(".");
+        name.push(extension);
+    } else {
+        name.push(".png");
+    }
+    match main.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => std::path::PathBuf::from(name),
+    }
 }
 
 #[cfg(test)]
@@ -94,5 +131,36 @@ mod tests {
     fn reject_smoke_prefix() {
         let error = invocation(["codevox-mu", "--smoke-now"]).unwrap_err();
         assert_eq!(error, "--smoke-now");
+    }
+
+    #[test]
+    fn screenshot_flag_names_both_views() {
+        let mode = invocation(["codevox-mu", "--screenshot", "/tmp/main.png"])
+            .expect("screenshot path is accepted");
+        match mode {
+            Mode::Screenshot { main, accounts } => {
+                assert_eq!(main, std::path::PathBuf::from("/tmp/main.png"));
+                assert_eq!(accounts, std::path::PathBuf::from("/tmp/main-accounts.png"));
+            }
+            other => panic!("expected screenshot mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn screenshot_requires_a_path() {
+        let error = invocation(["codevox-mu", "--screenshot"]).unwrap_err();
+        assert_eq!(error, "--screenshot");
+    }
+
+    #[test]
+    fn screenshot_rejects_a_flag_as_the_path() {
+        let error = invocation(["codevox-mu", "--screenshot", "--smoke"]).unwrap_err();
+        assert_eq!(error, "--smoke");
+    }
+
+    #[test]
+    fn smoke_and_screenshot_cannot_combine() {
+        let error = invocation(["codevox-mu", "--smoke", "--screenshot", "a.png"]).unwrap_err();
+        assert_eq!(error, "--screenshot");
     }
 }
