@@ -9,6 +9,7 @@ mod media_controls;
 mod music;
 mod output;
 mod player;
+mod queue;
 mod search;
 mod shell;
 mod spotify;

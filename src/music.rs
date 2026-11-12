@@ -1,28 +1,28 @@
 //! Catalogue reads shared by every music backend.
 //!
-//! [`MockService`] answers from a fixed list, so search and the queue can run
-//! with no network and no account. The unauthenticated YouTube Music search
-//! backend is [`crate::youtube_music::YouTubeMusic`].
+//! [`MockService`] answers from a fixed list, so search can run with no
+//! network and no account. The unauthenticated YouTube Music search backend
+//! is [`crate::youtube_music::YouTubeMusic`]. The play queue is
+//! [`crate::queue::Queue`].
 //!
-//! The window only calls [`MusicService::search`]. Resolve, playlists, and
-//! [`Queue`] are the rest of the v1 contract, so the binary target treats
-//! them as dead until a player uses them.
+//! The window only calls [`MusicService::search`]. Resolve and playlists are
+//! the rest of the v1 contract, so the binary target treats them as dead
+//! until a player uses them.
 
 #![cfg_attr(
     not(test),
     allow(
         dead_code,
-        reason = "the window only searches; resolve, playlists, and Queue are the rest of the v1 contract"
+        reason = "the window only searches; resolve and playlists are the rest of the v1 contract"
     )
 )]
 
-use std::collections::VecDeque;
 use std::fmt;
 use std::time::Duration;
 
 /// Where a track or playlist comes from.
 ///
-/// A [`Queue`] may hold any mix of these.
+/// One play queue can hold any mix of these.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     Spotify,
@@ -66,44 +66,6 @@ pub struct Playlist {
     pub id: String,
     pub source: Source,
     pub name: String,
-}
-
-/// Tracks waiting to play, from any mix of [`Source`]s.
-///
-/// [`Queue::enqueue`] adds at the back. [`Queue::next`] removes from the
-/// front, so the oldest track comes out first.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Queue {
-    tracks: VecDeque<Track>,
-}
-
-impl Queue {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn enqueue(&mut self, track: Track) {
-        self.tracks.push_back(track);
-    }
-
-    /// Put `track` at the front, so [`Queue::next`] yields it first.
-    ///
-    /// Previous-track puts the interrupted song back in front of the queue.
-    pub fn prepend(&mut self, track: Track) {
-        self.tracks.push_front(track);
-    }
-
-    pub fn next(&mut self) -> Option<Track> {
-        self.tracks.pop_front()
-    }
-
-    pub fn len(&self) -> usize {
-        self.tracks.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.tracks.is_empty()
-    }
 }
 
 /// A catalogue call that did not return tracks.
@@ -485,40 +447,5 @@ mod tests {
                 .iter()
                 .all(|item| item.source == Source::YouTubeMusic)
         );
-    }
-
-    #[test]
-    fn mixed_queue_yields_enqueue_order() {
-        let spotify = MockService::spotify()
-            .resolve("sp-night-drive")
-            .expect("spotify track");
-        let youtube = MockService::youtube_music()
-            .resolve("yt-kitchen-radio")
-            .expect("youtube track");
-        let local = Track {
-            id: "local-desk".to_string(),
-            source: Source::Local,
-            title: "Desk Recording".to_string(),
-            artists: vec!["Room".to_string()],
-            album: None,
-            duration: Duration::from_secs(30),
-        };
-
-        let mut queue = Queue::new();
-        assert!(queue.is_empty());
-        assert_eq!(queue.next(), None);
-
-        queue.enqueue(spotify.clone());
-        queue.enqueue(youtube.clone());
-        queue.enqueue(local.clone());
-        assert_eq!(queue.len(), 3);
-
-        assert_eq!(queue.next(), Some(spotify));
-        assert_eq!(queue.next(), Some(youtube));
-        queue.enqueue(local.clone());
-        assert_eq!(queue.next(), Some(local.clone()));
-        assert_eq!(queue.next(), Some(local));
-        assert_eq!(queue.next(), None);
-        assert!(queue.is_empty());
     }
 }

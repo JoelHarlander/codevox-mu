@@ -14,7 +14,7 @@ Status: Done (real screen, 3 OSes) · Built (merged, CI green on 3 OSes, not yet
 | 2 | Installers: Windows x64 and Arm (NSIS, zip), macOS universal dmg, Linux AppImage, deb and rpm, all unsigned, from CI | Built (PR #7) |
 | 3 | Spotify sign-in and playback via librespot (Premium), with free accounts falling back to the matched YouTube Music track | Built (PR #12, YouTube Music fallback included) |
 | 4 | One search across both services: merged, de-duplicated results tagged by source | Built (PR #14) |
-| 5 | Mixed queue: add, reorder and remove tracks from either service, with next and previous across sources | In progress |
+| 5 | Mixed queue: add, reorder and remove tracks from either service, with next and previous across sources | Built |
 | 6 | OS media keys and media controls: Windows SMTC, macOS Now Playing, Linux MPRIS | Built (PR #11) |
 | 7 | Spotify library: playlists and liked songs | Not started |
 | 8 | YouTube Music sign-in: library and playlists | Built (PR #15, cookie sign-in; first page of each playlist only) |

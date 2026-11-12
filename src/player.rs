@@ -1,5 +1,5 @@
 //! Play, pause, stop, skip, and return to the previous track in a mixed
-//! [`Queue`](crate::music::Queue).
+//! [`Queue`](crate::queue::Queue).
 //!
 //! The state machine is synchronous and talks to an [`AudioSink`]. Tests
 //! pass a fake sink. The window uses [`Playback`], which owns the machine
@@ -19,8 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::extract::{Extractor, InnertubeExtractor};
-use crate::music::{Queue, Source, Track};
+use crate::music::{Source, Track};
 use crate::output::{AudioSink, RodioSink, SinkError};
+use crate::queue::{Queue, Shift};
 
 /// Shown when a Spotify track is heard through its YouTube Music match.
 pub const SPOTIFY_FALLBACK_NOTE: &str =
@@ -57,10 +58,14 @@ pub struct NowPlaying {
     pub can_pause: bool,
     pub can_stop: bool,
     pub can_next: bool,
+    /// Previous can restart this track or return to an earlier one.
+    pub can_previous: bool,
     /// Service the loaded track came from. `None` when nothing is loaded.
     pub source: Option<Source>,
     /// Source id of the loaded track. Empty when nothing is loaded.
     pub track_id: String,
+    /// Tracks that play after this one, front first.
+    pub upcoming: Vec<Track>,
 }
 
 impl Default for NowPlaying {
@@ -77,8 +82,10 @@ impl Default for NowPlaying {
             can_pause: false,
             can_stop: false,
             can_next: false,
+            can_previous: false,
             source: None,
             track_id: String::new(),
+            upcoming: Vec::new(),
         }
     }
 }
@@ -140,9 +147,6 @@ enum Start {
 /// Queue plus the sink. `E` resolves YouTube ids. `S` makes sound.
 pub struct Player<E, S> {
     queue: Queue,
-    /// Tracks already left, newest at the end. Previous pops this.
-    history: Vec<Track>,
-    current: Option<Track>,
     phase: Phase,
     duration: Duration,
     error: Option<String>,
@@ -168,8 +172,6 @@ where
     ) -> Self {
         Self {
             queue: Queue::new(),
-            history: Vec::new(),
-            current: None,
             phase: Phase::Idle,
             duration: Duration::ZERO,
             error: None,
@@ -183,17 +185,41 @@ where
         }
     }
 
-    /// Add a track behind whatever is current. The window plays a click
-    /// immediately; tests use this to build a mixed queue.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "tests fill the queue; the window plays the clicked track directly"
-        )
-    )]
+    /// Add `track` at the end of the upcoming list.
     pub fn enqueue(&mut self, track: Track) {
         self.queue.enqueue(track);
+    }
+
+    /// Insert `track` so it plays immediately after the loaded one.
+    pub fn play_next(&mut self, track: Track) {
+        self.queue.play_next(track);
+    }
+
+    /// Move the upcoming track at `index` one place earlier.
+    pub fn move_earlier(&mut self, index: usize) {
+        self.queue.move_earlier(index);
+    }
+
+    /// Move the upcoming track at `index` one place later.
+    pub fn move_later(&mut self, index: usize) {
+        self.queue.move_later(index);
+    }
+
+    /// Drop the upcoming track at `index`. The loaded track keeps playing.
+    pub fn remove_queued(&mut self, index: usize) {
+        let _ = self.queue.remove_upcoming(index);
+    }
+
+    /// Drop the loaded track and play whatever follows it.
+    ///
+    /// The dropped track is not remembered, so previous will not return to it.
+    pub fn remove_current(&mut self) {
+        self.halt_audio();
+        self.queue.remove_current();
+        self.phase = Phase::Idle;
+        self.note = None;
+        self.error = None;
+        self.advance();
     }
 
     /// Play `track` now. A YouTube track replaces whatever is audible. A
@@ -207,9 +233,7 @@ where
             }
             Source::YouTubeMusic => {
                 self.halt_audio();
-                if let Some(previous) = self.current.take() {
-                    self.remember(previous);
-                }
+                self.queue.remember_current();
                 self.note = None;
                 let _ = self.play_stream(track, None);
             }
@@ -231,11 +255,11 @@ where
             }
             Phase::Stopped => {
                 let replay_spotify = self
-                    .current
-                    .as_ref()
+                    .queue
+                    .current()
                     .is_some_and(|track| track.source == Source::Spotify);
                 if replay_spotify {
-                    if let Some(track) = self.current.clone() {
+                    if let Some(track) = self.queue.current().cloned() {
                         let _ = self.load_spotify(&track);
                     }
                 } else {
@@ -272,9 +296,7 @@ where
     /// Drop the current track and play the next queued one.
     pub fn next(&mut self) {
         self.halt_audio();
-        if let Some(track) = self.current.take() {
-            self.remember(track);
-        }
+        self.queue.forward();
         self.phase = Phase::Idle;
         self.advance();
     }
@@ -286,26 +308,22 @@ where
     /// its YouTube Music match. Local files in the history are skipped.
     pub fn previous(&mut self) {
         self.halt_audio();
-        let displaced = self.current.take();
-        while let Some(track) = self.history.pop() {
-            if track.source == Source::Local {
-                self.error = Some(LOCAL_UNAVAILABLE.to_string());
-                continue;
-            }
-            if let Some(current) = displaced.clone() {
-                self.queue.prepend(current);
-            }
-            self.note = None;
-            if track.source == Source::Spotify {
-                self.play_spotify_from_history(track);
-            } else {
-                let _ = self.play_stream(track, None);
-            }
-            return;
+        let retreat = self.queue.back();
+        if retreat.skipped_local {
+            self.error = Some(LOCAL_UNAVAILABLE.to_string());
         }
-
-        self.current = displaced;
-        self.restart_current();
+        match retreat.shift {
+            Shift::Idle => {}
+            Shift::Restart(_) => self.restart_current(),
+            Shift::Play(track) => {
+                self.note = None;
+                if track.source == Source::Spotify {
+                    self.play_spotify_from_history(track);
+                } else {
+                    let _ = self.play_stream(track, None);
+                }
+            }
+        }
     }
 
     /// When the sink has finished the current track, play the next one.
@@ -323,9 +341,7 @@ where
                 return true;
             }
             if self.phase == Phase::Playing && feed.finished {
-                if let Some(track) = self.current.take() {
-                    self.remember(track);
-                }
+                self.queue.forward();
                 self.origin = AudioOrigin::None;
                 self.phase = Phase::Idle;
                 self.advance();
@@ -336,9 +352,7 @@ where
         if self.phase != Phase::Playing || !self.sink.finished() {
             return false;
         }
-        if let Some(track) = self.current.take() {
-            self.remember(track);
-        }
+        self.queue.forward();
         self.origin = AudioOrigin::None;
         self.phase = Phase::Idle;
         self.advance();
@@ -346,24 +360,22 @@ where
     }
 
     pub fn view(&self) -> NowPlaying {
-        let title = self
-            .current
-            .as_ref()
-            .map(|track| track.title.clone())
-            .unwrap_or_default();
-        let artist = self.current.as_ref().map(artist_line).unwrap_or_default();
-        let source = self.current.as_ref().map(|track| track.source);
-        let track_id = self
-            .current
-            .as_ref()
-            .map(|track| track.id.clone())
-            .unwrap_or_default();
+        let (title, artist, source, track_id, has_current) = match self.queue.current() {
+            Some(track) => (
+                track.title.clone(),
+                artist_line(track),
+                Some(track.source),
+                track.id.clone(),
+                true,
+            ),
+            None => (String::new(), String::new(), None, String::new(), false),
+        };
         NowPlaying {
             title,
             artist,
             phase: self.phase,
             elapsed: self.elapsed(),
-            duration: if self.current.is_some() {
+            duration: if has_current {
                 self.duration
             } else {
                 Duration::ZERO
@@ -373,22 +385,16 @@ where
             can_play: self.can_play(),
             can_pause: self.phase == Phase::Playing,
             can_stop: matches!(self.phase, Phase::Playing | Phase::Paused),
-            can_next: self.current.is_some() || !self.queue.is_empty(),
+            can_next: has_current || !self.queue.is_empty(),
+            can_previous: self.queue.can_back(),
             source,
             track_id,
-        }
-    }
-
-    fn remember(&mut self, track: Track) {
-        self.history.push(track);
-        const LIMIT: usize = 50;
-        if self.history.len() > LIMIT {
-            self.history.remove(0);
+            upcoming: self.queue.upcoming().to_vec(),
         }
     }
 
     fn restart_current(&mut self) {
-        if self.current.is_none() {
+        if self.queue.current().is_none() {
             return;
         }
         if !matches!(self.phase, Phase::Playing | Phase::Paused | Phase::Stopped) {
@@ -397,11 +403,11 @@ where
         self.halt_audio();
         self.phase = Phase::Stopped;
         let replay_spotify = self
-            .current
-            .as_ref()
+            .queue
+            .current()
             .is_some_and(|track| track.source == Source::Spotify);
         if replay_spotify {
-            if let Some(track) = self.current.clone() {
+            if let Some(track) = self.queue.current().cloned() {
                 let _ = self.load_spotify(&track);
             }
         } else {
@@ -420,12 +426,12 @@ where
                 let _ = self.play_stream(matched, Some(SPOTIFY_FALLBACK_NOTE.to_string()));
             }
             Ok(None) => {
-                self.current = Some(track);
+                self.queue.load(track);
                 self.phase = Phase::Stopped;
                 self.note = Some(SPOTIFY_UNAVAILABLE_NOTE.to_string());
             }
             Err(message) => {
-                self.current = Some(track);
+                self.queue.load(track);
                 self.phase = Phase::Stopped;
                 self.error = Some(format!("Couldn't find a YouTube Music match: {message}"));
                 self.note = Some(SPOTIFY_UNAVAILABLE_NOTE.to_string());
@@ -444,7 +450,7 @@ where
     fn can_play(&self) -> bool {
         match self.phase {
             Phase::Playing | Phase::Loading => false,
-            Phase::Paused | Phase::Stopped => self.current.is_some(),
+            Phase::Paused | Phase::Stopped => self.queue.current().is_some(),
             Phase::Idle => !self.queue.is_empty(),
         }
     }
@@ -461,7 +467,7 @@ where
     }
 
     fn start_current(&mut self) -> Start {
-        let Some(track) = self.current.clone() else {
+        let Some(track) = self.queue.current().cloned() else {
             self.phase = Phase::Idle;
             return Start::Stop;
         };
@@ -501,7 +507,7 @@ where
 
     fn play_stream(&mut self, track: Track, note: Option<String>) -> Start {
         self.duration = track.duration;
-        self.current = Some(track);
+        self.queue.load(track);
         self.phase = Phase::Stopped;
         let started = self.start_current();
         match &started {
@@ -520,9 +526,7 @@ where
     fn play_spotify_now(&mut self, track: Track) {
         if self.spotify.can_play() {
             self.halt_audio();
-            if let Some(previous) = self.current.take() {
-                self.remember(previous);
-            }
+            self.queue.remember_current();
             self.note = None;
             let _ = self.load_spotify(&track);
             return;
@@ -530,9 +534,7 @@ where
         match self.matcher.find(&track.title, &track.artists) {
             Ok(Some(matched)) => {
                 self.halt_audio();
-                if let Some(previous) = self.current.take() {
-                    self.remember(previous);
-                }
+                self.queue.remember_current();
                 self.note = None;
                 let _ = self.play_stream(matched, Some(SPOTIFY_FALLBACK_NOTE.to_string()));
             }
@@ -548,7 +550,7 @@ where
 
     fn load_spotify(&mut self, track: &Track) -> Start {
         self.duration = track.duration;
-        self.current = Some(track.clone());
+        self.queue.load(track.clone());
         self.spotify_position = Duration::ZERO;
         match self.spotify.load(&track.id) {
             Ok(()) => {
@@ -567,10 +569,10 @@ where
     }
 
     fn advance(&mut self) {
+        self.queue.fill_current();
         let mut skipped_spotify = false;
         loop {
-            let Some(track) = self.queue.next() else {
-                self.current = None;
+            let Some(track) = self.queue.current().cloned() else {
                 self.phase = Phase::Idle;
                 self.origin = AudioOrigin::None;
                 if skipped_spotify {
@@ -582,6 +584,7 @@ where
             match track.source {
                 Source::Local => {
                     self.error = Some(LOCAL_UNAVAILABLE.to_string());
+                    self.queue.remove_current();
                 }
                 Source::Spotify => {
                     if self.spotify.can_play() {
@@ -593,24 +596,32 @@ where
                             }
                             Start::Stop => return,
                             Start::Skip => {
-                                self.current = None;
+                                self.queue.remove_current();
                             }
                         }
                     } else {
                         match self.matcher.find(&track.title, &track.artists) {
                             Ok(Some(matched)) => {
+                                // The Spotify row is replaced by the match. It is
+                                // not kept in the history.
                                 match self
                                     .play_stream(matched, Some(SPOTIFY_FALLBACK_NOTE.to_string()))
                                 {
                                     Start::Playing | Start::Stop => return,
-                                    Start::Skip => self.current = None,
+                                    Start::Skip => {
+                                        self.queue.remove_current();
+                                    }
                                 }
                             }
-                            Ok(None) => skipped_spotify = true,
+                            Ok(None) => {
+                                skipped_spotify = true;
+                                self.queue.remove_current();
+                            }
                             Err(message) => {
                                 self.error =
                                     Some(format!("Couldn't find a YouTube Music match: {message}"));
                                 skipped_spotify = true;
+                                self.queue.remove_current();
                             }
                         }
                     }
@@ -619,7 +630,9 @@ where
                     let note = skipped_spotify.then(|| SPOTIFY_UNAVAILABLE_NOTE.to_string());
                     match self.play_stream(track, note) {
                         Start::Playing | Start::Stop => return,
-                        Start::Skip => self.current = None,
+                        Start::Skip => {
+                            self.queue.remove_current();
+                        }
                     }
                 }
             }
@@ -638,6 +651,12 @@ enum Command {
     Stop,
     Next,
     Previous,
+    Enqueue(Track),
+    PlayNext(Track),
+    MoveEarlier(usize),
+    MoveLater(usize),
+    RemoveQueued(usize),
+    RemoveCurrent,
 }
 
 /// Handle the window keeps. Commands go to the playback thread.
@@ -704,6 +723,30 @@ impl Playback {
 
     pub fn previous(&self) {
         self.send(Command::Previous);
+    }
+
+    pub fn enqueue(&self, track: Track) {
+        self.send(Command::Enqueue(track));
+    }
+
+    pub fn play_next(&self, track: Track) {
+        self.send(Command::PlayNext(track));
+    }
+
+    pub fn move_earlier(&self, index: usize) {
+        self.send(Command::MoveEarlier(index));
+    }
+
+    pub fn move_later(&self, index: usize) {
+        self.send(Command::MoveLater(index));
+    }
+
+    pub fn remove_queued(&self, index: usize) {
+        self.send(Command::RemoveQueued(index));
+    }
+
+    pub fn remove_current(&self) {
+        self.send(Command::RemoveCurrent);
     }
 
     pub fn now(&self) -> NowPlaying {
@@ -791,8 +834,7 @@ fn dispatch(
     match command {
         Command::PlayNow(track) => {
             if matches!(track.source, Source::YouTubeMusic | Source::Spotify) {
-                let can_next = !player.queue.is_empty();
-                write_snapshot(snapshot, loading_now(&track, can_next));
+                write_snapshot(snapshot, loading_now(&track, &player.queue));
             }
             player.play_now(track);
         }
@@ -801,10 +843,16 @@ fn dispatch(
         Command::Stop => player.stop(),
         Command::Next => player.next(),
         Command::Previous => player.previous(),
+        Command::Enqueue(track) => player.enqueue(track),
+        Command::PlayNext(track) => player.play_next(track),
+        Command::MoveEarlier(index) => player.move_earlier(index),
+        Command::MoveLater(index) => player.move_later(index),
+        Command::RemoveQueued(index) => player.remove_queued(index),
+        Command::RemoveCurrent => player.remove_current(),
     }
 }
 
-fn loading_now(track: &Track, can_next: bool) -> NowPlaying {
+fn loading_now(track: &Track, queue: &Queue) -> NowPlaying {
     NowPlaying {
         title: track.title.clone(),
         artist: artist_line(track),
@@ -816,9 +864,11 @@ fn loading_now(track: &Track, can_next: bool) -> NowPlaying {
         can_play: false,
         can_pause: false,
         can_stop: true,
-        can_next,
+        can_next: queue.current().is_some() || !queue.is_empty(),
+        can_previous: queue.can_back(),
         source: Some(track.source),
         track_id: track.id.clone(),
+        upcoming: queue.upcoming().to_vec(),
     }
 }
 
@@ -1625,10 +1675,47 @@ mod tests {
         playback.stop();
         playback.next();
         playback.previous();
+        playback.enqueue(yt("yt-2", "Paper Planes"));
+        playback.play_next(yt("yt-3", "Later"));
+        playback.move_earlier(0);
+        playback.move_later(0);
+        playback.remove_queued(0);
+        playback.remove_current();
 
         let now = playback.now();
         assert_eq!(now.phase, Phase::Idle);
         assert!(now.error.is_none());
         assert!(now.note.is_none());
+    }
+
+    #[test]
+    fn play_next_and_remove_current_follow_the_queue() {
+        let mut player = machine(&[], Fail::None);
+        player.play_now(yt("yt-1", "Kitchen Radio"));
+        player.enqueue(yt("yt-3", "Later"));
+        player.play_next(yt("yt-2", "Paper Planes"));
+
+        let now = player.view();
+        let upcoming: Vec<_> = now.upcoming.iter().map(|track| track.id.as_str()).collect();
+        assert_eq!(upcoming, ["yt-2", "yt-3"]);
+
+        player.next();
+        assert_eq!(player.view().title, "Paper Planes");
+        player.previous();
+        assert_eq!(player.view().title, "Kitchen Radio");
+        player.next();
+        assert_eq!(player.view().title, "Paper Planes");
+
+        player.remove_current();
+        assert_eq!(player.view().title, "Later");
+        assert!(
+            player
+                .view()
+                .upcoming
+                .iter()
+                .all(|track| track.id != "yt-2")
+        );
+        player.previous();
+        assert_eq!(player.view().title, "Kitchen Radio");
     }
 }
