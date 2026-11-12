@@ -26,6 +26,19 @@ innertube-rs = "0.10.1"
 # Symphonia decodes. cpal plays: WASAPI, CoreAudio, and ALSA.
 # Symphonia itself is MPL-2.0. rodio is MIT OR Apache-2.0.
 rodio = { version = "0.23.0", default-features = false, features = ["playback", "mp4", "wav"] }
+# Spotify sign-in and playback. All three crates are MIT.
+# Default features pull native-tls (OpenSSL). rustls is used instead.
+# librespot's rodio backend is cpal 0.16, which cannot link beside this
+# app's rodio 0.23 (both pull alsa-sys). Playback writes PCM into the
+# rodio 0.23 device instead. No Connect discovery crate.
+# librespot calls process::exit on a non-Premium session; this app checks
+# the account first and never connects those sessions.
+librespot-core = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-oauth = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-playback = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+# Web API reads (profile, search) before a librespot session exists.
+# rustls, no OpenSSL. librespot-oauth already uses this crate.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
 # OS media keys and the system overlay. MIT.
 # Linux is MPRIS through libdbus (the default backend). Windows is SMTC.
 # macOS is MPNowPlayingInfoCenter and MPRemoteCommandCenter.
@@ -125,3 +138,9 @@ assets = [
 "libXi.so.6()(64bit)" = "*"
 "libdbus-1.so.3()(64bit)" = "*"
 "libasound.so.2()(64bit)" = "*"
+
+# librespot-core 0.8's build script uses vergen-gitcl 1.0 with the `build`
+# feature. vergen 9.1 switched its vergen-lib dependency to 9.x, which no
+# longer matches that build script. 9.0.6 is the last release that does.
+[build-dependencies]
+vergen = { version = "=9.0.6", default-features = false }

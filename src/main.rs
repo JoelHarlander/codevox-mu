@@ -11,6 +11,7 @@ mod output;
 mod player;
 mod search;
 mod shell;
+mod spotify;
 mod theme;
 mod youtube_music;
 
