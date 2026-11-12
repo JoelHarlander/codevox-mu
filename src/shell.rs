@@ -100,6 +100,11 @@ enum Message {
         epoch: u64,
         phase: AccountPhase,
     },
+    /// The window exists, so OS media controls can attach to it.
+    BindMedia(window::Id),
+    /// `hwnd` is the native handle on Windows. Other platforms pass `None`.
+    MediaBound(Option<isize>),
+    Media(crate::media_controls::MediaCommand),
 }
 
 struct Shell {
@@ -508,12 +513,26 @@ impl Shell {
                 self.arm_clock()
             }
             Message::Tick => self.on_tick(),
+            Message::BindMedia(id) => {
+                crate::media_controls::read_handle(id).map(Message::MediaBound)
+            }
+            Message::MediaBound(hwnd) => {
+                crate::media_controls::attach(hwnd);
+                Task::none()
+            }
+            Message::Media(command) => {
+                crate::media_controls::drive(&self.playback, command);
+                self.arm_clock()
+            }
         }
     }
 
     /// Redraw while a track is loading or playing. One sleeping thread per
     /// tick, same shape as search, because the window executor is not Tokio.
     fn arm_clock(&mut self) -> Task<Message> {
+        if self.mode == Mode::Run {
+            crate::media_controls::publish(&self.playback.now());
+        }
         if self.mode != Mode::Run || self.clock_armed {
             return Task::none();
         }
@@ -525,6 +544,7 @@ impl Shell {
 
     fn on_tick(&mut self) -> Task<Message> {
         self.clock_armed = false;
+        crate::media_controls::publish(&self.playback.now());
         match self.playback.phase() {
             Phase::Loading | Phase::Playing => self.arm_clock(),
             Phase::Idle | Phase::Paused | Phase::Stopped => Task::none(),
@@ -660,8 +680,12 @@ impl Shell {
 
     fn subscription(&self) -> Subscription<Message> {
         match self.mode {
+            // Smoke must not open a D-Bus session or a media-controls handle.
             Mode::Smoke => window::frames().map(|_| Message::Frame),
-            Mode::Run => Subscription::none(),
+            Mode::Run => Subscription::batch([
+                crate::media_controls::events().map(Message::Media),
+                window::open_events().map(Message::BindMedia),
+            ]),
         }
     }
 

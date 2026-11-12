@@ -15,7 +15,7 @@ Status: Done (real screen, 3 OSes) · Built (merged, CI green on 3 OSes, not yet
 | 3 | Spotify sign-in and playback via librespot (Premium), with free accounts falling back to the matched YouTube Music track | In progress (PR #12, YouTube Music fallback included) |
 | 4 | One search across both services: merged, de-duplicated results tagged by source | Not started (merged list exists, no de-dup) |
 | 5 | Mixed queue: add, reorder and remove tracks from either service, with next and previous across sources | Not started (model exists, no UI) |
-| 6 | OS media keys and media controls: Windows SMTC, macOS Now Playing, Linux MPRIS | In progress (PR #11) |
+| 6 | OS media keys and media controls: Windows SMTC, macOS Now Playing, Linux MPRIS | In progress (PR #11 is on main; this branch also drives Spotify playback and the overlay) |
 | 7 | Spotify library: playlists and liked songs | Not started |
 | 8 | YouTube Music sign-in: library and playlists | Not started |
 | 9 | Mixed playlists: create, save locally, and play tracks from both services | Not started |
