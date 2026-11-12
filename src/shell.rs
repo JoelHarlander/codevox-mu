@@ -1,9 +1,10 @@
 //! The native window.
 //!
 //! One iced window is the whole interface today. Search asks the Spotify
-//! mock immediately and YouTube Music on a background thread. Choosing a
-//! row asks the playback thread to play it. The window does not know how
-//! a catalogue is fetched or how a stream is decoded.
+//! mock immediately and YouTube Music on a background thread, then keeps one
+//! row per recording. Choosing a row asks the playback thread to play it.
+//! The window does not know how a catalogue is fetched or how a stream is
+//! decoded.
 
 use std::sync::Arc;
 
@@ -15,6 +16,7 @@ use iced::{Background, Border, Color, Element, Fill, Shadow, Size, Subscription,
 
 use crate::music::{self, MusicService, Source, Track};
 use crate::player::{self, Phase};
+use crate::search;
 use crate::youtube_music::YouTubeMusic;
 
 /// A blocking catalogue call. The iced executor is not a Tokio runtime, so
@@ -102,7 +104,7 @@ struct Shell {
     /// exceeded; the window can still be closing.
     exit_requested: bool,
     query: String,
-    results: Vec<Track>,
+    results: Vec<search::SearchRow>,
     /// YouTube Music failure for the query now on screen. Spotify rows stay.
     error: Option<String>,
     /// Bumped on every edit so a slow reply cannot overwrite a newer query.
@@ -198,7 +200,7 @@ fn search_box_merges_spotify_now_and_youtube_when_it_returns() {
 
     assert_eq!(shell.query, "night");
     assert_eq!(shell.generation, 1);
-    let sources: Vec<_> = shell.results.iter().map(|track| track.source).collect();
+    let sources: Vec<_> = shell.results.iter().map(|row| row.track.source).collect();
     assert_eq!(sources, [Source::Spotify]);
     assert!(shell.error.is_none());
 
@@ -209,9 +211,9 @@ fn search_box_merges_spotify_now_and_youtube_when_it_returns() {
         generation: 1,
         result: Ok(youtube),
     });
-    let sources: Vec<_> = shell.results.iter().map(|track| track.source).collect();
+    let sources: Vec<_> = shell.results.iter().map(|row| row.track.source).collect();
     assert_eq!(sources, [Source::Spotify, Source::YouTubeMusic]);
-    assert_eq!(shell.results[1].title, "Night Drive (Live)");
+    assert_eq!(shell.results[1].track.title, "Night Drive (Live)");
     let _ = Shell::view(&shell);
 
     let _ = shell.update(Message::QueryChanged("   ".into()));
@@ -233,7 +235,7 @@ fn youtube_failure_keeps_spotify_rows_and_shows_an_error() {
         shell
             .results
             .iter()
-            .all(|track| track.source == Source::Spotify)
+            .all(|row| row.track.source == Source::Spotify)
     );
     assert_eq!(
         shell.error.as_deref(),
@@ -260,9 +262,9 @@ fn a_stale_youtube_reply_does_not_replace_the_current_query() {
         shell
             .results
             .iter()
-            .all(|track| track.source == Source::Spotify)
+            .all(|row| row.track.source == Source::Spotify)
     );
-    assert_eq!(shell.results[0].title, "Paper Boats");
+    assert_eq!(shell.results[0].track.title, "Paper Boats");
 
     let paper = music::MockService::youtube_music()
         .search("paper")
@@ -274,7 +276,7 @@ fn a_stale_youtube_reply_does_not_replace_the_current_query() {
     let titles: Vec<_> = shell
         .results
         .iter()
-        .map(|track| (track.source, track.title.as_str()))
+        .map(|row| (row.track.source, row.track.title.as_str()))
         .collect();
     assert_eq!(
         titles,
@@ -294,6 +296,31 @@ fn smoke_play_does_not_start_the_clock() {
     let _ = shell.update(Message::Play(track));
     assert!(!shell.clock_armed);
     assert_eq!(shell.playback.phase(), Phase::Idle);
+    let _ = Shell::view(&shell);
+}
+
+#[test]
+fn search_box_collapses_a_youtube_duplicate_into_the_playable_row() {
+    let mut shell = test_shell(Mode::Run);
+    let _ = shell.update(Message::QueryChanged("night".into()));
+    let youtube = vec![Track {
+        id: "yt-night-drive".to_string(),
+        source: Source::YouTubeMusic,
+        title: "Night Drive (Official Video)".to_string(),
+        artists: vec!["Ada Vega".to_string()],
+        album: None,
+        duration: std::time::Duration::from_secs(194),
+    }];
+    let _ = shell.update(Message::YoutubeSearched {
+        generation: 1,
+        result: Ok(youtube),
+    });
+
+    assert_eq!(shell.results.len(), 1);
+    assert_eq!(shell.results[0].track.id, "yt-night-drive");
+    assert_eq!(shell.results[0].track.source, Source::YouTubeMusic);
+    assert_eq!(shell.results[0].also[0].source, Source::Spotify);
+    assert_eq!(shell.results[0].also[0].id, "sp-night-drive");
     let _ = Shell::view(&shell);
 }
 
@@ -415,7 +442,9 @@ impl Shell {
         }
 
         // Spotify is memory. YouTube blocks, so it rides an iced task.
-        self.results = self.spotify.search(&self.query).unwrap_or_default();
+        // Until that reply lands, the list is the Spotify ranking alone.
+        let spotify_tracks = self.spotify.search(&self.query).unwrap_or_default();
+        self.results = search_rows(&spotify_tracks, &[]);
 
         let youtube = Arc::clone(&self.youtube);
         let query = self.query.clone();
@@ -458,9 +487,8 @@ impl Shell {
             }
         };
 
-        let mut results = self.spotify.search(&self.query).unwrap_or_default();
-        results.extend(youtube_tracks);
-        self.results = results;
+        let spotify_tracks = self.spotify.search(&self.query).unwrap_or_default();
+        self.results = search_rows(&spotify_tracks, &youtube_tracks);
     }
 
     fn on_frame(&mut self) -> Task<Message> {
@@ -583,9 +611,17 @@ fn status_line(shell: &Shell) -> Option<Element<'_, Message>> {
     )
 }
 
-fn result_row(track: &Track) -> Element<'_, Message> {
-    let play = Message::Play(track.clone());
-    button(result_body(track))
+/// Spotify first, then YouTube Music, interleaved by each service's rank.
+///
+/// YouTube Music is the source a click can play. A duplicate keeps that
+/// track, and the other service's id, for a later fallback.
+fn search_rows(spotify: &[Track], youtube: &[Track]) -> Vec<search::SearchRow> {
+    search::merge_results(&[spotify, youtube], Source::YouTubeMusic)
+}
+
+fn result_row(row: &search::SearchRow) -> Element<'_, Message> {
+    let play = Message::Play(row.track.clone());
+    button(result_body(&row.track))
         .on_press(play)
         .width(Fill)
         .padding([6.0, 0.0])

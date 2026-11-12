@@ -9,6 +9,7 @@ mod media_controls;
 mod music;
 mod output;
 mod player;
+mod search;
 mod shell;
 mod theme;
 mod youtube_music;

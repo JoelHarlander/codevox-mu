@@ -155,7 +155,8 @@ pub trait MusicService {
 /// Search several backends and concatenate the hits.
 ///
 /// Order is the iterator's order, then each backend's own order. The first
-/// error stops the merge.
+/// error stops the merge. Duplicates stay; the window uses
+/// [`crate::search::merge_results`] to collapse them.
 pub fn search_merged<'a, S>(
     services: impl IntoIterator<Item = &'a S>,
     query: &str,
