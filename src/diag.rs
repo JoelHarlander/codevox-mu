@@ -122,7 +122,7 @@ fn this_host() -> Host {
     }
 }
 
-fn data_dir() -> Option<PathBuf> {
+pub(crate) fn data_dir() -> Option<PathBuf> {
     data_dir_from(this_host(), |key| std::env::var(key).ok())
 }
 

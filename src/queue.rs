@@ -191,6 +191,25 @@ impl Queue {
         };
     }
 
+    /// Arrange this queue so playback starts at `index`.
+    ///
+    /// Tracks before `index` become history, so previous walks back through
+    /// them. That prefix is not trimmed to the session history cap: previous
+    /// should still reach the first track of a playlist. Tracks from `index`
+    /// onward wait as upcoming, and nothing is loaded yet. An empty list, or
+    /// an index past the end, leaves the queue idle.
+    pub fn start_from(&mut self, tracks: Vec<Track>, index: usize) {
+        self.history.clear();
+        self.current = None;
+        self.upcoming.clear();
+        if index >= tracks.len() {
+            return;
+        }
+        let mut tracks = tracks;
+        self.upcoming = tracks.split_off(index);
+        self.history = tracks;
+    }
+
     fn push_history(&mut self, track: Track) {
         self.history.push(track);
         if self.history.len() > HISTORY_LIMIT {
@@ -446,5 +465,28 @@ mod tests {
         assert!(matches!(retreat.shift, Shift::Restart(track) if track.id == "now"));
         assert_eq!(queue.current().map(|item| item.id.as_str()), Some("now"));
         assert!(queue.upcoming().is_empty());
+    }
+
+    #[test]
+    fn start_from_keeps_the_prefix_in_history_and_the_rest_upcoming() {
+        let mut queue = Queue::new();
+        queue.enqueue(yt("old"));
+        queue.start_from(vec![sp("a"), yt("b"), sp("c")], 1);
+
+        assert!(queue.current().is_none());
+        assert_eq!(upcoming_ids(&queue), ["b", "c"]);
+        let retreat = queue.back();
+        assert!(matches!(retreat.shift, Shift::Play(track) if track.id == "a"));
+        assert_eq!(
+            queue.current().map(|item| item.source),
+            Some(Source::Spotify)
+        );
+        assert_eq!(upcoming_ids(&queue), ["b", "c"]);
+
+        let mut idle = Queue::new();
+        idle.start_from(vec![yt("only")], 2);
+        assert!(idle.current().is_none());
+        assert!(idle.upcoming().is_empty());
+        assert!(matches!(idle.back().shift, Shift::Idle));
     }
 }
