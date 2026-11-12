@@ -25,10 +25,10 @@ cargo run --release -- --smoke
 
 Unsigned installers for Windows, macOS, and Linux are built by the Package workflow and uploaded as Actions artifacts. See [install testing](docs/install-testing.md).
 
-Linux needs the iced system libraries and ALSA. On Debian or Ubuntu:
+Linux needs the iced system libraries, ALSA, and libdbus. On Debian or Ubuntu:
 
 ```sh
-sudo apt install pkg-config libasound2-dev libxkbcommon-dev libxkbcommon-x11-dev \
+sudo apt install pkg-config libdbus-1-dev libasound2-dev libxkbcommon-dev libxkbcommon-x11-dev \
   libwayland-dev libx11-dev libxcb1-dev libxcursor-dev libxi-dev \
   libxrandr-dev libfontconfig1-dev libvulkan1 mesa-vulkan-drivers
 ```
@@ -44,7 +44,8 @@ Windows needs the MSVC build tools. macOS needs the Xcode command line tools.
 `src/music.rs` is the service trait, the shared track and playlist types, the mixed queue, and the mock catalogues.
 `src/youtube_music.rs` is unauthenticated YouTube Music song search.
 `src/extract.rs` resolves a YouTube video id to an audio stream.
-`src/player.rs` is play, pause, stop, and next over the mixed queue.
+`src/player.rs` is play, pause, stop, next, and previous over the mixed queue.
 `src/output.rs` decodes with symphonia and plays through cpal.
+`src/media_controls.rs` is OS media keys and the system now-playing overlay.
 `src/shell.rs` is the iced window.
 A new concern gets its own module when it has real code. Accounts are not in the tree yet.
