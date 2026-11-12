@@ -705,6 +705,7 @@ mod tests {
             can_previous: false,
             source: Some(source),
             track_id: "track-1".into(),
+            loaded: None,
             upcoming: Vec::new(),
         }
     }

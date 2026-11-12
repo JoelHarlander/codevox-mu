@@ -338,6 +338,7 @@ mod tests {
             source,
             track_id: track_id.to_string(),
             album: None,
+            loaded: None,
             upcoming: Vec::new(),
         }
     }
