@@ -1,0 +1,32 @@
+{
+  "href": "https://api.spotify.com/v1/me/playlists?offset=0&limit=50",
+  "limit": 50,
+  "next": "https://api.spotify.com/v1/me/playlists?offset=50&limit=50",
+  "offset": 0,
+  "previous": null,
+  "total": 3,
+  "items": [
+    {
+      "collaborative": false,
+      "id": "37i9dQZF1DXcBWIGoYBM5M",
+      "name": "Low Glow",
+      "public": false,
+      "type": "playlist",
+      "tracks": { "total": 2 }
+    },
+    {
+      "id": "6RQ4lI2a1b3c4d5e6f7g8h",
+      "name": "  ",
+      "type": "playlist"
+    },
+    {
+      "id": "",
+      "name": "Skipped"
+    },
+    {
+      "id": "../etc",
+      "name": "Not a path"
+    },
+    null
+  ]
+}

@@ -1,0 +1,67 @@
+{
+  "href": "https://api.spotify.com/v1/playlists/37i9dQZF1DXcBWIGoYBM5M/items?offset=0&limit=50",
+  "limit": 50,
+  "next": null,
+  "offset": 0,
+  "previous": null,
+  "total": 2,
+  "items": [
+    {
+      "added_at": "2026-02-01T00:00:00Z",
+      "is_local": false,
+      "track": {
+        "id": "5sWHDYs0csV6RS48xBl0tH",
+        "name": "Night Drive",
+        "duration_ms": 192000,
+        "type": "track",
+        "artists": [{ "name": "Ada Vega" }],
+        "album": { "name": "Low Glow" }
+      }
+    },
+    {
+      "added_at": "2026-02-02T00:00:00Z",
+      "is_local": false,
+      "item": {
+        "id": "4GNcXTGWmnZ3ySrqvol3o4",
+        "name": "Glass House",
+        "duration_ms": 241000,
+        "type": "track",
+        "artists": [{ "name": "Ada Vega" }, { "name": "North Line" }],
+        "album": { "name": "Low Glow" }
+      }
+    },
+    {
+      "is_local": false,
+      "item": {
+        "id": "1abcDEFghiJKLmnoPQRstu",
+        "name": "A Podcast",
+        "type": "episode",
+        "duration_ms": 600000
+      }
+    },
+    {
+      "is_local": true,
+      "track": {
+        "id": "5sWHDYs0csV6RS48xBl0tH",
+        "name": "On This Computer",
+        "duration_ms": 1000,
+        "type": "track",
+        "artists": [{ "name": "Ada Vega" }]
+      }
+    },
+    {
+      "is_local": false,
+      "track": null
+    },
+    {
+      "is_local": false,
+      "track": {
+        "id": "not-a-spotify-id",
+        "name": "Skipped",
+        "duration_ms": 1000,
+        "type": "track",
+        "artists": [{ "name": "Ada Vega" }]
+      }
+    }
+  ]
+}

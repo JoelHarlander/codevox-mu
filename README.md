@@ -23,7 +23,7 @@ Sign in from Accounts. Spotify opens the browser login for CodeVox mU's own Spot
 cargo run --release -- --smoke
 ```
 
-`--smoke` draws three frames and exits 0. `--screenshot <path.png>` writes that file and a sibling `<name>-accounts.png`, then exits 0. Any other argument is a usage error and exits 2. Continuous integration uses `--smoke` to prove the binary opens a window.
+`--smoke` draws three frames and exits 0. `--screenshot <path.png>` writes that file, a sibling `<name>-accounts.png`, and a sibling `<name>-library.png`, then exits 0. Any other argument is a usage error and exits 2. Continuous integration uses `--smoke` to prove the binary opens a window.
 
 Unsigned installers for Windows, macOS, and Linux are built by the Package workflow and uploaded as Actions artifacts. See [install testing](docs/install-testing.md).
 

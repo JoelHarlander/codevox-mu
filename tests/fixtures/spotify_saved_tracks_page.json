@@ -1,0 +1,35 @@
+{
+  "href": "https://api.spotify.com/v1/me/tracks?offset=0&limit=50",
+  "limit": 50,
+  "next": "https://api.spotify.com/v1/me/tracks?offset=50&limit=50",
+  "offset": 0,
+  "previous": null,
+  "total": 80,
+  "items": [
+    {
+      "added_at": "2026-01-02T00:00:00Z",
+      "track": {
+        "id": "5sWHDYs0csV6RS48xBl0tH",
+        "name": "Night Drive",
+        "duration_ms": 192000,
+        "type": "track",
+        "artists": [{ "name": "Ada Vega" }],
+        "album": { "name": "Low Glow" }
+      }
+    },
+    {
+      "added_at": "2026-01-01T00:00:00Z",
+      "track": null
+    },
+    {
+      "added_at": "2025-12-01T00:00:00Z",
+      "track": {
+        "id": "not-a-spotify-id",
+        "name": "Skipped",
+        "duration_ms": 1000,
+        "type": "track",
+        "artists": [{ "name": "Ada Vega" }]
+      }
+    }
+  ]
+}

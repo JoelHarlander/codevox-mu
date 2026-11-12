@@ -1,0 +1,15 @@
+{
+  "href": "https://api.spotify.com/v1/me/playlists?offset=50&limit=50",
+  "limit": 50,
+  "next": null,
+  "offset": 50,
+  "previous": "https://api.spotify.com/v1/me/playlists?offset=0&limit=50",
+  "total": 3,
+  "items": [
+    {
+      "id": "0a1B2c3D4e5F6g7H8i9J0k",
+      "name": "Harbour",
+      "type": "playlist"
+    }
+  ]
+}

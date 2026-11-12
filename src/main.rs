@@ -35,9 +35,10 @@ fn main() -> iced::Result {
 
 /// Accepts no arguments, one or more `--smoke` flags, or one `--screenshot` path.
 ///
-/// `--screenshot <path.png>` writes the main view there and the Accounts view
-/// beside it as `<name>-accounts.png`. The first unknown argument is returned
-/// so the caller can show it.
+/// `--screenshot <path.png>` writes the main view there, the Accounts view
+/// beside it as `<name>-accounts.png`, and the Library view as
+/// `<name>-library.png`. The first unknown argument is returned so the caller
+/// can show it.
 fn invocation(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<shell::Mode, String> {
     let mut arguments = args.into_iter();
     // The first value is the program name, not an option.
@@ -66,7 +67,12 @@ fn invocation(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<shell::
             }
             let main = std::path::PathBuf::from(path);
             let accounts = accounts_screenshot_path(&main);
-            mode = shell::Mode::Screenshot { main, accounts };
+            let library = library_screenshot_path(&main);
+            mode = shell::Mode::Screenshot {
+                main,
+                accounts,
+                library,
+            };
         } else {
             return Err(argument.to_string());
         }
@@ -77,8 +83,17 @@ fn invocation(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<shell::
 
 /// Accounts view for a `--screenshot` path: `main.png` becomes `main-accounts.png`.
 fn accounts_screenshot_path(main: &std::path::Path) -> std::path::PathBuf {
+    sibling_screenshot(main, "-accounts")
+}
+
+/// Library view for a `--screenshot` path: `main.png` becomes `main-library.png`.
+fn library_screenshot_path(main: &std::path::Path) -> std::path::PathBuf {
+    sibling_screenshot(main, "-library")
+}
+
+fn sibling_screenshot(main: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     let mut name = main.file_stem().unwrap_or_default().to_os_string();
-    name.push("-accounts");
+    name.push(suffix);
     if let Some(extension) = main.extension() {
         name.push(".");
         name.push(extension);
@@ -134,13 +149,18 @@ mod tests {
     }
 
     #[test]
-    fn screenshot_flag_names_both_views() {
+    fn screenshot_flag_names_search_accounts_and_library() {
         let mode = invocation(["codevox-mu", "--screenshot", "/tmp/main.png"])
             .expect("screenshot path is accepted");
         match mode {
-            Mode::Screenshot { main, accounts } => {
+            Mode::Screenshot {
+                main,
+                accounts,
+                library,
+            } => {
                 assert_eq!(main, std::path::PathBuf::from("/tmp/main.png"));
                 assert_eq!(accounts, std::path::PathBuf::from("/tmp/main-accounts.png"));
+                assert_eq!(library, std::path::PathBuf::from("/tmp/main-library.png"));
             }
             other => panic!("expected screenshot mode, got {other:?}"),
         }
