@@ -50,6 +50,16 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 # Building on Linux needs pkg-config and libdbus-1-dev.
 souvlaki = "0.8.3"
 
+# Release builds on Windows are GUI programs. This reattaches a parent
+# console so `--smoke` and `--screenshot` still print. Already in the
+# lockfile via other crates; pinned to that revision.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+] }
+
 # Unsigned test installers. cargo-packager 0.11.8 reads this table.
 # RPM is not a packager format; cargo-generate-rpm 0.21.1 reads the table below.
 # Both versions are pinned in .github/workflows/package.yml.

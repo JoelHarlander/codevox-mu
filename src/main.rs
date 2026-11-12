@@ -4,6 +4,15 @@
 //! [`shell::Mode`] to the window. The shell never reads `argv`, so a bad
 //! argument fails before a window exists.
 
+// Release builds on Windows are GUI programs. A console-subsystem exe opens
+// a black console window behind the borderless player. Debug builds stay
+// console programs so `cargo run` keeps its output. Tests stay console
+// programs so `cargo test --release` can print.
+#![cfg_attr(
+    all(windows, not(debug_assertions), not(test)),
+    windows_subsystem = "windows"
+)]
+
 mod extract;
 mod media_controls;
 mod music;
@@ -23,6 +32,7 @@ use std::process::exit;
 const USAGE_EXIT_CODE: i32 = 2;
 
 fn main() -> iced::Result {
+    attach_parent_console();
     match invocation(std::env::args()) {
         Ok(mode) => shell::run(mode),
         Err(argument) => {
@@ -32,6 +42,63 @@ fn main() -> iced::Result {
         }
     }
 }
+
+/// A GUI-subsystem process has no console of its own. When a terminal
+/// launched this release build, attach to that console and point any
+/// missing standard handle at it, so `--smoke`, `--screenshot`, and usage
+/// errors still print. Redirected handles (the Windows CI runner, pipes)
+/// stay where they are. No parent console means a double-clicked window:
+/// attaching fails and this returns without allocating one.
+#[cfg(all(windows, not(debug_assertions)))]
+fn attach_parent_console() {
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+        SetStdHandle,
+    };
+
+    // SAFETY: documented console-attach sequence for a GUI program that
+    // still prints to the terminal it was launched from. The CONOUT$
+    // handle is left open for the process lifetime; closing it would
+    // dangle the standard handles. Inherited handles are not replaced, so
+    // a redirected CI step keeps the pipes it was given.
+    unsafe {
+        let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+        let stderr = GetStdHandle(STD_ERROR_HANDLE);
+        let stdout_missing = stdout.is_null() || stdout == INVALID_HANDLE_VALUE;
+        let stderr_missing = stderr.is_null() || stderr == INVALID_HANDLE_VALUE;
+        if !stdout_missing && !stderr_missing {
+            return;
+        }
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        let console = CreateFileW(
+            windows_sys::w!("CONOUT$"),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        );
+        if console.is_null() || console == INVALID_HANDLE_VALUE {
+            return;
+        }
+        if stdout_missing {
+            SetStdHandle(STD_OUTPUT_HANDLE, console);
+        }
+        if stderr_missing {
+            SetStdHandle(STD_ERROR_HANDLE, console);
+        }
+    }
+}
+
+#[cfg(not(all(windows, not(debug_assertions))))]
+fn attach_parent_console() {}
 
 /// Accepts no arguments, one or more `--smoke` flags, or one `--screenshot` path.
 ///
