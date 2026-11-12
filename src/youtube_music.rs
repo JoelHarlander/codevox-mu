@@ -20,6 +20,7 @@ use ytmapi_rs::query::SearchQuery;
 use ytmapi_rs::query::search::{FilteredSearch, SongsFilter};
 
 use crate::music::{Error, MusicService, Playlist, Source, Track};
+use crate::player::{YoutubeMatch, match_query};
 
 /// How long an error row is allowed to get. The API text can be a whole body.
 const ERROR_CHARS: usize = 160;
@@ -248,6 +249,33 @@ fn bad_duration(text: &str) -> Error {
 
 fn brief(error: impl std::fmt::Display) -> Error {
     brief_message(error.to_string())
+}
+
+/// Plays a Spotify row that librespot cannot, by searching YouTube Music
+/// for the title and artist. The first song is the match.
+pub struct YouTubeFallback {
+    music: YouTubeMusic,
+}
+
+impl YouTubeFallback {
+    pub fn new(music: YouTubeMusic) -> Self {
+        Self { music }
+    }
+}
+
+impl YoutubeMatch for YouTubeFallback {
+    fn find(&mut self, title: &str, artists: &[String]) -> Result<Option<Track>, String> {
+        let query = match_query(title, artists);
+        if query.is_empty() {
+            return Ok(None);
+        }
+        match self.music.search(&query) {
+            Ok(tracks) => Ok(tracks
+                .into_iter()
+                .find(|track| track.source == Source::YouTubeMusic)),
+            Err(error) => Err(error.to_string()),
+        }
+    }
 }
 
 fn brief_message(message: impl Into<String>) -> Error {

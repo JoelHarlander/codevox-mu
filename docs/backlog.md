@@ -11,16 +11,15 @@ Draft v1, 11 Nov 2026. Still to refine with Joel.
 - Visual style follows CodeVox. Decided 11 Nov 2026. See [Visual style follows CodeVox](decisions.md#11-nov-2026--visual-style-follows-codevox).
 - A services/backend trait plus a mock.
 - YouTube Music search. Unauthenticated song search through ytmapi-rs (MIT), merged with the Spotify mock. See [YouTube Music search uses ytmapi-rs](decisions.md#11-nov-2026--youtube-music-search-uses-ytmapi-rs).
-- YouTube Music playback. A search result plays in the window. Spotify tracks in the queue are skipped. See [Spotify via librespot, YouTube Music for everyone else](decisions.md#11-nov-2026--spotify-via-librespot-youtube-music-for-everyone-else).
+- YouTube Music playback. A search result plays in the window. See [Spotify via librespot, YouTube Music for everyone else](decisions.md#11-nov-2026--spotify-via-librespot-youtube-music-for-everyone-else).
+- Spotify sign-in and in-app playback via librespot 0.8.0 (MIT). Premium accounts play the Spotify row. Free accounts and a failed sign-in play the YouTube Music match for that title and artist. See [Spotify playback uses librespot 0.8](decisions.md#12-nov-2026--spotify-playback-uses-librespot-08).
 
 ## Now
 
 ## Next
 
-Each of the first two is its own small PR, in this order:
+Each item is its own small PR, in this order:
 
-- Spotify sign-in and playback via librespot.
-- librespot playback spike. In-app playback; free accounts fall back to YouTube Music.
 - YouTube Music sign-in.
 - One search across both services.
 - A mixed queue.

@@ -9,6 +9,7 @@ mod music;
 mod output;
 mod player;
 mod shell;
+mod spotify;
 mod theme;
 mod youtube_music;
 

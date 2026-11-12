@@ -1,0 +1,20 @@
+{
+  "tracks": {
+    "items": [
+      {
+        "id": "5sWHDYs0csV6RS48xBl0tH",
+        "name": "Night Drive",
+        "duration_ms": 192000,
+        "artists": [{ "name": "Ada Vega" }],
+        "album": { "name": "Low Glow" }
+      },
+      {
+        "id": "4GNcXTGWmnZ3ySrqvol3o4",
+        "name": "Glass House",
+        "duration_ms": 241000,
+        "artists": [{ "name": "Ada Vega" }, { "name": "North Line" }],
+        "album": { "name": "  " }
+      }
+    ]
+  }
+}
