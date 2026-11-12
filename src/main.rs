@@ -19,6 +19,7 @@ mod media_controls;
 mod music;
 mod output;
 mod player;
+mod playlists;
 mod queue;
 mod search;
 mod selftest;
