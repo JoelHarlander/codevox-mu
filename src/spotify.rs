@@ -304,8 +304,9 @@ fn this_desktop() -> Desktop {
 fn cache_dir_from(desktop: Desktop, var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
     let absolute = |key: &str| {
         let value = var(key).filter(|value| !value.trim().is_empty())?;
-        let path = PathBuf::from(value);
-        is_absolute_for(desktop, &path).then_some(path)
+        // Judge the env value itself. `Path` rewrites `/` to `\` on Windows,
+        // so a later `starts_with('/')` would reject a Linux cache root there.
+        is_absolute_for(desktop, &value).then(|| PathBuf::from(value))
     };
 
     let root = match desktop {
@@ -317,20 +318,21 @@ fn cache_dir_from(desktop: Desktop, var: impl Fn(&str) -> Option<String>) -> Opt
     Some(root.join("codevox-mu"))
 }
 
-/// `Path::is_absolute` follows the host. Both rules are spelled out so each
-/// desktop's path check can be tested on any host: a drive letter is not
-/// absolute on Linux, and `/home` is not absolute on Windows.
-fn is_absolute_for(desktop: Desktop, path: &Path) -> bool {
+/// Absolute for that desktop, not for the machine running the check.
+///
+/// `Path::is_absolute` follows the host, and on Windows `Path` displays a
+/// rooted `/var/cache` path with backslashes. The rules look at the original
+/// text so a Linux cache root still counts as absolute in a Windows test.
+fn is_absolute_for(desktop: Desktop, path: &str) -> bool {
     match desktop {
-        Desktop::Linux | Desktop::Mac => path.to_string_lossy().starts_with('/'),
+        Desktop::Linux | Desktop::Mac => path.starts_with('/'),
         Desktop::Windows => {
-            let text = path.to_string_lossy();
-            let bytes = text.as_bytes();
+            let bytes = path.as_bytes();
             let drive = bytes.len() >= 3
                 && bytes[0].is_ascii_alphabetic()
                 && bytes[1] == b':'
                 && (bytes[2] == b'\\' || bytes[2] == b'/');
-            drive || text.starts_with(r"\\") || text.starts_with("//")
+            drive || path.starts_with(r"\\") || path.starts_with("//")
         }
     }
 }
