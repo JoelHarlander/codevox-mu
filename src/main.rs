@@ -13,6 +13,7 @@
     windows_subsystem = "windows"
 )]
 
+mod diag;
 mod extract;
 mod media_controls;
 mod music;
@@ -20,6 +21,7 @@ mod output;
 mod player;
 mod queue;
 mod search;
+mod selftest;
 mod shell;
 mod spotify;
 mod theme;
@@ -33,11 +35,15 @@ const USAGE_EXIT_CODE: i32 = 2;
 
 fn main() -> iced::Result {
     attach_parent_console();
+    // The log file is truncated here, before sign-in or `--selftest` runs.
+    // A missing data directory only skips the file. The window still opens.
+    diag::init();
     match invocation(std::env::args()) {
-        Ok(mode) => shell::run(mode),
+        Ok(Launch::Window(mode)) => shell::run(mode),
+        Ok(Launch::SelfTest) => exit(selftest::run()),
         Err(argument) => {
             eprintln!("codevox-mu: unknown argument: {argument}");
-            eprintln!("usage: codevox-mu [--smoke | --screenshot <path.png>]");
+            eprintln!("usage: codevox-mu [--smoke | --screenshot <path.png> | --selftest]");
             exit(USAGE_EXIT_CODE);
         }
     }
@@ -100,29 +106,43 @@ fn attach_parent_console() {
 #[cfg(not(all(windows, not(debug_assertions))))]
 fn attach_parent_console() {}
 
-/// Accepts no arguments, one or more `--smoke` flags, or one `--screenshot` path.
+/// How the process was started. The window modes stay in the shell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Launch {
+    Window(shell::Mode),
+    /// Saved-account checks. No window.
+    SelfTest,
+}
+
+/// Accepts no arguments, `--smoke`, one `--screenshot` path, or `--selftest`.
 ///
 /// `--screenshot <path.png>` writes the main view there, the Accounts view
 /// beside it as `<name>-accounts.png`, and the Library view as
 /// `<name>-library.png`. The first unknown argument is returned so the caller
 /// can show it.
-fn invocation(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<shell::Mode, String> {
+fn invocation(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Launch, String> {
     let mut arguments = args.into_iter();
     // The first value is the program name, not an option.
     let _program = arguments.next();
     let mut mode = shell::Mode::Run;
     let mut saw_smoke = false;
+    let mut saw_selftest = false;
 
     while let Some(argument) = arguments.next() {
         let argument = argument.as_ref();
         if argument == "--smoke" {
-            if matches!(mode, shell::Mode::Screenshot { .. }) {
+            if matches!(mode, shell::Mode::Screenshot { .. }) || saw_selftest {
                 return Err(argument.to_string());
             }
             saw_smoke = true;
             mode = shell::Mode::Smoke;
+        } else if argument == "--selftest" {
+            if saw_smoke || matches!(mode, shell::Mode::Screenshot { .. }) {
+                return Err(argument.to_string());
+            }
+            saw_selftest = true;
         } else if argument == "--screenshot" {
-            if saw_smoke {
+            if saw_smoke || saw_selftest {
                 return Err(argument.to_string());
             }
             let Some(path) = arguments.next() else {
@@ -145,7 +165,11 @@ fn invocation(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<shell::
         }
     }
 
-    Ok(mode)
+    if saw_selftest {
+        Ok(Launch::SelfTest)
+    } else {
+        Ok(Launch::Window(mode))
+    }
 }
 
 /// Accounts view for a `--screenshot` path: `main.png` becomes `main-accounts.png`.
@@ -175,26 +199,42 @@ fn sibling_screenshot(main: &std::path::Path, suffix: &str) -> std::path::PathBu
 
 #[cfg(test)]
 mod tests {
-    use super::invocation;
+    use super::{Launch, invocation};
     use crate::shell::Mode;
 
     #[test]
     fn run_without_arguments() {
         let mode = invocation(["codevox-mu"]).expect("no arguments is run");
-        assert_eq!(mode, Mode::Run);
+        assert_eq!(mode, Launch::Window(Mode::Run));
     }
 
     #[test]
     fn smoke_flag() {
         let mode = invocation(["codevox-mu", "--smoke"]).expect("--smoke is accepted");
-        assert_eq!(mode, Mode::Smoke);
+        assert_eq!(mode, Launch::Window(Mode::Smoke));
     }
 
     #[test]
     fn repeated_smoke_flag_stays_smoke() {
         let mode = invocation(["codevox-mu", "--smoke", "--smoke"])
             .expect("repeating --smoke is still smoke");
-        assert_eq!(mode, Mode::Smoke);
+        assert_eq!(mode, Launch::Window(Mode::Smoke));
+    }
+
+    #[test]
+    fn selftest_flag_does_not_open_a_window() {
+        let mode = invocation(["codevox-mu", "--selftest"]).expect("--selftest is accepted");
+        assert_eq!(mode, Launch::SelfTest);
+    }
+
+    #[test]
+    fn selftest_cannot_combine_with_smoke_or_screenshot() {
+        let error = invocation(["codevox-mu", "--selftest", "--smoke"]).unwrap_err();
+        assert_eq!(error, "--smoke");
+        let error = invocation(["codevox-mu", "--smoke", "--selftest"]).unwrap_err();
+        assert_eq!(error, "--selftest");
+        let error = invocation(["codevox-mu", "--selftest", "--screenshot", "a.png"]).unwrap_err();
+        assert_eq!(error, "--screenshot");
     }
 
     #[test]
@@ -220,11 +260,11 @@ mod tests {
         let mode = invocation(["codevox-mu", "--screenshot", "/tmp/main.png"])
             .expect("screenshot path is accepted");
         match mode {
-            Mode::Screenshot {
+            Launch::Window(Mode::Screenshot {
                 main,
                 accounts,
                 library,
-            } => {
+            }) => {
                 assert_eq!(main, std::path::PathBuf::from("/tmp/main.png"));
                 assert_eq!(accounts, std::path::PathBuf::from("/tmp/main-accounts.png"));
                 assert_eq!(library, std::path::PathBuf::from("/tmp/main-library.png"));

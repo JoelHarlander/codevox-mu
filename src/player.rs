@@ -96,6 +96,8 @@ pub struct SpotifyFeed {
     pub position: Duration,
     pub finished: bool,
     pub failed: Option<String>,
+    /// A `Playing` event arrived in this poll.
+    pub playing: bool,
 }
 
 /// In-app Spotify audio. The mock used by tests never opens a device.
@@ -1087,6 +1089,7 @@ mod tests {
                 position: self.position,
                 finished: self.finished,
                 failed: self.failed.clone(),
+                playing: false,
             }
         }
     }
