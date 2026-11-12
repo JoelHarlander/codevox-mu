@@ -1,18 +1,20 @@
 //! The native window.
 //!
 //! One iced window is the whole interface today. Search asks the Spotify
-//! mock immediately and YouTube Music on a background thread. The window
-//! does not know how either catalogue is fetched.
+//! mock immediately and YouTube Music on a background thread. Choosing a
+//! row asks the playback thread to play it. The window does not know how
+//! a catalogue is fetched or how a stream is decoded.
 
 use std::sync::Arc;
 
 use iced::alignment::{Horizontal, Vertical};
 use iced::futures::channel::oneshot;
-use iced::widget::{Space, column, container, row, scrollable, text, text_input};
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::window::{self, Settings};
-use iced::{Background, Border, Color, Element, Fill, Size, Subscription, Task};
+use iced::{Background, Border, Color, Element, Fill, Shadow, Size, Subscription, Task};
 
 use crate::music::{self, MusicService, Source, Track};
+use crate::player::{self, Phase};
 use crate::youtube_music::YouTubeMusic;
 
 /// A blocking catalogue call. The iced executor is not a Tokio runtime, so
@@ -79,6 +81,11 @@ enum Message {
         generation: u64,
         result: Result<Vec<Track>, music::Error>,
     },
+    Play(Track),
+    TogglePlayback,
+    StopPlayback,
+    NextTrack,
+    Tick,
 }
 
 struct Shell {
@@ -97,6 +104,9 @@ struct Shell {
     generation: u64,
     spotify: music::MockService,
     youtube: BackgroundSearch,
+    playback: player::Playback,
+    /// A clock tick is already waiting. Keeps the 200 ms timer from stacking.
+    clock_armed: bool,
 }
 
 pub fn run(mode: Mode) -> iced::Result {
@@ -270,6 +280,18 @@ fn a_stale_youtube_reply_does_not_replace_the_current_query() {
     );
 }
 
+#[test]
+fn smoke_play_does_not_start_the_clock() {
+    let mut shell = test_shell(Mode::Smoke);
+    let track = music::MockService::youtube_music()
+        .resolve("yt-kitchen-radio")
+        .expect("mock track");
+    let _ = shell.update(Message::Play(track));
+    assert!(!shell.clock_armed);
+    assert_eq!(shell.playback.phase(), Phase::Idle);
+    let _ = Shell::view(&shell);
+}
+
 #[cfg(test)]
 fn test_shell(mode: Mode) -> Shell {
     let youtube = music::MockService::youtube_music();
@@ -284,7 +306,13 @@ impl Shell {
         }
 
         let youtube = YouTubeMusic::new();
-        Self::with_youtube(mode, Arc::new(move |query| youtube.search(query)))
+        let mut shell = Self::with_youtube(mode, Arc::new(move |query| youtube.search(query)));
+        // Smoke must not open a device or resolve a stream. The dormant
+        // handle drops every command.
+        if mode == Mode::Run {
+            shell.playback = player::Playback::start();
+        }
+        shell
     }
 
     fn with_youtube(mode: Mode, youtube: BackgroundSearch) -> Self {
@@ -298,6 +326,8 @@ impl Shell {
             generation: 0,
             spotify: music::MockService::spotify(),
             youtube,
+            playback: player::Playback::dormant(),
+            clock_armed: false,
         }
     }
 
@@ -309,6 +339,47 @@ impl Shell {
                 self.apply_youtube(generation, result);
                 Task::none()
             }
+            Message::Play(track) => {
+                self.playback.play_now(track);
+                self.arm_clock()
+            }
+            Message::TogglePlayback => {
+                if self.playback.phase() == Phase::Playing {
+                    self.playback.pause();
+                } else {
+                    self.playback.play();
+                }
+                self.arm_clock()
+            }
+            Message::StopPlayback => {
+                self.playback.stop();
+                self.arm_clock()
+            }
+            Message::NextTrack => {
+                self.playback.next();
+                self.arm_clock()
+            }
+            Message::Tick => self.on_tick(),
+        }
+    }
+
+    /// Redraw while a track is loading or playing. One sleeping thread per
+    /// tick, same shape as search, because the window executor is not Tokio.
+    fn arm_clock(&mut self) -> Task<Message> {
+        if self.mode != Mode::Run || self.clock_armed {
+            return Task::none();
+        }
+        self.clock_armed = true;
+        Task::perform(wait(std::time::Duration::from_millis(200)), |_| {
+            Message::Tick
+        })
+    }
+
+    fn on_tick(&mut self) -> Task<Message> {
+        self.clock_armed = false;
+        match self.playback.phase() {
+            Phase::Loading | Phase::Playing => self.arm_clock(),
+            Phase::Idle | Phase::Paused | Phase::Stopped => Task::none(),
         }
     }
 
@@ -445,6 +516,7 @@ impl Shell {
 
         let content = content
             .push(scrollable(results).width(Fill).height(Fill))
+            .push(now_playing(shell))
             .width(Fill)
             .height(Fill);
         let panel = container(content)
@@ -488,6 +560,16 @@ fn status_line(shell: &Shell) -> Option<Element<'_, Message>> {
 }
 
 fn result_row(track: &Track) -> Element<'_, Message> {
+    let play = Message::Play(track.clone());
+    button(result_body(track))
+        .on_press(play)
+        .width(Fill)
+        .padding([6.0, 0.0])
+        .style(result_button)
+        .into()
+}
+
+fn result_body(track: &Track) -> Element<'_, Message> {
     let mut details = column![
         text(&track.title)
             .font(crate::theme::BODY)
@@ -529,6 +611,192 @@ fn result_row(track: &Track) -> Element<'_, Message> {
     .align_y(Vertical::Center)
     .width(Fill)
     .into()
+}
+
+fn now_playing(shell: &Shell) -> Element<'_, Message> {
+    let now = shell.playback.now();
+    let idle = now.title.is_empty();
+    let title = if idle {
+        "Nothing playing".to_string()
+    } else {
+        now.title.clone()
+    };
+    let title_color = if idle {
+        crate::theme::TEXT_SECONDARY
+    } else {
+        crate::theme::TEXT_PRIMARY
+    };
+
+    let mut details = column![
+        text(title)
+            .font(crate::theme::BODY)
+            .size(BODY_SIZE)
+            .color(title_color)
+    ]
+    .spacing(2)
+    .width(Fill);
+
+    if !now.artist.is_empty() {
+        details = details.push(
+            text(now.artist.clone())
+                .font(crate::theme::BODY)
+                .size(META_SIZE)
+                .color(crate::theme::TEXT_SECONDARY),
+        );
+    }
+    if let Some(note) = now.note.clone() {
+        details = details.push(
+            text(note)
+                .font(crate::theme::BODY)
+                .size(META_SIZE)
+                .color(crate::theme::WARNING),
+        );
+    }
+    if let Some(error) = now.error.clone() {
+        details = details.push(
+            text(error)
+                .font(crate::theme::BODY)
+                .size(META_SIZE)
+                .color(crate::theme::DESTRUCTIVE),
+        );
+    }
+
+    let time = match now.phase {
+        Phase::Loading => "Loading".to_string(),
+        Phase::Idle if idle => String::new(),
+        _ => format!(
+            "{} / {}",
+            format_duration(now.elapsed),
+            format_duration(now.duration)
+        ),
+    };
+
+    let (play_label, play_message) = if now.can_pause {
+        ("Pause", Some(Message::TogglePlayback))
+    } else if now.can_play {
+        ("Play", Some(Message::TogglePlayback))
+    } else {
+        ("Play", None)
+    };
+
+    let controls = row![
+        text(time)
+            .font(crate::theme::BODY)
+            .size(META_SIZE)
+            .color(crate::theme::TEXT_TERTIARY),
+        transport_button(play_label, play_message, true),
+        transport_button("Next", now.can_next.then_some(Message::NextTrack), false,),
+        transport_button("Stop", now.can_stop.then_some(Message::StopPlayback), false,),
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center);
+
+    container(
+        row![details, controls]
+            .spacing(ROW_SPACING)
+            .align_y(Vertical::Center),
+    )
+    .width(Fill)
+    .padding([10.0, 12.0])
+    .style(transport_bar)
+    .into()
+}
+
+fn transport_button(
+    label: &'static str,
+    message: Option<Message>,
+    primary: bool,
+) -> Element<'static, Message> {
+    button(text(label).font(crate::theme::BODY).size(META_SIZE))
+        .on_press_maybe(message)
+        .padding([6.0, 10.0])
+        .style(move |_theme, status| transport_button_style(status, primary))
+        .into()
+}
+
+fn transport_bar(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        text_color: Some(crate::theme::TEXT_PRIMARY),
+        background: Some(crate::theme::DARK_LIGHT.into()),
+        border: Border {
+            color: crate::theme::HAIRLINE,
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        shadow: Shadow {
+            blur_radius: crate::theme::GLOW,
+            ..Shadow::default()
+        },
+        ..container::Style::default()
+    }
+}
+
+fn transport_button_style(status: button::Status, primary: bool) -> button::Style {
+    let (background, text_color) = if primary {
+        (crate::theme::ACCENT, crate::theme::ON_ACCENT)
+    } else {
+        (crate::theme::DARK_LIGHTER, crate::theme::TEXT_PRIMARY)
+    };
+    let (background, text_color) = match status {
+        button::Status::Disabled => (crate::theme::DARK_LIGHT, crate::theme::TEXT_TERTIARY),
+        button::Status::Hovered | button::Status::Pressed if !primary => {
+            (crate::theme::DARK_LIGHTER, crate::theme::TEXT_PRIMARY)
+        }
+        button::Status::Hovered | button::Status::Pressed => (background, text_color),
+        button::Status::Active => (background, text_color),
+    };
+
+    button::Style {
+        background: Some(Background::Color(background)),
+        text_color,
+        border: Border {
+            color: crate::theme::HAIRLINE,
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        shadow: Shadow {
+            blur_radius: crate::theme::GLOW,
+            ..Shadow::default()
+        },
+        snap: false,
+    }
+}
+
+fn result_button(_theme: &iced::Theme, status: button::Status) -> button::Style {
+    let background = match status {
+        button::Status::Hovered | button::Status::Pressed => {
+            Some(Background::Color(crate::theme::DARK_LIGHTER))
+        }
+        button::Status::Active | button::Status::Disabled => None,
+    };
+    button::Style {
+        background,
+        text_color: crate::theme::TEXT_PRIMARY,
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: 0.0.into(),
+        },
+        shadow: Shadow {
+            blur_radius: crate::theme::GLOW,
+            ..Shadow::default()
+        },
+        snap: false,
+    }
+}
+
+async fn wait(duration: std::time::Duration) {
+    let (sender, receiver) = oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("playback-clock".into())
+        .spawn(move || {
+            std::thread::sleep(duration);
+            let _ = sender.send(());
+        });
+    if spawned.is_err() {
+        return;
+    }
+    let _ = receiver.await;
 }
 
 fn subtitle(track: &Track) -> String {

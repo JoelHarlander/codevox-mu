@@ -11,6 +11,7 @@ Draft v1, 11 Nov 2026. Still to refine with Joel.
 - Visual style follows CodeVox. Decided 11 Nov 2026. See [Visual style follows CodeVox](decisions.md#11-nov-2026--visual-style-follows-codevox).
 - A services/backend trait plus a mock.
 - YouTube Music search. Unauthenticated song search through ytmapi-rs (MIT), merged with the Spotify mock. See [YouTube Music search uses ytmapi-rs](decisions.md#11-nov-2026--youtube-music-search-uses-ytmapi-rs).
+- YouTube Music playback. A search result plays in the window. Spotify tracks in the queue are skipped. See [Spotify via librespot, YouTube Music for everyone else](decisions.md#11-nov-2026--spotify-via-librespot-youtube-music-for-everyone-else).
 
 ## Now
 
@@ -18,7 +19,7 @@ Draft v1, 11 Nov 2026. Still to refine with Joel.
 
 Each of the first two is its own small PR, in this order:
 
-- Spotify sign-in (OAuth PKCE, Web API library): library, playlists, and liked songs.
+- Spotify sign-in and playback via librespot.
 - librespot playback spike. In-app playback; free accounts fall back to YouTube Music.
 - YouTube Music sign-in.
 - One search across both services.
@@ -35,3 +36,4 @@ Each of the first two is its own small PR, in this order:
 - A tray or mini player.
 - Synced lyrics.
 - Local files.
+- Public release: revisit Spotify access (librespot block risk).
