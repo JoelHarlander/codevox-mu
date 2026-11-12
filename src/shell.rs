@@ -266,6 +266,8 @@ struct Shell {
     playlist_tracks: Vec<Track>,
     playlist_name: String,
     playlist_source: Option<Source>,
+    /// Why this playlist has no tracks. Not an error banner.
+    playlist_note: Option<String>,
     library_loading: bool,
     /// Bumped when a YouTube Music sign-in or library fetch starts, so a
     /// slower reply cannot overwrite a newer one. Spotify sign-in uses
@@ -573,6 +575,57 @@ fn account_states_render_and_a_stale_restore_is_ignored() {
 }
 
 #[test]
+fn a_finished_sign_in_becomes_signed_in_not_stopped() {
+    let mut shell = test_shell(Mode::Run);
+    let _ = shell.update(Message::SignIn);
+    assert!(matches!(shell.phase, AccountPhase::SigningIn));
+    let epoch = shell.epoch;
+    // The worker returns after the account file is saved. The window must
+    // take that phase. A dropped reply used to become "stopped before it finished".
+    let phase = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(account_task("spotify-sign-in", || AccountPhase::SignedIn {
+            name: "Joel".into(),
+        }));
+    assert_eq!(
+        phase,
+        AccountPhase::SignedIn {
+            name: "Joel".into()
+        }
+    );
+    let _ = shell.update(Message::AccountChanged { epoch, phase });
+    assert_eq!(
+        shell.phase,
+        AccountPhase::SignedIn {
+            name: "Joel".into()
+        }
+    );
+    let shown = spotify::present_account(&shell.phase).text;
+    assert_eq!(shown, "Signed in as Joel");
+    assert!(!shown.contains("stopped before it finished"), "{shown}");
+    assert_eq!(spotify_compact(&shell.phase).0, "signed in");
+    let _ = Shell::view(&shell);
+}
+
+#[test]
+fn a_panicked_sign_in_reports_the_panic_instead_of_a_dropped_reply() {
+    let phase = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(account_task("spotify-sign-in", || {
+            panic!("boom-marker");
+        }));
+    let AccountPhase::Failed { message } = phase else {
+        panic!("expected the panic text, got {phase:?}");
+    };
+    assert!(message.contains("boom-marker"), "{message}");
+    assert!(!message.contains("stopped before it finished"), "{message}");
+}
+
+#[test]
 fn smoke_play_does_not_start_the_clock() {
     let mut shell = test_shell(Mode::Smoke);
     let track = music::MockService::youtube_music()
@@ -606,7 +659,7 @@ fn the_library_says_when_both_accounts_are_signed_out() {
     assert!(!shell.library_loading);
     assert!(shell.playlists.is_empty());
     assert_eq!(
-        status_note(&shell),
+        status_note(&shell).as_deref(),
         Some("Sign in to Spotify or YouTube Music to see your library.")
     );
     assert!(notice_lines(&shell).is_empty());
@@ -790,8 +843,31 @@ fn an_empty_signed_in_library_says_there_are_no_playlists() {
         result: Ok(merge_library(Some(Ok(Vec::new())), None)),
     });
     assert!(shell.playlists.is_empty());
-    assert_eq!(status_note(&shell), Some("No playlists"));
+    assert_eq!(status_note(&shell).as_deref(), Some("No playlists"));
     assert!(notice_lines(&shell).is_empty());
+    let _ = Shell::view(&shell);
+}
+
+#[test]
+fn a_playlist_spotify_will_not_share_is_a_note() {
+    let mut shell = test_shell(Mode::Run);
+    shell.pane = Pane::Playlist;
+    shell.library_epoch = 4;
+    shell.playlist_source = Some(Source::Spotify);
+    shell.playlist_name = "Today's Top Hits".into();
+    let _ = shell.update(Message::PlaylistReady {
+        epoch: 4,
+        result: Err(music::Error::Unavailable(
+            spotify::PLAYLIST_NOT_SHARED.to_string(),
+        )),
+    });
+    assert!(shell.error.is_none());
+    assert!(shell.playlist_tracks.is_empty());
+    assert!(notice_lines(&shell).is_empty());
+    assert_eq!(
+        status_note(&shell).as_deref(),
+        Some(spotify::PLAYLIST_NOT_SHARED)
+    );
     let _ = Shell::view(&shell);
 }
 
@@ -830,7 +906,7 @@ fn a_spotify_rate_limit_keeps_the_youtube_library_and_the_sentence() {
     let lines = notice_lines(&shell);
     assert!(lines.iter().any(|line| line == limited), "{lines:?}");
     assert!(lines.iter().all(|line| !line.contains("429")), "{lines:?}");
-    assert_ne!(status_note(&shell), Some("No playlists"));
+    assert_ne!(status_note(&shell).as_deref(), Some("No playlists"));
     let _ = Shell::view(&shell);
 
     let _ = shell.update(Message::OpenPlaylist {
@@ -846,7 +922,10 @@ fn a_spotify_rate_limit_keeps_the_youtube_library_and_the_sentence() {
     assert!(shell.playlist_tracks.is_empty());
     let lines = notice_lines(&shell);
     assert!(lines.iter().any(|line| line == limited), "{lines:?}");
-    assert_ne!(status_note(&shell), Some("This playlist is empty."));
+    assert_ne!(
+        status_note(&shell).as_deref(),
+        Some("This playlist is empty.")
+    );
     let _ = Shell::view(&shell);
 }
 
@@ -1084,6 +1163,7 @@ impl Shell {
             playlist_tracks: Vec::new(),
             playlist_name: String::new(),
             playlist_source: None,
+            playlist_note: None,
             library_loading: false,
             library_epoch: 0,
             restore_started: false,
@@ -1117,7 +1197,13 @@ impl Shell {
             Message::SignIn => self.start_sign_in(),
             Message::AccountChanged { epoch, phase } => {
                 if epoch == self.epoch {
+                    log::info!(
+                        "{}",
+                        crate::diag::redact(&format!("spotify account: {phase:?}"))
+                    );
                     self.phase = phase;
+                } else {
+                    log::info!("spotify account: ignored a stale update");
                 }
                 Task::none()
             }
@@ -1328,6 +1414,7 @@ impl Shell {
         }
         match result {
             Ok(true) => {
+                log::info!("youtube music: signed in");
                 self.sign = YtSign::In;
                 self.cookie_draft.clear();
                 self.cookie_open = false;
@@ -1339,9 +1426,11 @@ impl Shell {
                 }
             }
             Err(error) => {
+                let detail = crate::diag::redact(&error.to_string());
+                log::error!("youtube music: sign-in failed: {detail}");
                 self.sign = YtSign::Out;
                 self.cookie_open = true;
-                self.error = Some(format!("YouTube Music sign-in failed: {error}"));
+                self.error = Some(format!("YouTube Music sign-in failed: {detail}"));
             }
         }
     }
@@ -1419,6 +1508,7 @@ impl Shell {
         self.playlist_name = name;
         self.playlist_source = Some(source);
         self.playlist_tracks.clear();
+        self.playlist_note = None;
         self.library_loading = true;
         self.error = None;
         self.library_epoch = self.library_epoch.wrapping_add(1);
@@ -1456,10 +1546,17 @@ impl Shell {
         match result {
             Ok(tracks) => {
                 self.playlist_tracks = tracks;
+                self.playlist_note = None;
                 self.error = None;
+            }
+            Err(error) if spotify::playlist_not_shared(&error) => {
+                self.playlist_tracks.clear();
+                self.error = None;
+                self.playlist_note = Some(spotify::PLAYLIST_NOT_SHARED.to_string());
             }
             Err(error) => {
                 self.playlist_tracks.clear();
+                self.playlist_note = None;
                 self.error = Some(playlist_failure(self.playlist_source, &error));
             }
         }
@@ -1561,6 +1658,7 @@ impl Shell {
         self.epoch = self.epoch.saturating_add(1);
         let epoch = self.epoch;
         self.phase = AccountPhase::SigningIn;
+        log::info!("spotify sign-in: started");
         let sign_in = Arc::clone(&self.sign_in);
         Task::perform(
             account_task("spotify-sign-in", move || sign_in()),
@@ -2327,8 +2425,14 @@ fn cookie_form(shell: &Shell) -> Element<'_, Message> {
     column![help, input, buttons].spacing(8).width(Fill).into()
 }
 
-fn status_note(shell: &Shell) -> Option<&'static str> {
-    match shell.pane {
+fn status_note(shell: &Shell) -> Option<String> {
+    if shell.pane == Pane::Playlist
+        && !shell.library_loading
+        && let Some(note) = &shell.playlist_note
+    {
+        return Some(note.clone());
+    }
+    let fixed = match shell.pane {
         Pane::Search if shell.spotify_pending || shell.youtube_pending => Some("Searching…"),
         Pane::Search if !shell.query.trim().is_empty() && shell.results.is_empty() => {
             Some("No matches")
@@ -2354,7 +2458,8 @@ fn status_note(shell: &Shell) -> Option<&'static str> {
             Some("This playlist is empty.")
         }
         Pane::Search | Pane::Queue | Pane::Library | Pane::Playlist | Pane::Accounts => None,
-    }
+    };
+    fixed.map(str::to_string)
 }
 
 fn notice_banner_if_any(shell: &Shell) -> Option<Element<'static, Message>> {
@@ -3083,7 +3188,17 @@ async fn account_task(
     let started = std::thread::Builder::new()
         .name(name.into())
         .spawn(move || {
-            let _ = sender.send(work());
+            // A panic used to drop this sender. The window then reported
+            // "stopped before it finished" even when account.json was saved.
+            let phase = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+                Ok(phase) => phase,
+                Err(payload) => {
+                    let message = panic_message(&payload);
+                    log::error!("{name} panicked: {message}");
+                    AccountPhase::Failed { message }
+                }
+            };
+            let _ = sender.send(phase);
         });
     if started.is_err() {
         return AccountPhase::Failed {
@@ -3093,6 +3208,26 @@ async fn account_task(
     receiver.await.unwrap_or(AccountPhase::Failed {
         message: "Spotify sign-in stopped before it finished".to_string(),
     })
+}
+
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    let text = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("Spotify sign-in hit an internal error");
+    let text = crate::diag::redact(text);
+    let owned = if text.starts_with("Spotify sign-in") {
+        text
+    } else {
+        format!("Spotify sign-in hit an internal error: {text}")
+    };
+    // Keep the banner to one line. The log already has the redacted text.
+    let mut brief: String = owned.chars().take(160).collect();
+    if owned.chars().count() > 160 {
+        brief.push('…');
+    }
+    brief
 }
 
 fn play_message(track: &Track) -> Message {

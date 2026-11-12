@@ -44,6 +44,18 @@ librespot-playback = { version = "0.8.0", default-features = false, features = [
 # Web API reads (profile, search) before a librespot session exists.
 # rustls, no OpenSSL. librespot-oauth already uses this crate.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
+# The interactive PKCE page is built here so the authorization URL can be
+# recorded before the browser opens. Refresh still uses librespot-oauth.
+# rustls, no OpenSSL. Same oauth2 major version librespot-oauth 0.8 uses.
+oauth2 = { version = "5", default-features = false, features = ["reqwest", "rustls-tls"] }
+# Opens the system browser for Spotify's authorization page.
+open = "5"
+# librespot's HTTP client asks rustls for the process-wide crypto provider.
+# This crate enables both ring and aws-lc-rs through other dependencies, so
+# rustls will not pick one on its own. Playback installs ring before connect.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# File log. librespot already emits through this crate.
+log = { version = "0.4", features = ["std"] }
 # OS media keys and the system overlay. MIT.
 # Linux is MPRIS through libdbus (the default backend). Windows is SMTC.
 # macOS is MPNowPlayingInfoCenter and MPRemoteCommandCenter.

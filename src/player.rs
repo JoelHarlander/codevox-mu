@@ -7,11 +7,15 @@
 //! off the UI thread.
 //!
 //! A Spotify track plays through a [`SpotifyEngine`] when that account can
-//! play. Otherwise the title and artist are matched on YouTube Music and
-//! that stream plays, with [`SPOTIFY_FALLBACK_NOTE`]. If nothing matches,
-//! the track is skipped and [`SPOTIFY_UNAVAILABLE_NOTE`] is set. Local files
-//! are skipped with an error. A failure to resolve a stream or open the
-//! device is stored on the snapshot. Nothing here panics for those cases.
+//! play. Otherwise the title, artist, and duration are matched on YouTube
+//! Music and that stream plays, with [`SPOTIFY_FALLBACK_NOTE`]. If nothing
+//! matches, the track is skipped and [`SPOTIFY_UNAVAILABLE_NOTE`] is set.
+//! A track librespot cannot decrypt does the same match, with
+//! [`SPOTIFY_KEY_FALLBACK_NOTE`], and stays on screen with
+//! [`SPOTIFY_KEY_UNAVAILABLE_NOTE`] when YouTube Music has no match.
+//! Local files are skipped with an error. A failure to resolve a stream or
+//! open the device is stored on the snapshot. Nothing here panics for those
+//! cases.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -30,6 +34,17 @@ pub const SPOTIFY_FALLBACK_NOTE: &str =
 /// Shown when a Spotify track cannot be played and YouTube Music has no match.
 pub const SPOTIFY_UNAVAILABLE_NOTE: &str =
     "Spotify Premium is required, and no YouTube Music match was found";
+
+/// Shown when librespot cannot decrypt a track and the YouTube Music match plays.
+///
+/// Spotify stopped giving audio keys to some Premium accounts. librespot 0.8.0
+/// is the newest release, and upstream has no fix. See librespot-org/librespot#1649.
+pub const SPOTIFY_KEY_FALLBACK_NOTE: &str =
+    "Spotify couldn't play this track, so it's playing from YouTube Music.";
+
+/// Shown when that match does not exist. The Spotify row stays put.
+pub const SPOTIFY_KEY_UNAVAILABLE_NOTE: &str =
+    "Spotify couldn't play this track, and no YouTube Music match was found.";
 
 const LOCAL_UNAVAILABLE: &str = "Local playback is not available yet";
 
@@ -96,6 +111,8 @@ pub struct SpotifyFeed {
     pub position: Duration,
     pub finished: bool,
     pub failed: Option<String>,
+    /// A `Playing` event arrived in this poll.
+    pub playing: bool,
 }
 
 /// In-app Spotify audio. The mock used by tests never opens a device.
@@ -110,7 +127,13 @@ pub trait SpotifyEngine: Send {
 
 /// Finds a YouTube Music track for a Spotify row that cannot play.
 pub trait YoutubeMatch: Send {
-    fn find(&mut self, title: &str, artists: &[String]) -> Result<Option<Track>, String>;
+    /// A YouTube Music recording of the same title, primary artist, and duration.
+    fn find(
+        &mut self,
+        title: &str,
+        artists: &[String],
+        duration: Duration,
+    ) -> Result<Option<Track>, String>;
 }
 
 /// Search text for a YouTube Music match: title, then each artist.
@@ -336,8 +359,22 @@ where
             let feed = self.spotify.poll();
             self.spotify_position = feed.position;
             if let Some(message) = feed.failed {
+                log::info!("spotify playback failed: {message}");
+                self.spotify.stop();
+                self.origin = AudioOrigin::None;
                 self.phase = Phase::Stopped;
-                self.error = Some(format!("Spotify playback failed: {message}"));
+                self.error = None;
+                if let Some(track) = self.queue.current().cloned()
+                    && track.source == Source::Spotify
+                {
+                    self.play_youtube_match(
+                        &track,
+                        SPOTIFY_KEY_FALLBACK_NOTE,
+                        SPOTIFY_KEY_UNAVAILABLE_NOTE,
+                    );
+                } else {
+                    self.error = Some(format!("Spotify playback failed: {message}"));
+                }
                 return true;
             }
             if self.phase == Phase::Playing && feed.finished {
@@ -421,7 +458,10 @@ where
             let _ = self.load_spotify(&track);
             return;
         }
-        match self.matcher.find(&track.title, &track.artists) {
+        match self
+            .matcher
+            .find(&track.title, &track.artists, track.duration)
+        {
             Ok(Some(matched)) => {
                 let _ = self.play_stream(matched, Some(SPOTIFY_FALLBACK_NOTE.to_string()));
             }
@@ -505,6 +545,24 @@ where
         }
     }
 
+    fn play_youtube_match(&mut self, track: &Track, playing: &str, missing: &str) {
+        match self
+            .matcher
+            .find(&track.title, &track.artists, track.duration)
+        {
+            Ok(Some(matched)) => {
+                let _ = self.play_stream(matched, Some(playing.to_string()));
+            }
+            Ok(None) => {
+                self.note = Some(missing.to_string());
+            }
+            Err(message) => {
+                self.error = Some(format!("Couldn't find a YouTube Music match: {message}"));
+                self.note = Some(missing.to_string());
+            }
+        }
+    }
+
     fn play_stream(&mut self, track: Track, note: Option<String>) -> Start {
         self.duration = track.duration;
         self.queue.load(track);
@@ -531,7 +589,10 @@ where
             let _ = self.load_spotify(&track);
             return;
         }
-        match self.matcher.find(&track.title, &track.artists) {
+        match self
+            .matcher
+            .find(&track.title, &track.artists, track.duration)
+        {
             Ok(Some(matched)) => {
                 self.halt_audio();
                 self.queue.remember_current();
@@ -600,7 +661,10 @@ where
                             }
                         }
                     } else {
-                        match self.matcher.find(&track.title, &track.artists) {
+                        match self
+                            .matcher
+                            .find(&track.title, &track.artists, track.duration)
+                        {
                             Ok(Some(matched)) => {
                                 // The Spotify row is replaced by the match. It is
                                 // not kept in the history.
@@ -1028,6 +1092,8 @@ mod tests {
         position: Duration,
         finished: bool,
         failed: Option<String>,
+        /// The next poll reports this, once. Models an audio key refusal.
+        fail_playback: bool,
     }
 
     impl FakeSpotify {
@@ -1042,12 +1108,19 @@ mod tests {
                 position: Duration::ZERO,
                 finished: false,
                 failed: None,
+                fail_playback: false,
             }
         }
 
         fn premium() -> Self {
             let mut engine = Self::denied();
             engine.allow = true;
+            engine
+        }
+
+        fn key_refused() -> Self {
+            let mut engine = Self::premium();
+            engine.fail_playback = true;
             engine
         }
     }
@@ -1086,7 +1159,11 @@ mod tests {
             SpotifyFeed {
                 position: self.position,
                 finished: self.finished,
-                failed: self.failed.clone(),
+                failed: self
+                    .fail_playback
+                    .then(|| "audio key error".to_string())
+                    .or_else(|| self.failed.clone()),
+                playing: false,
             }
         }
     }
@@ -1136,7 +1213,12 @@ mod tests {
     }
 
     impl YoutubeMatch for FakeMatch {
-        fn find(&mut self, title: &str, artists: &[String]) -> Result<Option<Track>, String> {
+        fn find(
+            &mut self,
+            title: &str,
+            artists: &[String],
+            _duration: Duration,
+        ) -> Result<Option<Track>, String> {
             self.queries.push(match_query(title, artists));
             if let Some(error) = &self.error {
                 return Err(error.clone());
@@ -1519,6 +1601,41 @@ mod tests {
         player.play();
         assert_eq!(state.lock().expect("spotify").loads.len(), 2);
         assert_eq!(state.lock().expect("spotify").stops, 1);
+    }
+
+    #[test]
+    fn a_refused_audio_key_plays_the_youtube_match() {
+        let mut matcher = FakeMatch::none();
+        matcher.track = Some(yt("yt-match", "Night Drive (Live)"));
+        let mut player = machine_with(FakeSpotify::key_refused(), matcher);
+
+        player.play_now(spotify("5sWHDYs0csV6RS48xBl0tH", "Night Drive"));
+        assert_eq!(player.view().phase, Phase::Playing);
+        assert!(player.poll());
+
+        let now = player.view();
+        assert_eq!(now.phase, Phase::Playing);
+        assert_eq!(now.title, "Night Drive (Live)");
+        assert_eq!(now.source, Some(Source::YouTubeMusic));
+        assert_eq!(now.note.as_deref(), Some(SPOTIFY_KEY_FALLBACK_NOTE));
+        assert!(now.error.is_none(), "{:?}", now.error);
+        assert_eq!(player.extractor.calls, ["yt-match"]);
+    }
+
+    #[test]
+    fn a_refused_audio_key_without_a_match_stays_on_the_spotify_track() {
+        let mut player = machine_with(FakeSpotify::key_refused(), FakeMatch::none());
+        player.enqueue(yt("yt-next", "Something Else"));
+        player.play_now(spotify("5sWHDYs0csV6RS48xBl0tH", "Night Drive"));
+        assert!(player.poll());
+
+        let now = player.view();
+        assert_eq!(now.phase, Phase::Stopped);
+        assert_eq!(now.title, "Night Drive");
+        assert_eq!(now.source, Some(Source::Spotify));
+        assert_eq!(now.note.as_deref(), Some(SPOTIFY_KEY_UNAVAILABLE_NOTE));
+        assert!(now.error.is_none(), "{:?}", now.error);
+        assert!(player.extractor.calls.is_empty());
     }
 
     #[test]

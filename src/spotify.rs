@@ -43,6 +43,12 @@ use librespot_playback::mixer::NoOpVolume;
 use librespot_playback::player::{Player, PlayerEvent};
 use librespot_playback::{NUM_CHANNELS, SAMPLE_RATE};
 
+use oauth2::basic::BasicClient;
+use oauth2::{
+    AuthUrl, AuthorizationCode, ClientId, CsrfToken, EndpointNotSet, EndpointSet,
+    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse, TokenUrl,
+};
+
 use crate::music::{Error, MusicService, Playlist, Source, Track};
 use crate::player::{SpotifyEngine, SpotifyFeed};
 
@@ -223,6 +229,20 @@ fn playback_session_config(device_id: &str) -> SessionConfig {
     }
 }
 
+/// Install ring as rustls's process provider, once.
+///
+/// librespot's hyper client builds `rustls::ClientConfig` from that provider.
+/// This process links rustls with both ring and aws-lc-rs, so rustls refuses
+/// to choose and panics on the first playback connection. reqwest does not
+/// install the process provider: it passes ring only to its own config. The
+/// panic used to happen after `account.json` was already written, and the
+/// sign-in thread then died without a reply.
+pub fn ensure_playback_tls() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
 /// `true` only for a Premium product string from `/v1/me`.
 pub fn premium_product(product: &str) -> bool {
     product.trim().eq_ignore_ascii_case("premium")
@@ -231,6 +251,8 @@ pub fn premium_product(product: &str) -> bool {
 /// A parsed `/v1/me` body. No token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Profile {
+    /// Spotify user id from `/v1/me`. Empty when the body omitted it.
+    pub id: String,
     pub name: String,
     pub product: String,
     pub premium: bool,
@@ -262,6 +284,7 @@ pub fn profile_from_json(body: &str) -> Result<Profile, Error> {
         }
     };
     Ok(Profile {
+        id: text_field(&value, "id"),
         premium: premium_product(&product),
         name,
         product,
@@ -539,6 +562,21 @@ fn replied_not_found(error: &Error) -> bool {
     matches!(error, Error::Unavailable(reason) if reason.contains("replied 404"))
 }
 
+/// Development-mode apps may read items only for playlists the user owns
+/// or collaborates on. Anything else is 403. Shown instead of a raw status.
+pub const PLAYLIST_NOT_SHARED: &str =
+    "Spotify only shares the songs in playlists you own or collaborate on.";
+
+/// `true` for that restriction, whether it is still the raw 403 or the note.
+pub fn playlist_not_shared(error: &Error) -> bool {
+    match error {
+        Error::Unavailable(reason) => {
+            reason == PLAYLIST_NOT_SHARED || reason.contains("replied 403")
+        }
+        Error::NotFound => false,
+    }
+}
+
 /// A Spotify id the player can load. Invalid ids never reach librespot.
 pub fn track_uri(id: &str) -> Result<SpotifyUri, String> {
     let id =
@@ -752,6 +790,7 @@ fn librespot_path(cache: &Path) -> PathBuf {
     cache.join("librespot")
 }
 
+#[derive(Clone)]
 struct SavedAccount {
     device_id: String,
     display_name: String,
@@ -939,11 +978,14 @@ impl SpotifyAccount {
     /// Load a saved sign-in, if there is one. No file means signed out, and
     /// no network. A saved free account is not connected to librespot.
     pub fn restore(&self) -> AccountPhase {
+        log::info!("spotify: restoring a saved sign-in");
         let epoch = self.snapshot_epoch();
         let Some(cache) = cache_dir() else {
+            log::info!("spotify: no cache directory, staying signed out");
             return self.current_phase();
         };
         let Some(saved) = read_saved(&account_path(&cache)) else {
+            log::info!("spotify: no saved account");
             return self.current_phase();
         };
         if !self.still(epoch) {
@@ -969,22 +1011,12 @@ impl SpotifyAccount {
             };
         }
         let epoch = self.bump_epoch();
-        let client = match OAuthClientBuilder::new(&web_client_id(), REDIRECT_URI, SCOPES.to_vec())
-            .open_in_browser()
-            .with_custom_message(BROWSER_MESSAGE)
-            .build()
-        {
-            Ok(client) => client,
-            Err(error) => {
-                return self.fail(epoch, scrub(&error.to_string(), &[]));
-            }
-        };
-        let token = match client.get_access_token() {
+        log::info!("spotify sign-in: requesting web authorization");
+        let token = match interactive_token(&web_client_id(), SCOPES, BROWSER_MESSAGE) {
             Ok(token) => token,
-            Err(error) => {
-                return self.fail(epoch, scrub(&error.to_string(), &[]));
-            }
+            Err(error) => return self.fail(epoch, error),
         };
+        log::info!("spotify sign-in: web authorization finished");
         if !self.still(epoch) {
             return self.current_phase();
         }
@@ -1110,9 +1142,15 @@ impl SpotifyAccount {
                 ),
             );
         }
+        log::info!("spotify sign-in: account saved");
 
         // Free and unknown plans must not reach Session::connect. librespot
         // exits the process when the product info is not Premium.
+        log::info!(
+            "spotify sign-in: profile {} ({})",
+            profile.name,
+            profile.product
+        );
         if !profile.premium {
             self.commit(epoch, |inner| {
                 inner.access_token = Some(refreshed.access_token.clone());
@@ -1135,6 +1173,7 @@ impl SpotifyAccount {
             prefer_saved_credentials,
         ) {
             Ok(session) => {
+                log::info!("spotify sign-in: playback session connected");
                 self.commit(epoch, |inner| {
                     inner.access_token = Some(refreshed.access_token.clone());
                     inner.access_until = Some(refreshed.expires_at);
@@ -1159,6 +1198,9 @@ impl SpotifyAccount {
         refresh_token: &str,
         prefer_saved_credentials: bool,
     ) -> Result<Session, String> {
+        // Before Session::connect. The hyper client panics without this.
+        ensure_playback_tls();
+        log::info!("spotify: connecting the playback session");
         let cred_dir = librespot_path(cache);
         restrict_dir(&cred_dir)?;
         let store = Cache::new(Some(&cred_dir), None, None, None)
@@ -1218,7 +1260,9 @@ impl SpotifyAccount {
                     .send()
                     .await
                     .map_err(|error| scrub(&error.to_string(), &[&access_token]))?;
-                if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let status = response.status();
+                log::info!("spotify web api {} {}", status.as_u16(), path_for_log(&url));
+                if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
                     return response
                         .text()
                         .await
@@ -1342,6 +1386,7 @@ impl SpotifyAccount {
 
     fn fail(&self, epoch: u64, message: String) -> AccountPhase {
         let message = brief_owned(message);
+        log::error!("spotify: {}", crate::diag::redact(&message));
         self.commit(epoch, |inner| {
             inner.session = None;
             inner.premium = false;
@@ -1363,6 +1408,183 @@ impl SpotifyAccount {
     fn lock_mut(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.lock()
     }
+}
+
+fn path_for_log(url: &str) -> &str {
+    url.split('?').next().unwrap_or(url)
+}
+
+type WebClient =
+    BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
+
+struct Minted {
+    access_token: String,
+    refresh_token: String,
+}
+
+/// Browser PKCE login. The authorization URL is recorded, then opened.
+///
+/// The listener lives on this thread and is dropped before the function
+/// returns, so the playback login can bind the same port afterwards.
+fn interactive_token(
+    client_id: &str,
+    scopes: &[&str],
+    browser_message: &str,
+) -> Result<Minted, String> {
+    let client = web_client(client_id)?;
+    let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
+    let scopes: Vec<Scope> = scopes
+        .iter()
+        .copied()
+        .map(|scope| Scope::new(scope.to_string()))
+        .collect();
+    let (url, _csrf) = client
+        .authorize_url(CsrfToken::new_random)
+        .add_scopes(scopes)
+        .set_pkce_challenge(challenge)
+        .url();
+    crate::diag::record_auth_url(url.as_str());
+    // The default browser stays the one that opens. Dropping the handle
+    // detaches that thread; it does not cancel the redirect listener.
+    let _browser = open::that_in_background(url.as_str());
+    log::info!("spotify auth: waiting for the browser redirect on 127.0.0.1:8898");
+    let code = listen_for_code(browser_message)?;
+    exchange_code(client, code, verifier)
+}
+
+fn web_client(client_id: &str) -> Result<WebClient, String> {
+    let auth_url = AuthUrl::new("https://accounts.spotify.com/authorize".to_string())
+        .map_err(|_| "Spotify's authorization URL was rejected".to_string())?;
+    let token_url = TokenUrl::new("https://accounts.spotify.com/api/token".to_string())
+        .map_err(|_| "Spotify's token URL was rejected".to_string())?;
+    let redirect = RedirectUrl::new(REDIRECT_URI.to_string())
+        .map_err(|_| "the Spotify redirect URL was rejected".to_string())?;
+    Ok(BasicClient::new(ClientId::new(client_id.to_string()))
+        .set_auth_uri(auth_url)
+        .set_token_uri(token_url)
+        .set_redirect_uri(redirect))
+}
+
+fn listen_for_code(message: &str) -> Result<String, String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:8898").map_err(|error| {
+        format!("could not listen on 127.0.0.1:8898 for the Spotify redirect ({error})")
+    })?;
+    let (mut stream, _) = listener
+        .accept()
+        .map_err(|error| format!("the Spotify redirect closed before it sent a code ({error})"))?;
+    let mut reader = std::io::BufReader::new(&mut stream);
+    let mut request_line = String::new();
+    std::io::BufRead::read_line(&mut reader, &mut request_line)
+        .map_err(|_| "could not read the Spotify redirect".to_string())?;
+    let target = request_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| "the Spotify redirect was not an HTTP request".to_string())?;
+    let code = auth_code_from_target(target)?;
+    let body = message.as_bytes();
+    let header = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(header.as_bytes())
+        .and_then(|()| stream.write_all(body))
+        .and_then(|()| stream.flush())
+        .map_err(|_| "could not answer the Spotify redirect".to_string())?;
+    drop(stream);
+    drop(listener);
+    Ok(code)
+}
+
+fn auth_code_from_target(target: &str) -> Result<String, String> {
+    let query = target.split_once('?').map(|(_, query)| query).unwrap_or("");
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if key == "code" {
+            let code = percent_decode(value);
+            if code.is_empty() {
+                return Err("Spotify did not return an authorization code.".to_string());
+            }
+            return Ok(code);
+        }
+    }
+    Err("Spotify's redirect did not include an authorization code.".to_string())
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn exchange_code(
+    client: WebClient,
+    code: String,
+    verifier: PkceCodeVerifier,
+) -> Result<Minted, String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("spotify-token".into())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                    .map_err(|error| format!("could not start the token exchange: {error}"))?;
+                let http = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(20))
+                    .user_agent("codevox-mu")
+                    .build()
+                    .map_err(|error| format!("could not start the token exchange: {error}"))?;
+                runtime.block_on(async move {
+                    client
+                        .exchange_code(AuthorizationCode::new(code.clone()))
+                        .set_pkce_verifier(verifier)
+                        .request_async(&http)
+                        .await
+                        .map_err(|error| scrub(&error.to_string(), &[code.as_str()]))
+                })
+            }));
+            let _ = sender.send(result);
+        });
+    if spawned.is_err() {
+        return Err("could not start the Spotify token exchange".to_string());
+    }
+    let result = receiver
+        .recv()
+        .map_err(|_| "the Spotify token exchange stopped before it finished".to_string())?;
+    let token = match result {
+        Ok(token) => token?,
+        Err(_) => return Err("the Spotify token exchange hit an internal error".to_string()),
+    };
+    let refresh_token = token
+        .refresh_token()
+        .map(|token| token.secret().clone())
+        .unwrap_or_default();
+    let access_token = token.access_token().secret().clone();
+    if access_token.is_empty() || refresh_token.is_empty() {
+        return Err("Spotify did not return a refresh token.".to_string());
+    }
+    Ok(Minted {
+        access_token,
+        refresh_token,
+    })
 }
 
 fn oauth_client() -> Result<librespot_oauth::OAuthClient, Error> {
@@ -1404,13 +1626,17 @@ fn playback_credentials(
     if !interactive {
         return Ok((String::new(), String::new()));
     }
-    let client = playback_oauth_client(true).map_err(|error| error.to_string())?;
-    let token = client
-        .get_access_token()
-        .map_err(|error| scrub(&error.to_string(), &[refresh_token]))?;
+    log::info!("spotify sign-in: requesting playback authorization");
+    let token = interactive_token(
+        &desktop_client_id(),
+        PLAYBACK_SCOPES,
+        PLAYBACK_BROWSER_MESSAGE,
+    )
+    .map_err(|error| scrub(&error, &[refresh_token]))?;
     if token.access_token.is_empty() {
         return Err("Spotify did not return a playback token.".to_string());
     }
+    log::info!("spotify sign-in: playback authorization finished");
     Ok((token.access_token, token.refresh_token))
 }
 
@@ -1525,16 +1751,23 @@ impl MusicService for SpotifyCatalogue {
                 let tracks = library_page_url(&format!(
                     "https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
                 ));
-                read_pages(
+                map_playlist_access(read_pages(
                     &self.account,
                     &token,
                     &tracks,
                     TRACK_CAP,
                     tracks_from_playlist_page_json,
-                )
+                ))
             }
-            other => other,
+            other => map_playlist_access(other),
         }
+    }
+}
+
+fn map_playlist_access(result: Result<Vec<Track>, Error>) -> Result<Vec<Track>, Error> {
+    match result {
+        Err(error) if playlist_not_shared(&error) => Err(brief_message(PLAYLIST_NOT_SHARED)),
+        other => other,
     }
 }
 
@@ -1548,6 +1781,8 @@ pub struct LibrespotEngine {
     finished: bool,
     failed: Option<String>,
     stop_requested: bool,
+    /// Last position written to the log, so a 200 ms tick does not fill it.
+    logged_position_ms: Option<u32>,
 }
 
 impl LibrespotEngine {
@@ -1560,6 +1795,7 @@ impl LibrespotEngine {
             finished: false,
             failed: None,
             stop_requested: false,
+            logged_position_ms: None,
         }
     }
 
@@ -1597,6 +1833,33 @@ impl LibrespotEngine {
     }
 
     fn note_event(&mut self, event: PlayerEvent) {
+        match &event {
+            PlayerEvent::Playing { position_ms, .. } => {
+                log::info!("spotify playback: playing at {position_ms}ms");
+            }
+            PlayerEvent::Paused { position_ms, .. } => {
+                log::info!("spotify playback: paused at {position_ms}ms");
+            }
+            PlayerEvent::Stopped { .. } => {
+                log::info!("spotify playback: stopped");
+            }
+            PlayerEvent::EndOfTrack { .. } => {
+                log::info!("spotify playback: end of track");
+            }
+            PlayerEvent::Unavailable { .. } => {
+                log::error!("spotify playback: track unavailable");
+            }
+            PlayerEvent::PositionChanged { position_ms, .. } => {
+                let log_it = self
+                    .logged_position_ms
+                    .is_none_or(|previous| position_ms.saturating_sub(previous) >= 1_000);
+                if log_it {
+                    self.logged_position_ms = Some(*position_ms);
+                    log::info!("spotify playback: position {position_ms}ms");
+                }
+            }
+            _ => {}
+        }
         match event {
             PlayerEvent::Playing { position_ms, .. }
             | PlayerEvent::Paused { position_ms, .. }
@@ -1682,16 +1945,22 @@ impl SpotifyEngine for LibrespotEngine {
                 }
             }
         }
+        let mut playing = false;
         for event in pending {
+            if matches!(event, PlayerEvent::Playing { .. }) {
+                playing = true;
+            }
             self.note_event(event);
         }
         if disconnected {
+            log::error!("spotify playback: event channel closed");
             self.failed = Some("Spotify playback stopped".to_string());
         }
         SpotifyFeed {
             position: self.position,
             finished: self.finished,
             failed: self.failed.clone(),
+            playing,
         }
     }
 }
@@ -1804,6 +2073,475 @@ impl Sink for PcmSink {
     }
 }
 
+/// One `--selftest` line. `detail` never contains a token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Check {
+    pub name: &'static str,
+    pub status: CheckStatus,
+    pub detail: String,
+}
+
+/// PASS keeps the process successful. SKIP is an optional step. FAIL exits non-zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckStatus {
+    Pass,
+    Fail,
+    Skip,
+}
+
+impl CheckStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Fail => "FAIL",
+            Self::Skip => "SKIP",
+        }
+    }
+
+    pub fn failed(self) -> bool {
+        matches!(self, Self::Fail)
+    }
+}
+
+impl Check {
+    fn pass(name: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            name,
+            status: CheckStatus::Pass,
+            detail: detail.into(),
+        }
+    }
+
+    fn fail(name: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            name,
+            status: CheckStatus::Fail,
+            detail: detail.into(),
+        }
+    }
+
+    fn skip(name: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            name,
+            status: CheckStatus::Skip,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn line(&self) -> String {
+        format!("{} {}: {}", self.status.label(), self.name, self.detail)
+    }
+}
+
+/// Saved-account checks. No window. `youtube` returns `Ok(None)` when that
+/// service is signed out, which is reported as SKIP.
+pub fn self_test(
+    query: &str,
+    youtube: impl FnMut(&str) -> Result<Option<usize>, String>,
+) -> Vec<Check> {
+    let saved = cache_dir().and_then(|cache| read_saved(&account_path(&cache)));
+    self_test_with(saved, query, youtube)
+}
+
+fn self_test_with(
+    saved: Option<SavedAccount>,
+    query: &str,
+    mut youtube: impl FnMut(&str) -> Result<Option<usize>, String>,
+) -> Vec<Check> {
+    const AFTER_REFRESH: [&str; 5] = [
+        "profile",
+        "playlists",
+        "liked songs",
+        "playlist tracks",
+        "spotify search",
+    ];
+    let mut lines = Vec::new();
+    let Some(saved) = saved else {
+        for name in [
+            "refresh",
+            "profile",
+            "playlists",
+            "liked songs",
+            "playlist tracks",
+            "spotify search",
+        ] {
+            lines.push(Check::fail(name, "not signed in"));
+        }
+        lines.push(youtube_check(query, &mut youtube));
+        lines.push(Check::fail("playback", "not signed in"));
+        return lines;
+    };
+
+    let account = SpotifyAccount::new();
+    let refreshed = match oauth_client().and_then(|client| {
+        client
+            .refresh_token(&saved.refresh_token)
+            .map_err(|error| brief_message(scrub(&error.to_string(), &[&saved.refresh_token])))
+    }) {
+        Ok(token) => token,
+        Err(error) => {
+            lines.push(Check::fail("refresh", error.to_string()));
+            for name in AFTER_REFRESH {
+                lines.push(Check::fail(name, "refresh failed"));
+            }
+            lines.push(youtube_check(query, &mut youtube));
+            lines.push(Check::fail("playback", "refresh failed"));
+            return lines;
+        }
+    };
+    lines.push(Check::pass("refresh", "web token refreshed"));
+    remember_rotated_refresh(&saved, &refreshed.refresh_token);
+
+    let profile = match account
+        .http_get(PROFILE_URL, &refreshed.access_token, &[])
+        .and_then(|body| profile_from_json(&body))
+    {
+        Ok(profile) => profile,
+        Err(error) => {
+            lines.push(Check::fail("profile", error.to_string()));
+            for name in &AFTER_REFRESH[1..] {
+                lines.push(Check::fail(name, "profile failed"));
+            }
+            lines.push(youtube_check(query, &mut youtube));
+            lines.push(Check::fail("playback", "profile failed"));
+            return lines;
+        }
+    };
+    lines.push(Check::pass(
+        "profile",
+        format!("{} ({})", profile.name, profile.product),
+    ));
+
+    let access = refreshed.access_token.as_str();
+    let mut openable = Vec::new();
+    match account
+        .http_get(&library_page_url(PLAYLISTS_URL), access, &[])
+        .and_then(|body| playlist_listings(&body))
+    {
+        Ok(page) => {
+            openable = page
+                .lists
+                .iter()
+                .filter(|list| playlist_is_openable(&profile.id, list))
+                .cloned()
+                .collect();
+            lines.push(Check::pass(
+                "playlists",
+                format!(
+                    "{} playlists, {} on the first page, {} readable (you own or collaborate on them)",
+                    page.total,
+                    page.lists.len(),
+                    openable.len()
+                ),
+            ));
+        }
+        Err(error) => lines.push(Check::fail("playlists", error.to_string())),
+    }
+
+    match account
+        .http_get(&library_page_url(SAVED_TRACKS_URL), access, &[])
+        .and_then(|body| track_sample(&body))
+    {
+        Ok(sample) => lines.push(Check::pass(
+            "liked songs",
+            format!(
+                "{} liked songs, {} on the first page",
+                sample.total, sample.shown
+            ),
+        )),
+        Err(error) => lines.push(Check::fail("liked songs", error.to_string())),
+    }
+
+    lines.push(open_owned_playlist(&account, access, &openable));
+
+    let mut play_tracks = Vec::new();
+    match account
+        .http_get(
+            SEARCH_URL,
+            access,
+            &[("type", "track"), ("q", query), ("limit", "10")],
+        )
+        .and_then(|body| tracks_from_search_json(&body))
+    {
+        Ok(tracks) if tracks.is_empty() => {
+            lines.push(Check::fail(
+                "spotify search",
+                format!("no tracks for \"{query}\""),
+            ));
+        }
+        Ok(tracks) => {
+            lines.push(Check::pass(
+                "spotify search",
+                format!(
+                    "{} tracks for \"{query}\", first \"{}\"",
+                    tracks.len(),
+                    tracks[0].title
+                ),
+            ));
+            play_tracks = tracks.into_iter().take(PLAYBACK_ATTEMPTS).collect();
+        }
+        Err(error) => lines.push(Check::fail("spotify search", error.to_string())),
+    }
+
+    lines.push(youtube_check(query, &mut youtube));
+    lines.push(playback_check(&account, &profile, &play_tracks));
+    lines
+}
+
+const PLAYBACK_ATTEMPTS: usize = 3;
+
+fn remember_rotated_refresh(saved: &SavedAccount, refresh_token: &str) {
+    if refresh_token.is_empty() || refresh_token == saved.refresh_token {
+        return;
+    }
+    let mut updated = saved.clone();
+    updated.refresh_token = refresh_token.to_string();
+    let Some(cache) = cache_dir() else {
+        return;
+    };
+    if let Err(error) = write_saved(&account_path(&cache), &updated) {
+        log::error!(
+            "selftest: could not store the rotated refresh token: {}",
+            crate::diag::redact(&error)
+        );
+    } else {
+        log::info!("selftest: stored a rotated refresh token");
+    }
+}
+
+fn open_owned_playlist(
+    account: &SpotifyAccount,
+    access: &str,
+    openable: &[PlaylistListing],
+) -> Check {
+    if openable.is_empty() {
+        return Check::fail(
+            "playlist tracks",
+            "no playlist you own or collaborate on in the first page",
+        );
+    }
+    let mut refused = 0;
+    for list in openable {
+        match playlist_track_page(account, access, &list.id) {
+            Ok(sample) => {
+                let mut detail = format!(
+                    "\"{}\": {} tracks, {} on the first page",
+                    list.name, sample.total, sample.shown
+                );
+                if refused > 0 {
+                    detail.push_str(&format!(
+                        "; skipped {refused} you own or collaborate on that Spotify would not share"
+                    ));
+                }
+                return Check::pass("playlist tracks", detail);
+            }
+            Err(error) if playlist_not_shared(&error) => refused += 1,
+            Err(error) => return Check::fail("playlist tracks", error.to_string()),
+        }
+    }
+    Check::fail(
+        "playlist tracks",
+        format!(
+            "Spotify would not share the songs in any of the {refused} playlists you own or collaborate on"
+        ),
+    )
+}
+
+fn playlist_track_page(
+    account: &SpotifyAccount,
+    access: &str,
+    playlist_id: &str,
+) -> Result<PageSample, Error> {
+    let items = library_page_url(&format!(
+        "https://api.spotify.com/v1/playlists/{playlist_id}/items"
+    ));
+    let body = account.http_get(&items, access, &[]).or_else(|error| {
+        if replied_not_found(&error) {
+            let tracks = library_page_url(&format!(
+                "https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
+            ));
+            account.http_get(&tracks, access, &[])
+        } else {
+            Err(error)
+        }
+    })?;
+    track_sample(&body)
+}
+
+fn playback_check(account: &SpotifyAccount, profile: &Profile, tracks: &[Track]) -> Check {
+    if !profile.premium {
+        return Check::skip("playback", "account is not Premium");
+    }
+    if tracks.is_empty() {
+        return Check::fail("playback", "no Spotify search result to play");
+    }
+    match account.restore() {
+        AccountPhase::NotPremium { .. } => Check::skip("playback", "account is not Premium"),
+        AccountPhase::Failed { message } => Check::fail("playback", message),
+        AccountPhase::SignedOut | AccountPhase::SigningIn => {
+            Check::fail("playback", "not signed in")
+        }
+        AccountPhase::SignedIn { .. } => play_attempts(account, tracks),
+    }
+}
+
+fn play_attempts(account: &SpotifyAccount, tracks: &[Track]) -> Check {
+    let mut engine = LibrespotEngine::new(account.clone());
+    let mut failures = Vec::new();
+    for track in tracks.iter().take(PLAYBACK_ATTEMPTS) {
+        match listen_once(&mut engine, &track.id) {
+            Ok(detail) => {
+                return Check::pass("playback", format!("\"{}\": {detail}", track.title));
+            }
+            Err(error) => failures.push(format!("\"{}\": {error}", track.title)),
+        }
+    }
+    Check::fail(
+        "playback",
+        trim_detail(&format!(
+            "tried {}: {}",
+            failures.len(),
+            failures.join("; ")
+        )),
+    )
+}
+
+fn listen_once(engine: &mut LibrespotEngine, track_id: &str) -> Result<String, String> {
+    engine.load(track_id)?;
+    engine.play();
+    let started = Instant::now();
+    let mut saw_playing = false;
+    let mut min_position = None;
+    let mut max_position = Duration::ZERO;
+    let mut failure = None;
+    while started.elapsed() < Duration::from_secs(8) {
+        let feed = engine.poll();
+        if let Some(error) = feed.failed.clone() {
+            failure = Some(error);
+            break;
+        }
+        saw_playing |= feed.playing;
+        min_position = Some(min_position.map_or(feed.position, |current: Duration| {
+            current.min(feed.position)
+        }));
+        if feed.position > max_position {
+            max_position = feed.position;
+        }
+        if saw_playing && min_position.is_some_and(|min| max_position > min) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    engine.stop();
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    let advanced = min_position.is_some_and(|min| max_position > min);
+    if saw_playing && advanced {
+        Ok(format!(
+            "Playing, position advanced {}ms to {}ms",
+            min_position.unwrap_or_default().as_millis(),
+            max_position.as_millis()
+        ))
+    } else if !saw_playing {
+        Err("no Playing event".to_string())
+    } else {
+        Err(format!(
+            "position did not advance (last {}ms)",
+            max_position.as_millis()
+        ))
+    }
+}
+
+fn trim_detail(detail: &str) -> String {
+    let mut brief: String = detail.chars().take(240).collect();
+    if detail.chars().count() > 240 {
+        brief.push('…');
+    }
+    brief
+}
+
+fn youtube_check(
+    query: &str,
+    youtube: &mut impl FnMut(&str) -> Result<Option<usize>, String>,
+) -> Check {
+    match youtube(query) {
+        Ok(None) => Check::skip("youtube music search", "not signed in"),
+        Ok(Some(count)) => Check::pass(
+            "youtube music search",
+            format!("{count} tracks for \"{query}\""),
+        ),
+        Err(error) => Check::fail("youtube music search", crate::diag::redact(&error)),
+    }
+}
+
+struct PageSample {
+    total: usize,
+    shown: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlaylistListing {
+    id: String,
+    name: String,
+    owner_id: String,
+    collaborative: bool,
+}
+
+struct PlaylistPage {
+    total: usize,
+    lists: Vec<PlaylistListing>,
+}
+
+fn playlist_is_openable(user_id: &str, list: &PlaylistListing) -> bool {
+    let owned = !user_id.is_empty() && list.owner_id == user_id;
+    owned || list.collaborative
+}
+
+fn playlist_listings(body: &str) -> Result<PlaylistPage, Error> {
+    let value = json_value(body)?;
+    let items = page_items(&value)?;
+    let mut lists = Vec::new();
+    for item in items {
+        let Some(playlist) = playlist_from_item(item) else {
+            continue;
+        };
+        lists.push(PlaylistListing {
+            id: playlist.id,
+            name: playlist.name,
+            owner_id: item
+                .get("owner")
+                .map(|owner| text_field(owner, "id"))
+                .unwrap_or_default(),
+            collaborative: item
+                .get("collaborative")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        });
+    }
+    Ok(PlaylistPage {
+        total: page_total(&value, lists.len()),
+        lists,
+    })
+}
+
+fn track_sample(body: &str) -> Result<PageSample, Error> {
+    let page = tracks_from_collection_page(body)?;
+    let value: serde_json::Value = serde_json::from_str(body).map_err(brief)?;
+    Ok(PageSample {
+        total: page_total(&value, page.items.len()),
+        shown: page.items.len(),
+    })
+}
+
+fn page_total(value: &serde_json::Value, fallback: usize) -> usize {
+    value
+        .get("total")
+        .and_then(serde_json::Value::as_u64)
+        .map(|total| usize::try_from(total).unwrap_or(fallback))
+        .unwrap_or(fallback)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1843,6 +2581,7 @@ mod tests {
     fn profile_json_reads_premium_and_free_fixtures() {
         let premium = profile_from_json(PREMIUM_FIXTURE).expect("premium profile");
         assert_eq!(premium.name, "Ada Vega");
+        assert_eq!(premium.id, "adavega");
         assert!(premium.premium);
         assert_eq!(premium.product, "premium");
 
@@ -2413,7 +3152,76 @@ mod tests {
 
         let missing = brief_message("Spotify replied 404: Not found");
         assert!(replied_not_found(&missing));
+        let forbidden = brief_message("Spotify replied 403: Forbidden");
+        assert!(playlist_not_shared(&forbidden));
+        assert!(playlist_not_shared(&brief_message(PLAYLIST_NOT_SHARED)));
+        assert!(!playlist_not_shared(&missing));
         let limited = brief_message("Spotify is limiting requests. Wait a moment and try again.");
         assert!(!replied_not_found(&limited));
+    }
+
+    #[test]
+    fn playback_tls_provider_lets_the_session_client_build() {
+        // librespot builds this config on the playback connection. With both
+        // rustls crypto features linked and no process provider, it panics
+        // after the account file has already been written.
+        ensure_playback_tls();
+        let _config = rustls::ClientConfig::builder();
+    }
+
+    #[test]
+    fn a_missing_account_is_not_signed_in() {
+        let lines = self_test_with(None, "love", |_| Ok(None));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.name == "refresh" && line.status == CheckStatus::Fail),
+            "{lines:?}"
+        );
+        assert!(lines.iter().all(|line| {
+            if line.name == "youtube music search" {
+                line.status == CheckStatus::Skip && line.detail.contains("not signed in")
+            } else {
+                line.status == CheckStatus::Fail && line.detail.contains("not signed in")
+            }
+        }));
+        let rendered = lines.iter().map(Check::line).collect::<Vec<_>>().join("\n");
+        assert!(
+            rendered.contains("FAIL refresh: not signed in"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("stopped before it finished"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn selftest_opens_a_playlist_the_user_owns() {
+        let body = r#"{
+            "total": 3,
+            "items": [
+                {"id":"37i9dQZF1DXcBWIGoYBM5M","name":"Today's Top Hits","collaborative":false,"owner":{"id":"spotify"}},
+                {"id":"ownedlist000000000000","name":"Harbour","collaborative":false,"owner":{"id":"adavega"}},
+                {"id":"sharedlist00000000000","name":"With Ada","collaborative":true,"owner":{"id":"friend"}}
+            ]
+        }"#;
+        let page = playlist_listings(body).expect("listings");
+        let openable: Vec<_> = page
+            .lists
+            .iter()
+            .filter(|list| playlist_is_openable("adavega", list))
+            .map(|list| list.name.as_str())
+            .collect();
+        assert_eq!(openable, ["Harbour", "With Ada"]);
+        assert!(!playlist_is_openable("adavega", &page.lists[0]));
+    }
+
+    #[test]
+    fn the_redirect_target_yields_the_authorization_code() {
+        let code =
+            auth_code_from_target("/login?state=abc&code=authorization-code-value").expect("code");
+        assert_eq!(code, "authorization-code-value");
+        assert!(auth_code_from_target("/login?error=access_denied").is_err());
     }
 }
