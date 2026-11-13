@@ -36,11 +36,10 @@ rodio = { version = "0.23.0", default-features = false, features = ["playback", 
 # YouTube Music browser cookies. The OS keyring when the session has one,
 # and a per-user file when it does not.
 keyring = "3"
-# Spotify sign-in and playback. All three crates are MIT.
-# Default features pull native-tls (OpenSSL). rustls is used instead.
-# librespot's rodio backend is cpal 0.16, which cannot link beside this
-# app's rodio 0.23 (both pull alsa-sys). Playback writes PCM into the
-# rodio 0.23 device instead. No Connect discovery crate.
+# Spotify sign-in and the Web API. librespot-playback stays in the build so the
+# old audio path still type-checks, but it is not called: newer accounts fail
+# with audio key error 0/1 (librespot-org/librespot#1649). Premium playback uses
+# Spotify Connect through reqwest. No Connect discovery crate.
 # librespot calls process::exit on a non-Premium session; this app checks
 # the account first and never connects those sessions.
 librespot-core = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }

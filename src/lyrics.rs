@@ -707,6 +707,8 @@ mod tests {
             track_id: "track-1".into(),
             loaded: None,
             upcoming: Vec::new(),
+            devices: Vec::new(),
+            volume: None,
         }
     }
 

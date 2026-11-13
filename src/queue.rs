@@ -65,6 +65,11 @@ impl Queue {
         self.current.is_some() || !self.history.is_empty()
     }
 
+    /// A track has already been heard, so previous can return to it.
+    pub fn has_history(&self) -> bool {
+        !self.history.is_empty()
+    }
+
     /// Add `track` at the end of the upcoming list.
     pub fn enqueue(&mut self, track: Track) {
         self.upcoming.push(track);

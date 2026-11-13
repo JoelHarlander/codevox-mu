@@ -340,6 +340,8 @@ mod tests {
             album: None,
             loaded: None,
             upcoming: Vec::new(),
+            devices: Vec::new(),
+            volume: None,
         }
     }
 
