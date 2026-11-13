@@ -19,6 +19,8 @@ The window is titled "CodeVox mU" and draws its own title bar, so the operating-
 
 Sign in from Accounts. Spotify opens the browser login for CodeVox mU's own Spotify app. A Premium account approves playback as well, which librespot signs in with Spotify's desktop client. Refresh tokens are stored in the OS cache directory for CodeVox mU, not in this repo. A saved sign-in that the app can no longer refresh asks to be renewed, and a rate limit is a short sentence rather than a status code. YouTube Music takes the Cookie header from music.youtube.com while that browser is signed in. The header has to include SAPISID. The cookie is stored in the OS keyring, or in the per-user config directory when the keyring is unavailable. The library lists playlists, with Liked songs first. Opening a playlist and clicking a track plays it the same way a search hit does. Sign out forgets the cookie. Search itself does not need an account. The main screen only shows whether each service is signed in.
 
+A tray icon sits in the Windows notification area, the macOS menu bar, or a Linux StatusNotifier host. The menu shows the current track, play or pause, next, previous, the mini player, show or hide, and quit. Closing the window hides it there and leaves playback running. Quit is on that menu. If Linux has no StatusNotifier host, the icon is skipped and closing the window quits, so the process is not left with no window and no icon. The title bar's Mini button, and the same row in the tray menu, shrink the window to an always-on-top player with the title, the artist, and the transport controls. Full restores the previous size. Linux uses the session bus the media controls already use. There is no extra GTK or AppIndicator package.
+
 ```sh
 cargo run --release -- --smoke
 ```
@@ -54,5 +56,6 @@ Windows needs the MSVC build tools. macOS needs the Xcode command line tools.
 `src/player.rs` is play, pause, stop, next, and previous over the mixed queue.
 `src/output.rs` decodes with symphonia and plays through cpal.
 `src/media_controls.rs` is OS media keys and the system now-playing overlay.
-`src/shell.rs` is the iced window.
+`src/tray.rs` is the tray icon and its menu.
+`src/shell.rs` is the iced window, including the mini player.
 A new concern gets its own module when it has real code.

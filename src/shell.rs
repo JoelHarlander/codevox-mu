@@ -8,6 +8,9 @@
 //! Choosing a row asks the playback thread to play it. Spotify and YouTube
 //! Music sign-in live on the Accounts pane. The window does not know how a
 //! catalogue is fetched or how a stream is decoded.
+//!
+//! A tray icon can hide this window without quitting. Mini player is the
+//! same window, shrunk and kept above other windows.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -47,6 +50,11 @@ const WINDOW_SIZE: Size = Size::new(1120.0, 740.0);
 
 /// Keeps the title bar, sidebar, and transport from collapsing together.
 const MIN_WINDOW_SIZE: Size = Size::new(880.0, 560.0);
+
+/// Compact always-on-top size. Title, artist, and the transport row.
+const MINI_SIZE: Size = Size::new(440.0, 156.0);
+
+const MINI_TITLE_HEIGHT: f32 = 40.0;
 
 const TITLE_BAR_HEIGHT: f32 = 48.0;
 const SIDEBAR_WIDTH: f32 = 196.0;
@@ -94,7 +102,8 @@ const SMOKE_TIMEOUT_EXIT_CODE: i32 = 1;
 ///
 /// `Smoke` draws a bounded number of frames and exits.
 /// `Screenshot` writes the main view and the Accounts view, then exits.
-/// `Run` stays open until the window is closed.
+/// `Run` stays open until Quit. Closing the window hides it when a tray
+/// icon is up, and quits when the tray could not be created.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mode {
     Run,
@@ -211,10 +220,16 @@ enum Message {
     ToggleMaximize,
     MinimizeWindow,
     CloseWindow,
+    /// The listener asked the window to close. Run mode may hide it instead.
+    CloseRequested(window::Id),
     Resize(Direction),
     /// The window exists. Screenshot mode records the id and does not attach media keys.
     WindowOpened(window::Id),
-    WindowResized(window::Id),
+    WindowResized(window::Id, Size),
+    /// Shrink to the mini player, or restore the previous size.
+    ToggleMini,
+    /// A click on the tray icon or its menu.
+    Tray(crate::tray::Action),
     Maximized(bool),
     Captured {
         kind: Capture,
@@ -322,6 +337,14 @@ struct Shell {
     dismissed_playback_error: Option<String>,
     window_id: Option<window::Id>,
     maximized: bool,
+    /// Compact always-on-top layout.
+    mini: bool,
+    /// The window was hidden to the tray. Playback keeps running.
+    hidden: bool,
+    /// [`crate::tray::attach`] succeeded. Close hides only in this case.
+    tray_live: bool,
+    /// Size to restore when leaving the mini player.
+    full_size: Size,
     shot_step: ShotStep,
     screenshot_main: Option<PathBuf>,
     screenshot_accounts: Option<PathBuf>,
@@ -334,7 +357,11 @@ struct Shell {
 }
 
 pub fn run(mode: Mode) -> iced::Result {
-    let boot_mode = mode.clone();
+    // Run mode does not quit on the close button. The handler hides the
+    // window when a tray icon exists, and quits when it does not. Smoke and
+    // screenshot still exit when their window closes.
+    let hide_on_close = matches!(mode, Mode::Run);
+    let boot_mode = mode;
     let mut application = iced::application(
         move || Shell::boot(boot_mode.clone()),
         Shell::update,
@@ -343,6 +370,7 @@ pub fn run(mode: Mode) -> iced::Result {
     .title(TITLE)
     .theme(Shell::theme)
     .window(window_settings())
+    .exit_on_close_request(!hide_on_close)
     .subscription(Shell::subscription)
     .default_font(crate::theme::FALLBACK);
 
@@ -1225,6 +1253,10 @@ impl Shell {
             dismissed_playback_error: None,
             window_id: None,
             maximized: false,
+            mini: false,
+            hidden: false,
+            tray_live: false,
+            full_size: WINDOW_SIZE,
             shot_step,
             screenshot_main,
             screenshot_accounts,
@@ -1391,16 +1423,23 @@ impl Shell {
                 window::toggle_maximize(id).chain(window::is_maximized(id).map(Message::Maximized))
             }),
             Message::MinimizeWindow => self.window_action(|id| window::minimize(id, true)),
-            Message::CloseWindow => self.window_action(window::close),
+            Message::CloseWindow => self.dismiss_window(),
+            Message::CloseRequested(id) => {
+                self.window_id = Some(id);
+                self.dismiss_window()
+            }
             Message::Resize(direction) => {
                 self.window_action(move |id| window::drag_resize(id, direction))
             }
+            Message::ToggleMini => self.toggle_mini(),
+            Message::Tray(action) => self.on_tray(action),
             Message::WindowOpened(id) => {
                 self.window_id = Some(id);
                 Task::none()
             }
-            Message::WindowResized(id) => {
+            Message::WindowResized(id, size) => {
                 self.window_id = Some(id);
+                self.note_full_size(size);
                 window::is_maximized(id).map(Message::Maximized)
             }
             Message::Maximized(maximized) => {
@@ -1462,6 +1501,10 @@ impl Shell {
             }
             Message::BindMedia(id) => {
                 self.window_id = Some(id);
+                if self.mode == Mode::Run {
+                    self.tray_live = crate::tray::attach();
+                    self.sync_tray();
+                }
                 Task::batch([
                     crate::media_controls::read_handle(id).map(Message::MediaBound),
                     self.restore_saved_sign_in(),
@@ -1637,6 +1680,7 @@ impl Shell {
     fn arm_clock(&mut self) -> Task<Message> {
         if self.mode == Mode::Run {
             crate::media_controls::publish(&self.playback.now());
+            self.sync_tray();
         }
         let lyrics = self.sync_lyrics();
         if self.mode != Mode::Run || self.clock_armed {
@@ -1653,6 +1697,7 @@ impl Shell {
         self.clock_armed = false;
         let now = self.playback.now();
         crate::media_controls::publish(&now);
+        self.sync_tray();
         let lyrics = self.sync_lyrics();
         let scroll = self.scroll_lyrics(now.elapsed);
         let clock = match now.phase {
@@ -2107,8 +2152,10 @@ impl Shell {
             ]),
             Mode::Run => Subscription::batch([
                 crate::media_controls::events().map(Message::Media),
+                crate::tray::events().map(Message::Tray),
                 window::open_events().map(Message::BindMedia),
-                window::resize_events().map(|(id, _size)| Message::WindowResized(id)),
+                window::close_requests().map(Message::CloseRequested),
+                window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
             ]),
         }
     }
@@ -2130,6 +2177,142 @@ impl Shell {
         }
         if let Some(error) = self.displayed_now().error {
             self.dismissed_playback_error = Some(error);
+        }
+    }
+
+    fn sync_tray(&self) {
+        if !self.tray_live {
+            return;
+        }
+        let now = self.displayed_now();
+        crate::tray::sync(crate::tray::Snapshot {
+            title: now.title,
+            artist: now.artist,
+            playing: now.can_pause,
+            mini: self.mini,
+            hidden: self.hidden,
+        });
+    }
+
+    fn note_full_size(&mut self, size: Size) {
+        if self.mini || self.maximized {
+            return;
+        }
+        if size.width < MIN_WINDOW_SIZE.width || size.height < MIN_WINDOW_SIZE.height {
+            return;
+        }
+        self.full_size = size;
+    }
+
+    /// Closing hides the window when the tray can bring it back.
+    ///
+    /// Smoke, screenshot, and a Run session with no tray quit. A hidden
+    /// process with no icon would have no way back to the window.
+    fn dismiss_window(&mut self) -> Task<Message> {
+        match dismiss_for(&self.mode, self.tray_live) {
+            Dismiss::Hide => self.set_hidden(true),
+            Dismiss::Quit => {
+                if matches!(self.mode, Mode::Run) {
+                    iced::exit()
+                } else {
+                    self.window_action(window::close)
+                }
+            }
+        }
+    }
+
+    fn set_hidden(&mut self, hidden: bool) -> Task<Message> {
+        if self.hidden == hidden {
+            self.sync_tray();
+            return if hidden {
+                Task::none()
+            } else {
+                self.window_action(window::gain_focus)
+            };
+        }
+        self.hidden = hidden;
+        self.sync_tray();
+        self.visibility_task(hidden)
+    }
+
+    fn visibility_task(&self, hidden: bool) -> Task<Message> {
+        self.window_action(move |id| {
+            if hidden {
+                window::set_mode::<Message>(id, window::Mode::Hidden)
+            } else {
+                window::minimize::<Message>(id, false)
+                    .chain(window::set_mode::<Message>(id, window::Mode::Windowed))
+                    .chain(window::gain_focus::<Message>(id))
+            }
+        })
+    }
+
+    fn toggle_mini(&mut self) -> Task<Message> {
+        if self.maximized && !self.mini {
+            self.maximized = false;
+        }
+        self.mini = !self.mini;
+        let reveal = self.hidden;
+        self.hidden = false;
+        self.sync_tray();
+        let chrome = self.chrome_task();
+        if reveal {
+            self.visibility_task(false).chain(chrome)
+        } else {
+            chrome
+        }
+    }
+
+    fn chrome_task(&self) -> Task<Message> {
+        let mini = self.mini;
+        let full = self.full_size;
+        self.window_action(move |id| {
+            if mini {
+                // Drop the large minimum before the resize, or it clamps the
+                // window. Unmaximize first so a zoomed window can shrink.
+                window::maximize::<Message>(id, false)
+                    .chain(window::set_min_size::<Message>(id, Some(MINI_SIZE)))
+                    .chain(window::set_max_size::<Message>(id, Some(MINI_SIZE)))
+                    .chain(window::resize::<Message>(id, MINI_SIZE))
+                    .chain(window::set_level::<Message>(id, window::Level::AlwaysOnTop))
+            } else {
+                window::set_level::<Message>(id, window::Level::Normal)
+                    .chain(window::set_max_size::<Message>(id, None))
+                    .chain(window::set_min_size::<Message>(id, Some(MIN_WINDOW_SIZE)))
+                    .chain(window::resize::<Message>(id, full))
+            }
+        })
+    }
+
+    fn on_tray(&mut self, action: crate::tray::Action) -> Task<Message> {
+        match action {
+            crate::tray::Action::PlayPause => {
+                if self.playback.phase() == Phase::Playing {
+                    self.playback.pause();
+                } else {
+                    self.playback.play();
+                }
+                self.arm_clock()
+            }
+            crate::tray::Action::Next => {
+                self.playback.next();
+                self.arm_clock()
+            }
+            crate::tray::Action::Previous => {
+                self.playback.previous();
+                self.arm_clock()
+            }
+            crate::tray::Action::ToggleMini => self.toggle_mini(),
+            crate::tray::Action::ToggleWindow => self.set_hidden(!self.hidden),
+            crate::tray::Action::Show => {
+                if self.hidden {
+                    self.set_hidden(false)
+                } else {
+                    self.sync_tray();
+                    self.window_action(window::gain_focus)
+                }
+            }
+            crate::tray::Action::Quit => iced::exit(),
         }
     }
 
@@ -2275,6 +2458,9 @@ impl Shell {
     }
 
     fn view(shell: &Self) -> Element<'_, Message> {
+        if shell.mini {
+            return mini_player(shell);
+        }
         let mut body = row![sidebar(shell), vertical_rule(), main_column(shell)]
             .width(Fill)
             .height(Fill);
@@ -2331,6 +2517,7 @@ fn title_bar(shell: &Shell) -> Element<'_, Message> {
 
     let maximize = if shell.maximized { "Restore" } else { "Max" };
     let buttons = row![
+        caption_button("Mini", Message::ToggleMini, false),
         caption_button("Min", Message::MinimizeWindow, false),
         caption_button(maximize, Message::ToggleMaximize, false),
         caption_button("Close", Message::CloseWindow, true),
@@ -2348,6 +2535,132 @@ fn title_bar(shell: &Shell) -> Element<'_, Message> {
     .height(TITLE_BAR_HEIGHT)
     .padding([0.0, 16.0])
     .style(title_bar_style)
+    .into()
+}
+
+/// What closing the window does. Hide only when the tray can show it again.
+#[derive(Debug, PartialEq, Eq)]
+enum Dismiss {
+    Hide,
+    Quit,
+}
+
+fn dismiss_for(mode: &Mode, tray_live: bool) -> Dismiss {
+    if matches!(mode, Mode::Run) && tray_live {
+        Dismiss::Hide
+    } else {
+        Dismiss::Quit
+    }
+}
+
+fn mini_player(shell: &Shell) -> Element<'_, Message> {
+    let now = shell.displayed_now();
+    let idle = now.title.is_empty();
+    let title = if idle {
+        "Nothing playing".to_string()
+    } else {
+        now.title.clone()
+    };
+    let title_color = if idle {
+        crate::theme::TEXT_SECONDARY
+    } else {
+        crate::theme::TEXT_PRIMARY
+    };
+
+    let brand = row![
+        container(
+            Space::new()
+                .width(ACCENT_MARK_WIDTH)
+                .height(ACCENT_MARK_HEIGHT)
+        )
+        .style(accent_mark),
+        text(if idle { TITLE } else { "Mini" })
+            .font(crate::theme::HEADING)
+            .size(13.0)
+            .color(crate::theme::TEXT_PRIMARY),
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center);
+
+    let drag = mouse_area(
+        container(brand)
+            .width(Fill)
+            .height(Fill)
+            .align_y(Vertical::Center),
+    )
+    .on_press(Message::DragWindow)
+    .interaction(iced::mouse::Interaction::Grab);
+
+    let buttons = row![
+        caption_button("Full", Message::ToggleMini, false),
+        caption_button("Close", Message::CloseWindow, true),
+    ]
+    .spacing(6)
+    .align_y(Vertical::Center);
+
+    let bar = container(
+        row![drag, buttons]
+            .align_y(Vertical::Center)
+            .width(Fill)
+            .height(Fill),
+    )
+    .width(Fill)
+    .height(MINI_TITLE_HEIGHT)
+    .padding([0.0, 12.0])
+    .style(title_bar_style);
+
+    let mut lines = column![
+        text(title)
+            .font(crate::theme::HEADING)
+            .size(BODY_SIZE)
+            .color(title_color)
+            .width(Fill)
+    ]
+    .spacing(2)
+    .width(Fill);
+    if !now.artist.is_empty() {
+        lines = lines.push(
+            text(now.artist.clone())
+                .font(crate::theme::BODY)
+                .size(META_SIZE)
+                .color(crate::theme::TEXT_SECONDARY)
+                .width(Fill),
+        );
+    }
+
+    let (play_label, play_message) = if now.can_pause {
+        ("Pause", Some(Message::TogglePlayback))
+    } else if now.can_play {
+        ("Play", Some(Message::TogglePlayback))
+    } else {
+        ("Play", None)
+    };
+    let controls = row![
+        transport_button(
+            "Prev",
+            now.can_previous.then_some(Message::PreviousTrack),
+            false,
+        ),
+        transport_button(play_label, play_message, true),
+        transport_button("Next", now.can_next.then_some(Message::NextTrack), false),
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center);
+
+    let body = container(column![lines, controls].spacing(10).width(Fill))
+        .width(Fill)
+        .height(Fill)
+        .padding([12.0, 14.0])
+        .align_y(Vertical::Center);
+
+    container(
+        column![bar, horizontal_rule(), body]
+            .width(Fill)
+            .height(Fill),
+    )
+    .width(Fill)
+    .height(Fill)
+    .style(window_background)
     .into()
 }
 
@@ -3486,6 +3799,62 @@ fn the_window_is_borderless_opaque_and_has_a_minimum_size() {
     assert!(min.width >= 800.0 && min.height >= 500.0);
     assert!(settings.size.width >= min.width);
     assert!(settings.size.height >= min.height);
+}
+
+#[test]
+fn closing_hides_only_when_the_tray_can_show_the_window() {
+    assert_eq!(dismiss_for(&Mode::Run, true), Dismiss::Hide);
+    assert_eq!(dismiss_for(&Mode::Run, false), Dismiss::Quit);
+    assert_eq!(dismiss_for(&Mode::Smoke, true), Dismiss::Quit);
+    assert_eq!(
+        dismiss_for(
+            &Mode::Screenshot {
+                main: PathBuf::from("a.png"),
+                accounts: PathBuf::from("b.png"),
+                library: PathBuf::from("c.png"),
+            },
+            true
+        ),
+        Dismiss::Quit
+    );
+}
+
+#[test]
+fn close_hides_the_window_when_the_tray_is_live() {
+    let mut shell = test_shell(Mode::Run);
+    shell.tray_live = true;
+    let _ = shell.update(Message::CloseWindow);
+    assert!(shell.hidden);
+    let _ = shell.update(Message::CloseRequested(window::Id::unique()));
+    assert!(shell.hidden);
+    let _ = shell.update(Message::Tray(crate::tray::Action::Show));
+    assert!(!shell.hidden);
+    let _ = Shell::view(&shell);
+}
+
+#[test]
+fn close_without_a_tray_does_not_hide() {
+    let mut shell = test_shell(Mode::Run);
+    let _ = shell.update(Message::CloseWindow);
+    assert!(!shell.hidden);
+}
+
+#[test]
+fn mini_player_toggles_and_keeps_the_restored_size() {
+    let mut shell = test_shell(Mode::Run);
+    let _ = shell.update(Message::WindowResized(
+        window::Id::unique(),
+        Size::new(1000.0, 700.0),
+    ));
+    assert_eq!(shell.full_size, Size::new(1000.0, 700.0));
+    let _ = shell.update(Message::ToggleMini);
+    assert!(shell.mini);
+    let _ = Shell::view(&shell);
+    let _ = shell.update(Message::WindowResized(window::Id::unique(), MINI_SIZE));
+    assert_eq!(shell.full_size, Size::new(1000.0, 700.0));
+    let _ = shell.update(Message::Tray(crate::tray::Action::ToggleMini));
+    assert!(!shell.mini);
+    let _ = Shell::view(&shell);
 }
 
 #[test]

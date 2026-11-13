@@ -2,7 +2,7 @@
 name = "codevox-mu"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.90"
 description = "Spotify and YouTube Music in one native desktop player."
 license = "MIT"
 repository = "https://github.com/JoelHarlander/codevox-mu"
@@ -66,6 +66,11 @@ log = { version = "0.4", features = ["std"] }
 # macOS is MPNowPlayingInfoCenter and MPRemoteCommandCenter.
 # Building on Linux needs pkg-config and libdbus-1-dev.
 souvlaki = "0.8.3"
+# Menu bar and notification area. MIT OR Apache-2.0.
+# Linux uses the ksni StatusNotifier backend, which is pure Rust and does
+# not link GTK or libappindicator. A missing host is skipped at runtime.
+# tray-icon 0.26 and muda 0.21 need Rust 1.90.
+tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
 
 # Release builds on Windows are GUI programs. This reattaches a parent
 # console so `--smoke` and `--screenshot` still print. Already in the
@@ -76,6 +81,11 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
 ] }
+
+# Asks the session bus whether a StatusNotifier host is running.
+# The same libdbus the media controls already link. No GTK package.
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus = "0.9"
 
 # Unsigned test installers. cargo-packager 0.11.8 reads this table.
 # RPM is not a packager format; cargo-generate-rpm 0.21.1 reads the table below.

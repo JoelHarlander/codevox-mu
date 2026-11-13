@@ -28,6 +28,7 @@ mod selftest;
 mod shell;
 mod spotify;
 mod theme;
+mod tray;
 mod youtube_account;
 mod youtube_music;
 

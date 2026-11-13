@@ -45,7 +45,7 @@ xattr -dr com.apple.quarantine "/Applications/CodeVox mU.app"
 
 ## Linux
 
-The AppImage uses the system Vulkan loader and the system X11 or Wayland libraries. Install those the same way a local build does (`libvulkan1` and the iced libraries in the README). Then:
+The AppImage uses the system Vulkan loader and the system X11 or Wayland libraries. Install those the same way a local build does (`libvulkan1` and the iced libraries in the README). The tray icon uses StatusNotifier on the session bus. A desktop that has no StatusNotifier host still runs the player, and closing the window quits instead of hiding. Then:
 
 ```sh
 chmod +x codevox-mu_*.AppImage

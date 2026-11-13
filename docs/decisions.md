@@ -86,3 +86,9 @@ vergen is pinned to 9.0.6. librespot-core's build script uses vergen-gitcl 1.0, 
 Decided. Web API calls and the PKCE sign-in use CodeVox mU's own public client id (`34edc1e59dcb447db61ea7720733cbde`). There is still no client secret. The id can be replaced at build time with `SPOTIFY_CLIENT_ID`, or at runtime with `CODEVOX_MU_SPOTIFY_CLIENT_ID`.
 
 librespot 0.8.0 keeps the desktop client id (`65b708073fc0480ea92a077233ca87bd`) for playback only. Its client-token and login5 paths reject any other id, so an access token from the Web API app cannot open a session. Premium sign-in therefore runs a second PKCE login with the desktop id, the same split spotify-player uses. A free account never starts that login.
+
+## 14 Nov 2026 — Tray icon uses tray-icon with the ksni backend
+
+Decided. The tray is [tray-icon](https://crates.io/crates/tray-icon) 0.26.1, MIT OR Apache-2.0, with default features off and the `ksni` feature on. Windows is the notification area. macOS is the menu bar. Linux is StatusNotifier over the session bus. The GTK AppIndicator backend is not enabled, so the build does not need libgtk or libayatana-appindicator, and a missing tray host cannot abort inside GTK. The player asks the session bus (the `dbus` crate, Apache-2.0 OR MIT, already required by the media controls) whether `org.kde.StatusNotifierWatcher` has an owner. No owner, or a failed icon, skips the tray and closing the window quits.
+
+[ksni](https://crates.io/crates/ksni) 0.3.7 is Unlicense. [muda](https://crates.io/crates/muda) 0.21.2 is Apache-2.0 OR MIT. [zbus](https://crates.io/crates/zbus) 5 is MIT. None of these is GPL-only. tray-icon and muda require Rust 1.90, so the package rust-version is 1.90. Closing the window hides it while the tray is up. Quit is a tray menu item. Mini player is the same borderless window, resized and set always-on-top.
