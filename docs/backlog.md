@@ -21,7 +21,7 @@ Status: Done (real screen, 3 OSes) · Built (merged, CI green on 3 OSes, not yet
 | 9 | Mixed playlists: create, save locally, and play tracks from both services | Built (PR #24) |
 | 10 | Playlist import from Spotify or YouTube Music into a mixed playlist | Not started |
 | 11 | Tray icon or mini player | Not started |
-| 12 | Synced lyrics | In progress (PR #27) |
+| 12 | Synced lyrics | Built (PR #27) |
 | 13 | Local files | Not started |
 | 14 | Release builds on GitHub Actions for all 3 OSes (artifacts only, no publishing) | Built (package workflow) |
 
