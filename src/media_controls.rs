@@ -337,6 +337,7 @@ mod tests {
             can_previous: false,
             source,
             track_id: track_id.to_string(),
+            album: None,
             loaded: None,
             upcoming: Vec::new(),
             devices: Vec::new(),

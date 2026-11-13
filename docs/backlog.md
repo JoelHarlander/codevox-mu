@@ -18,10 +18,10 @@ Status: Done (real screen, 3 OSes) · Built (merged, CI green on 3 OSes, not yet
 | 6 | OS media keys and media controls: Windows SMTC, macOS Now Playing, Linux MPRIS | Built (PR #11) |
 | 7 | Spotify library: playlists and liked songs | Built |
 | 8 | YouTube Music sign-in: library and playlists | Built (PR #15, cookie sign-in; first page of each playlist only) |
-| 9 | Mixed playlists: create, save locally, and play tracks from both services | In progress (PR #24) |
+| 9 | Mixed playlists: create, save locally, and play tracks from both services | Built (PR #24) |
 | 10 | Playlist import from Spotify or YouTube Music into a mixed playlist | Not started |
 | 11 | Tray icon or mini player | Not started |
-| 12 | Synced lyrics | Not started |
+| 12 | Synced lyrics | In progress (PR #27) |
 | 13 | Local files | Not started |
 | 14 | Release builds on GitHub Actions for all 3 OSes (artifacts only, no publishing) | Built (package workflow) |
 | 15 | Spotify Connect playback: Premium tracks play on an open Spotify device, with a device picker, seek and volume. In-app librespot audio is disabled (audio key error 0/1, librespot#1649). No open device falls back to the YouTube Music match | In progress |

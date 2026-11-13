@@ -805,7 +805,12 @@ fn is_absolute_for(desktop: Desktop, path: &str) -> bool {
     }
 }
 
-fn cache_dir() -> Option<PathBuf> {
+/// Per-user cache root for this app (`…/codevox-mu`).
+///
+/// Account tokens live here. Lyrics use a `lyrics` subdirectory of the same
+/// root. Relative env values are refused so nothing is written into the
+/// working tree.
+pub(crate) fn cache_dir() -> Option<PathBuf> {
     cache_dir_from(this_desktop(), |key| std::env::var(key).ok())
 }
 
