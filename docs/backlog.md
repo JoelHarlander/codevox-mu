@@ -1,6 +1,6 @@
 # Backlog
 
-Ranked milestones to v1. Updated 13 Nov 2026. Every run starts from this list, top first.
+Ranked milestones to v1. Updated 14 Nov 2026. Every run starts from this list, top first.
 
 **Done means working on a real screen on all 3 OSes.** That is Windows 11, macOS (Apple Silicon and Intel) and Linux, from the CI-built installer. Green CI plus a smoke run is only "Built". An item is "Done" once someone has used it on a real screen on each OS, and that person is named in the item.
 
@@ -20,7 +20,7 @@ Status: Done (real screen, 3 OSes) · Built (merged, CI green on 3 OSes, not yet
 | 8 | YouTube Music sign-in: library and playlists | Built (PR #15, cookie sign-in; first page of each playlist only) |
 | 9 | Mixed playlists: create, save locally, and play tracks from both services | Built (PR #24) |
 | 10 | Playlist import from Spotify or YouTube Music into a mixed playlist | Not started |
-| 11 | Tray icon or mini player | Not started |
+| 11 | Tray icon or mini player | Built (PR #30) |
 | 12 | Synced lyrics | Built (PR #27) |
 | 13 | Local files | Not started |
 | 14 | Release builds on GitHub Actions for all 3 OSes (artifacts only, no publishing) | Built (package workflow) |
