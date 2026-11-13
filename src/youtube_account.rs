@@ -8,7 +8,13 @@
 //! The cookie goes to the OS keyring. When that backend is missing, it goes
 //! to the per-user config directory as a file the user can read and nobody
 //! else can. It is never written into the repo, a log line, or an error.
+//!
+//! A playlist, liked songs, and the library list continue past the first
+//! page. ytmapi-rs follows each continuation token. This module stops at
+//! [`TRACK_CAP`] tracks or [`PLAYLIST_CAP`] playlists, and it does not
+//! request a continuation token it has already used.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::future::Future;
@@ -17,11 +23,15 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use futures_util::StreamExt;
 use ytmapi_rs::YtMusic;
 use ytmapi_rs::auth::BrowserToken;
 use ytmapi_rs::common::{PlaylistID, YoutubeID};
+use ytmapi_rs::continuations::ParseFromContinuable;
 use ytmapi_rs::parse::{LibraryPlaylist, PlaylistItem, TableListSong};
-use ytmapi_rs::query::{GetLibraryPlaylistsQuery, GetLibrarySongsQuery, GetPlaylistTracksQuery};
+use ytmapi_rs::query::{
+    GetLibraryPlaylistsQuery, GetLibrarySongsQuery, GetPlaylistTracksQuery, PostQuery, Query,
+};
 
 use crate::music::{Error, Playlist, Source, Track};
 use crate::youtube_music::parse_duration;
@@ -30,6 +40,14 @@ use crate::youtube_music::parse_duration;
 pub const LIKED_SONGS: &str = "liked-songs";
 
 const LIKED_SONGS_NAME: &str = "Liked songs";
+
+/// Tracks kept from one playlist or from liked songs.
+///
+/// The same ceiling Spotify uses. A continuation loop cannot grow past it.
+const TRACK_CAP: usize = 1_000;
+
+/// Library playlists kept. Liked songs is added after the cap, as on Spotify.
+const PLAYLIST_CAP: usize = 500;
 const KEYRING_SERVICE: &str = "codevox-mu";
 const KEYRING_USER: &str = "youtube-music";
 const COOKIE_FILE: &str = "youtube-music.cookie";
@@ -238,10 +256,8 @@ impl Catalogue for BrowserCatalogue {
     fn playlists(&self) -> Result<Vec<Playlist>, Error> {
         let client = self.client.clone();
         self.handle.block_on(async move {
-            let rows = client
-                .query(GetLibraryPlaylistsQuery)
-                .await
-                .map_err(|error| scrub("", &error.to_string()))?;
+            let query = GetLibraryPlaylistsQuery;
+            let rows = collect_query(&client, &query, PLAYLIST_CAP).await?;
             Ok(with_liked(
                 rows.into_iter().filter_map(playlist_from_library).collect(),
             ))
@@ -253,20 +269,15 @@ impl Catalogue for BrowserCatalogue {
         let playlist_id = playlist_id.to_string();
         self.handle.block_on(async move {
             if playlist_id == LIKED_SONGS {
-                let songs = client
-                    .query(GetLibrarySongsQuery::default())
-                    .await
-                    .map_err(|error| scrub("", &error.to_string()))?;
+                let query = GetLibrarySongsQuery::default();
+                let songs = collect_query(&client, &query, TRACK_CAP).await?;
                 return tracks_from_parts(
                     songs.into_iter().map(listed_from_library_song).collect(),
                 );
             }
             let browse = browse_playlist_id(&playlist_id);
             let query = GetPlaylistTracksQuery::new(PlaylistID::from_raw(browse));
-            let items = client
-                .query(query)
-                .await
-                .map_err(|error| scrub("", &error.to_string()))?;
+            let items = collect_query(&client, &query, TRACK_CAP).await?;
             let listed = items
                 .into_iter()
                 .filter_map(listed_from_playlist_item)
@@ -274,6 +285,131 @@ impl Catalogue for BrowserCatalogue {
             tracks_from_parts(listed)
         })
     }
+}
+
+/// One continuation page. `continuation` is the token for the next page.
+struct ContinuationPage<T> {
+    items: Vec<T>,
+    continuation: Option<String>,
+}
+
+/// Follow continuation tokens until the list ends, a token repeats, or `cap`
+/// items have been kept.
+///
+/// `fetch(None)` is the first page. A later call gets the previous page's
+/// token. The token is trimmed. A blank token ends the walk. A token that
+/// was already requested is not requested again.
+fn walk_continuations<T, F>(cap: usize, mut fetch: F) -> Vec<T>
+where
+    F: FnMut(Option<&str>) -> ContinuationPage<T>,
+{
+    if cap == 0 {
+        return Vec::new();
+    }
+    let mut seen = HashSet::new();
+    let mut kept = Vec::new();
+    let mut pending: Option<String> = None;
+    loop {
+        if kept.len() >= cap {
+            break;
+        }
+        let request = pending.as_deref();
+        if let Some(token) = request
+            && !seen.insert(token.to_string())
+        {
+            break;
+        }
+        let page = fetch(request);
+        let room = cap - kept.len();
+        let available = page.items.len();
+        kept.extend(page.items.into_iter().take(room));
+        if available > room || kept.len() >= cap {
+            break;
+        }
+        pending = usable_token(page.continuation);
+        if pending.is_none() {
+            break;
+        }
+    }
+    kept
+}
+
+fn usable_token(token: Option<String>) -> Option<String> {
+    let token = token?.trim().to_string();
+    if token.is_empty() { None } else { Some(token) }
+}
+
+/// `true` while another streamed page should be requested.
+///
+/// Pages and items share `cap`, so a continuation that returns nothing
+/// cannot be followed forever.
+fn another_stream_page<T>(pages: &[Vec<T>], cap: usize) -> bool {
+    cap > 0 && pages.len() < cap && page_len(pages) < cap
+}
+
+fn page_len<T>(pages: &[Vec<T>]) -> usize {
+    pages.iter().map(Vec::len).sum()
+}
+
+/// Read every continuation page ytmapi-rs yields, then apply [`walk_continuations`].
+///
+/// The crate follows YouTube's continuation token. The tokens used here only
+/// link those pages so the cap and the repeated-token stop stay in one place.
+async fn collect_query<Q, T>(
+    client: &YtMusic<BrowserToken>,
+    query: &Q,
+    cap: usize,
+) -> Result<Vec<T>, Error>
+where
+    Q: Query<BrowserToken> + PostQuery,
+    Q::Output: ParseFromContinuable<Q> + IntoIterator<Item = T>,
+{
+    let mut stream = std::pin::pin!(client.stream(query));
+    let mut pages = Vec::new();
+    while another_stream_page(&pages, cap) {
+        match stream.next().await {
+            None => break,
+            Some(Err(error)) => return Err(scrub("", &error.to_string())),
+            Some(Ok(page)) => pages.push(page.into_iter().collect()),
+        }
+    }
+    Ok(replay_pages(pages, cap))
+}
+
+fn replay_pages<T>(mut pages: Vec<Vec<T>>, cap: usize) -> Vec<T> {
+    let count = pages.len();
+    if count == 0 {
+        return Vec::new();
+    }
+    let continuations: Vec<Option<String>> = (0..count)
+        .map(|index| {
+            if index + 1 == count {
+                None
+            } else {
+                Some(format!("p{}", index + 1))
+            }
+        })
+        .collect();
+    walk_continuations(cap, |token| {
+        let index = match token {
+            None => 0,
+            Some(token) => token
+                .strip_prefix('p')
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|index| *index < count)
+                .unwrap_or(count),
+        };
+        if index >= count {
+            return ContinuationPage {
+                items: Vec::new(),
+                continuation: None,
+            };
+        }
+        ContinuationPage {
+            items: std::mem::take(&mut pages[index]),
+            continuation: continuations[index].clone(),
+        }
+    })
 }
 
 fn playlist_from_library(row: LibraryPlaylist) -> Option<Playlist> {
@@ -1057,5 +1193,146 @@ mod tests {
         assert!(error.to_string().contains("cancelled"), "{error}");
         assert!(!account.signed_in());
         assert!(secrets.load().expect("load").is_none());
+    }
+
+    const PLAYLIST_PAGES: &str =
+        include_str!("../tests/fixtures/youtube_music_playlist_pages.json");
+
+    #[derive(serde::Deserialize)]
+    struct FixtureFile {
+        ordered: Vec<FixturePage>,
+        repeated_token: Vec<FixturePage>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct FixturePage {
+        token: Option<String>,
+        continuation: Option<String>,
+        tracks: Vec<FixtureTrack>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct FixtureTrack {
+        id: String,
+        title: String,
+        artists: Vec<String>,
+        album: Option<String>,
+        duration: String,
+    }
+
+    fn listed_fixture(track: &FixtureTrack) -> ListedTrack {
+        ListedTrack {
+            id: track.id.clone(),
+            title: track.title.clone(),
+            artists: track.artists.clone(),
+            album: track.album.clone(),
+            duration: track.duration.clone(),
+        }
+    }
+
+    fn walk_fixture(pages: &[FixturePage], cap: usize) -> (Vec<Track>, usize) {
+        let mut calls = 0;
+        let listed = walk_continuations(cap, |token| {
+            calls += 1;
+            if calls > pages.len() + 1 {
+                return ContinuationPage {
+                    items: Vec::new(),
+                    continuation: None,
+                };
+            }
+            let page = pages
+                .iter()
+                .find(|page| page.token.as_deref() == token)
+                .expect("fixture page");
+            ContinuationPage {
+                items: page.tracks.iter().map(listed_fixture).collect(),
+                continuation: page.continuation.clone(),
+            }
+        });
+        (tracks_from_parts(listed).expect("tracks"), calls)
+    }
+
+    #[test]
+    fn playlist_pages_follow_continuations_in_order_and_stop() {
+        let fixture: FixtureFile = serde_json::from_str(PLAYLIST_PAGES).expect("fixture");
+        let (tracks, calls) = walk_fixture(&fixture.ordered, TRACK_CAP);
+        assert_eq!(calls, 3);
+        assert_eq!(
+            tracks
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            ["aaaaaaaaaaa", "bbbbbbbbbbb", "ddddddddddd"]
+        );
+        assert!(
+            tracks
+                .iter()
+                .all(|track| track.source == Source::YouTubeMusic)
+        );
+        assert_eq!(tracks[0].title, "Night Drive");
+        assert_eq!(tracks[0].artists, ["Ada Vega"]);
+        assert_eq!(tracks[0].album.as_deref(), Some("Low Glow"));
+        assert_eq!(tracks[0].duration, Duration::from_secs(192));
+        assert_eq!(tracks[1].artists, ["Ada Vega", "North Line"]);
+        assert_eq!(tracks[1].duration, Duration::from_secs(241));
+        assert_eq!(tracks[2].title, "Paper Boats");
+        assert_eq!(tracks[2].album, None);
+        assert_eq!(tracks[2].duration, Duration::from_secs(164));
+
+        let (capped, calls) = walk_fixture(&fixture.ordered, 1);
+        assert_eq!(calls, 1, "the cap stops before the next continuation");
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].id, "aaaaaaaaaaa");
+
+        let (repeated, calls) = walk_fixture(&fixture.repeated_token, TRACK_CAP);
+        assert_eq!(calls, 2, "a repeated continuation is not requested again");
+        assert_eq!(
+            repeated
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            ["aaaaaaaaaaa", "bbbbbbbbbbb"]
+        );
+    }
+
+    #[test]
+    fn streamed_pages_stop_at_the_cap_without_another_page() {
+        let mut pages = Vec::new();
+        assert!(another_stream_page(&pages, 2));
+        pages.push(vec!["a"]);
+        assert!(another_stream_page(&pages, 2));
+        pages.push(vec!["b", "c"]);
+        assert!(
+            !another_stream_page(&pages, 2),
+            "two items fill the cap, so the next page is not requested"
+        );
+        assert_eq!(replay_pages(pages, 2), ["a", "b"]);
+
+        let full = vec![vec!["a", "b"]];
+        assert!(!another_stream_page(&full, 2));
+        assert_eq!(replay_pages(full, 2), ["a", "b"]);
+        assert!(replay_pages(Vec::<Vec<&str>>::new(), 10).is_empty());
+        assert!(
+            walk_continuations(0, |_| ContinuationPage {
+                items: vec!["a"],
+                continuation: Some("next".into()),
+            })
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_blank_continuation_ends_the_walk() {
+        let tracks = walk_continuations(10, |token| {
+            if token.is_none() {
+                ContinuationPage {
+                    items: vec!["first".to_string()],
+                    continuation: Some("   ".into()),
+                }
+            } else {
+                panic!("a blank token is not requested");
+            }
+        });
+        assert_eq!(tracks, ["first"]);
     }
 }

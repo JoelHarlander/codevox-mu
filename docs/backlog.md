@@ -17,9 +17,9 @@ Status: Done (real screen, 3 OSes) · Built (merged, CI green on 3 OSes, not yet
 | 5 | Mixed queue: add, reorder and remove tracks from either service, with next and previous across sources | Built |
 | 6 | OS media keys and media controls: Windows SMTC, macOS Now Playing, Linux MPRIS | Built (PR #11) |
 | 7 | Spotify library: playlists and liked songs | Built |
-| 8 | YouTube Music sign-in: library and playlists | Built (PR #15, cookie sign-in; first page of each playlist only) |
+| 8 | YouTube Music sign-in: library and playlists | Built (PR #15, cookie sign-in) |
 | 9 | Mixed playlists: create, save locally, and play tracks from both services | Built (PR #24) |
-| 10 | Playlist import from Spotify or YouTube Music into a mixed playlist | Not started |
+| 10 | Playlist import from Spotify or YouTube Music into a mixed playlist | Built (PR #29) |
 | 11 | Tray icon or mini player | Built (PR #30) |
 | 12 | Synced lyrics | Built (PR #27) |
 | 13 | Local files | Not started |

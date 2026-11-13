@@ -18,6 +18,9 @@ ytmapi-rs = { version = "0.3.4", default-features = false, features = ["rustls"]
 # The window executor is not a Tokio runtime. Search and stream
 # extraction run here, off the UI thread.
 tokio = { version = "1.52", features = ["rt-multi-thread", "time", "net"] }
+# YouTube Music playlist reads follow continuation pages. StreamExt is the
+# iterator for that. std only: no executor of its own.
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 # The theme test reads design/tokens.json. Search re-reads the InnerTube body.
 # Playlists use serde's derive for the versioned JSON file.
 serde = { version = "1", features = ["derive"] }

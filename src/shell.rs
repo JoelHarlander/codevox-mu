@@ -195,6 +195,8 @@ enum Message {
         epoch: u64,
         result: Result<Vec<Track>, music::Error>,
     },
+    /// Save the open Spotify or YouTube Music playlist as a mixed playlist.
+    ImportPlaylist,
     ShowSearch,
     ShowQueue,
     ShowMixes,
@@ -304,8 +306,13 @@ struct Shell {
     playlists: Vec<Playlist>,
     playlist_tracks: Vec<Track>,
     playlist_name: String,
+    /// Service id of the open playlist. Import matches on this.
+    playlist_id: String,
     playlist_source: Option<Source>,
-    /// Why this playlist has no tracks. Not an error banner.
+    /// The tracks finished loading. Import stays off while that request
+    /// is in flight or after it failed.
+    playlist_loaded: bool,
+    /// Why this playlist has no tracks, or the result of Import. Not an error banner.
     playlist_note: Option<String>,
     /// Mixed playlists saved on this device.
     mixes: playlists::Store,
@@ -1228,7 +1235,9 @@ impl Shell {
             playlists: Vec::new(),
             playlist_tracks: Vec::new(),
             playlist_name: String::new(),
+            playlist_id: String::new(),
             playlist_source: None,
+            playlist_loaded: false,
             playlist_note: None,
             mixes: playlists::Store::memory(),
             mix_id: None,
@@ -1468,6 +1477,10 @@ impl Shell {
                 self.finish_playlist(epoch, result);
                 Task::none()
             }
+            Message::ImportPlaylist => {
+                self.import_open_playlist();
+                Task::none()
+            }
             Message::ShowSearch => {
                 self.library_epoch = self.library_epoch.wrapping_add(1);
                 self.back_to_search();
@@ -1478,6 +1491,10 @@ impl Shell {
                 self.pane = Pane::Library;
                 self.playlist_tracks.clear();
                 self.playlist_name.clear();
+                self.playlist_id.clear();
+                self.playlist_source = None;
+                self.playlist_loaded = false;
+                self.playlist_note = None;
                 self.library_loading = false;
                 self.error = None;
                 Task::none()
@@ -1785,7 +1802,10 @@ impl Shell {
         self.pane = Pane::Library;
         self.playlist_tracks.clear();
         self.playlist_name.clear();
+        self.playlist_id.clear();
         self.playlist_source = None;
+        self.playlist_loaded = false;
+        self.playlist_note = None;
         self.error = None;
         self.spotify_error = None;
         self.library_epoch = self.library_epoch.wrapping_add(1);
@@ -1833,7 +1853,9 @@ impl Shell {
     fn open_playlist(&mut self, source: Source, id: String, name: String) -> Task<Message> {
         self.pane = Pane::Playlist;
         self.playlist_name = name;
+        self.playlist_id = id.clone();
         self.playlist_source = Some(source);
+        self.playlist_loaded = false;
         self.playlist_tracks.clear();
         self.playlist_note = None;
         self.library_loading = true;
@@ -1873,19 +1895,58 @@ impl Shell {
         match result {
             Ok(tracks) => {
                 self.playlist_tracks = tracks;
+                self.playlist_loaded = true;
                 self.playlist_note = None;
                 self.error = None;
             }
             Err(error) if spotify::playlist_not_shared(&error) => {
                 self.playlist_tracks.clear();
+                self.playlist_loaded = false;
                 self.error = None;
                 self.playlist_note = Some(spotify::PLAYLIST_NOT_SHARED.to_string());
             }
             Err(error) => {
                 self.playlist_tracks.clear();
+                self.playlist_loaded = false;
                 self.playlist_note = None;
                 self.error = Some(playlist_failure(self.playlist_source, &error));
             }
+        }
+    }
+
+    /// Save the open library playlist into the mixed-playlist store.
+    ///
+    /// The tracks are the ones just loaded, which already include every
+    /// continuation page the catalogue returned. Doing it again replaces
+    /// that saved list.
+    fn import_open_playlist(&mut self) {
+        if import_message(self).is_none() {
+            return;
+        }
+        let Some(source) = self.playlist_source else {
+            return;
+        };
+        match self.mixes.import_from(
+            source,
+            &self.playlist_id,
+            &self.playlist_name,
+            self.playlist_tracks.clone(),
+        ) {
+            Ok(outcome) => {
+                let (id, verb) = match outcome {
+                    playlists::ImportOutcome::Created { id } => (id, "Imported"),
+                    playlists::ImportOutcome::Updated { id } => (id, "Updated"),
+                };
+                let name = self
+                    .mixes
+                    .playlist(&id)
+                    .map(|playlist| playlist.name().to_string())
+                    .unwrap_or_else(|| self.playlist_name.clone());
+                self.mix_id = Some(id);
+                self.mix_error = None;
+                self.playlist_note = Some(format!("{verb} {name}."));
+            }
+            Err(error) => self.mix_error = Some(error),
         }
     }
 
@@ -1894,6 +1955,10 @@ impl Shell {
         self.playlists.clear();
         self.playlist_tracks.clear();
         self.playlist_name.clear();
+        self.playlist_id.clear();
+        self.playlist_source = None;
+        self.playlist_loaded = false;
+        self.playlist_note = None;
         self.library_loading = false;
     }
 
@@ -2957,10 +3022,12 @@ fn pane_title(shell: &Shell) -> Element<'_, Message> {
     if shell.pane == Pane::Playlist {
         row![
             transport_button("Back", Some(Message::BackToLibrary), false),
-            heading,
+            heading.width(Fill),
+            transport_button("Import", import_message(shell), true),
         ]
         .spacing(12)
         .align_y(Vertical::Center)
+        .width(Fill)
         .into()
     } else if shell.pane == Pane::Mix {
         row![
@@ -3082,6 +3149,25 @@ fn cookie_form(shell: &Shell) -> Element<'_, Message> {
     ]
     .spacing(8);
     column![help, input, buttons].spacing(8).width(Fill).into()
+}
+
+/// Import is the one action on an open Spotify or YouTube Music playlist.
+///
+/// It stays off until the tracks have loaded. A failure, including a
+/// playlist Spotify would not share, does not save an empty list.
+fn import_message(shell: &Shell) -> Option<Message> {
+    if shell.pane != Pane::Playlist
+        || shell.library_loading
+        || !shell.playlist_loaded
+        || shell.playlist_id.is_empty()
+        || shell.error.is_some()
+    {
+        return None;
+    }
+    match shell.playlist_source {
+        Some(Source::Spotify | Source::YouTubeMusic) => Some(Message::ImportPlaylist),
+        Some(Source::Local) | None => None,
+    }
 }
 
 fn status_note(shell: &Shell) -> Option<String> {
@@ -3978,6 +4064,98 @@ fn mixed_playlists_can_be_edited_and_played_from_the_other_panes() {
     assert_eq!(shell.pane, Pane::Mixes);
     assert_eq!(shell.mixes.playlists().len(), 1);
     assert_eq!(shell.mixes.playlists()[0].name(), "Playlist");
+    let _ = Shell::view(&shell);
+}
+
+#[test]
+fn importing_a_library_playlist_saves_it_updates_on_repeat_and_plays() {
+    let mut shell = test_shell(Mode::Run);
+    let spotify = Track {
+        id: "sp-night".into(),
+        source: Source::Spotify,
+        title: "Night Drive".into(),
+        artists: vec!["Ada Vega".into()],
+        album: Some("Low Glow".into()),
+        duration: std::time::Duration::from_secs(192),
+    };
+    let youtube = Track {
+        id: "yt-paper".into(),
+        source: Source::YouTubeMusic,
+        title: "Paper Boats".into(),
+        artists: vec!["Jonah Reed".into()],
+        album: None,
+        duration: std::time::Duration::from_secs(164),
+    };
+
+    let _ = shell.update(Message::OpenPlaylist {
+        source: Source::Spotify,
+        id: "liked-songs".into(),
+        name: "Liked Songs".into(),
+    });
+    assert!(shell.library_loading);
+    assert!(import_message(&shell).is_none());
+    let _ = shell.update(Message::ImportPlaylist);
+    assert!(shell.mixes.playlists().is_empty());
+
+    let epoch = shell.library_epoch;
+    let _ = shell.update(Message::PlaylistReady {
+        epoch,
+        result: Ok(vec![spotify.clone(), youtube.clone()]),
+    });
+    assert!(shell.playlist_loaded);
+    assert_eq!(shell.playlist_id, "liked-songs");
+    let _ = Shell::view(&shell);
+    let _ = shell.update(Message::ImportPlaylist);
+    assert_eq!(shell.mixes.playlists().len(), 1);
+    assert_eq!(shell.mixes.playlists()[0].name(), "Liked Songs");
+    assert_eq!(
+        shell.mixes.playlists()[0].tracks(),
+        &[spotify.clone(), youtube.clone()]
+    );
+    assert_eq!(
+        shell.playlist_note.as_deref(),
+        Some("Imported Liked Songs.")
+    );
+    let id = shell.mixes.playlists()[0].id().to_string();
+
+    shell.mix_draft = "Kept".into();
+    let _ = shell.update(Message::RenameMix);
+    shell.playlist_tracks = vec![youtube.clone()];
+    let _ = shell.update(Message::ImportPlaylist);
+    assert_eq!(shell.mixes.playlists().len(), 1);
+    assert_eq!(shell.mixes.playlists()[0].id(), id);
+    assert_eq!(shell.mixes.playlists()[0].name(), "Kept");
+    assert_eq!(
+        shell.mixes.playlists()[0].tracks(),
+        std::slice::from_ref(&youtube)
+    );
+    assert_eq!(shell.playlist_note.as_deref(), Some("Updated Kept."));
+    let _ = shell.update(Message::PlayMix);
+    let (ids, index) = shell.last_mix_play.clone().expect("played");
+    assert_eq!(ids, ["yt-paper"]);
+    assert_eq!(index, 0);
+
+    shell.playlist_source = Some(Source::YouTubeMusic);
+    shell.playlist_id = "liked-songs".into();
+    shell.playlist_name = "Liked songs".into();
+    shell.playlist_tracks = vec![spotify.clone()];
+    shell.playlist_loaded = true;
+    let _ = shell.update(Message::ImportPlaylist);
+    assert_eq!(shell.mixes.playlists().len(), 2);
+    assert_eq!(shell.mixes.playlists()[1].name(), "Liked songs");
+    assert_eq!(
+        shell.mixes.playlists()[1].tracks(),
+        std::slice::from_ref(&spotify)
+    );
+
+    let _ = shell.update(Message::PlaylistReady {
+        epoch: shell.library_epoch,
+        result: Err(music::Error::NotFound),
+    });
+    assert!(!shell.playlist_loaded);
+    let before = shell.mixes.playlists().len();
+    let _ = shell.update(Message::ImportPlaylist);
+    assert_eq!(shell.mixes.playlists().len(), before);
     let _ = Shell::view(&shell);
 }
 
