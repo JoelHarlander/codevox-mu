@@ -53,6 +53,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
+          # libdbus is the session bus for MPRIS and the StatusNotifier tray probe.
+          # The tray does not link GTK or libayatana-appindicator.
           sudo apt-get install -y --no-install-recommends \
             pkg-config \
             libasound2-dev \
