@@ -1,0 +1,78 @@
+{
+  "ordered": [
+    {
+      "token": null,
+      "continuation": "page-2",
+      "tracks": [
+        {
+          "id": "aaaaaaaaaaa",
+          "title": "Night Drive",
+          "artists": ["Ada Vega", " "],
+          "album": "Low Glow",
+          "duration": "3:12"
+        }
+      ]
+    },
+    {
+      "token": "page-2",
+      "continuation": "page-3",
+      "tracks": [
+        {
+          "id": "bbbbbbbbbbb",
+          "title": "Glass House",
+          "artists": ["Ada Vega", "North Line"],
+          "album": "Low Glow",
+          "duration": "4:01"
+        },
+        {
+          "id": "ccccccccccc",
+          "title": "Live Cut",
+          "artists": ["North Line"],
+          "album": null,
+          "duration": "live"
+        }
+      ]
+    },
+    {
+      "token": "page-3",
+      "continuation": null,
+      "tracks": [
+        {
+          "id": "ddddddddddd",
+          "title": "Paper Boats",
+          "artists": ["Jonah Reed"],
+          "album": null,
+          "duration": "2:44"
+        }
+      ]
+    }
+  ],
+  "repeated_token": [
+    {
+      "token": null,
+      "continuation": "again",
+      "tracks": [
+        {
+          "id": "aaaaaaaaaaa",
+          "title": "Night Drive",
+          "artists": ["Ada Vega"],
+          "album": "Low Glow",
+          "duration": "3:12"
+        }
+      ]
+    },
+    {
+      "token": "again",
+      "continuation": "again",
+      "tracks": [
+        {
+          "id": "bbbbbbbbbbb",
+          "title": "Glass House",
+          "artists": ["Ada Vega"],
+          "album": "Low Glow",
+          "duration": "4:01"
+        }
+      ]
+    }
+  ]
+}
