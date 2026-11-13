@@ -3040,6 +3040,61 @@ mod tests {
     }
 
     #[test]
+    fn fixture_tracks_import_into_one_mixed_playlist_and_a_second_pass_updates_it() {
+        let playlist = tracks_from_playlist_page_json(PLAYLIST_TRACKS_FIXTURE).expect("playlist");
+        let liked = tracks_from_saved_page_json(SAVED_TRACKS_FIXTURE).expect("liked");
+        let mut store = crate::playlists::Store::memory();
+        let created = store
+            .import_from(
+                Source::Spotify,
+                "37i9dQZF1DXcBWIGoYBM5M",
+                "Low Glow",
+                playlist.items.clone(),
+            )
+            .expect("import");
+        let crate::playlists::ImportOutcome::Created { id } = created else {
+            panic!("first import creates");
+        };
+        assert_eq!(
+            store.playlist(&id).expect("saved").tracks(),
+            playlist.items.as_slice()
+        );
+        assert!(
+            store
+                .playlist(&id)
+                .expect("saved")
+                .tracks()
+                .iter()
+                .all(|track| track.source == Source::Spotify)
+        );
+
+        let updated = store
+            .import_from(
+                Source::Spotify,
+                "37i9dQZF1DXcBWIGoYBM5M",
+                "Renamed On Spotify",
+                liked.items.clone(),
+            )
+            .expect("reimport");
+        assert_eq!(
+            updated,
+            crate::playlists::ImportOutcome::Updated { id: id.clone() }
+        );
+        let kept = store.playlist(&id).expect("same list");
+        assert_eq!(kept.name(), "Low Glow");
+        assert_eq!(kept.tracks(), liked.items.as_slice());
+
+        let liked_songs = store
+            .import_from(Source::Spotify, LIKED_SONGS_ID, "Liked Songs", liked.items)
+            .expect("liked songs");
+        let crate::playlists::ImportOutcome::Created { id: liked_id } = liked_songs else {
+            panic!("liked songs is its own list");
+        };
+        assert_ne!(liked_id, id);
+        assert_eq!(store.playlists().len(), 2);
+    }
+
+    #[test]
     fn saved_track_pages_keep_liked_songs_and_skip_nulls() {
         let page = tracks_from_saved_page_json(SAVED_TRACKS_FIXTURE).expect("saved");
         assert_eq!(
