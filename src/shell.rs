@@ -1,8 +1,10 @@
 //! The native window.
 //!
 //! One borderless iced window is the whole interface. A title bar, a sidebar,
-//! the open pane, and a now-playing bar fill that window. Search asks Spotify
-//! and YouTube Music on background threads, then keeps one row per recording.
+//! the open pane, and a now-playing bar fill that window. While a Spotify or
+//! YouTube Music track is loaded, a lyrics column sits beside the pane.
+//! Search asks Spotify and YouTube Music on background threads, then keeps
+//! one row per recording.
 //! Choosing a row asks the playback thread to play it. Spotify and YouTube
 //! Music sign-in live on the Accounts pane. The window does not know how a
 //! catalogue is fetched or how a stream is decoded.
@@ -150,6 +152,11 @@ enum Message {
     RemoveQueued(usize),
     RemoveCurrent,
     Tick,
+    /// Lyrics for the track that was current when the lookup started.
+    LyricsReady {
+        key: crate::lyrics::Key,
+        outcome: crate::lyrics::Outcome,
+    },
     SignIn,
     AccountChanged {
         epoch: u64,
@@ -298,6 +305,8 @@ struct Shell {
     library_epoch: u64,
     restore_started: bool,
     playback: player::Playback,
+    /// Lyric for the loaded Spotify or YouTube Music track.
+    lyrics: crate::lyrics::Session,
     /// A clock tick is already waiting. Keeps the 200 ms timer from stacking.
     clock_armed: bool,
     /// Sample transport for `--screenshot` only. Run and smoke leave this empty.
@@ -1201,6 +1210,7 @@ impl Shell {
             library_epoch: 0,
             restore_started: false,
             playback: player::Playback::dormant(),
+            lyrics: crate::lyrics::Session::default(),
             clock_armed: false,
             preview: None,
             dismissed_playback_error: None,
@@ -1295,6 +1305,14 @@ impl Shell {
                 self.arm_clock()
             }
             Message::Tick => self.on_tick(),
+            Message::LyricsReady { key, outcome } => {
+                let elapsed = self.playback.now().elapsed;
+                if self.lyrics.accept(&key, outcome) {
+                    self.scroll_lyrics(elapsed)
+                } else {
+                    Task::none()
+                }
+            }
             Message::ShowSignIn => {
                 self.cookie_open = true;
                 self.pane = Pane::Accounts;
@@ -1603,21 +1621,53 @@ impl Shell {
         if self.mode == Mode::Run {
             crate::media_controls::publish(&self.playback.now());
         }
+        let lyrics = self.sync_lyrics();
         if self.mode != Mode::Run || self.clock_armed {
-            return Task::none();
+            return lyrics;
         }
         self.clock_armed = true;
-        Task::perform(wait(std::time::Duration::from_millis(200)), |_| {
+        let clock = Task::perform(wait(std::time::Duration::from_millis(200)), |_| {
             Message::Tick
-        })
+        });
+        Task::batch([lyrics, clock])
     }
 
     fn on_tick(&mut self) -> Task<Message> {
         self.clock_armed = false;
-        crate::media_controls::publish(&self.playback.now());
-        match self.playback.phase() {
+        let now = self.playback.now();
+        crate::media_controls::publish(&now);
+        let lyrics = self.sync_lyrics();
+        let scroll = self.scroll_lyrics(now.elapsed);
+        let clock = match now.phase {
             Phase::Loading | Phase::Playing => self.arm_clock(),
             Phase::Idle | Phase::Paused | Phase::Stopped => Task::none(),
+        };
+        Task::batch([lyrics, scroll, clock])
+    }
+
+    /// Ask for lyrics when the loaded track changes. Smoke and screenshot
+    /// stay offline. A tick for the same track does not start another lookup.
+    fn sync_lyrics(&mut self) -> Task<Message> {
+        if self.mode != Mode::Run {
+            return Task::none();
+        }
+        let now = self.playback.now();
+        let cache = crate::lyrics::disk_cache();
+        let Some(lookup) = self.lyrics.begin(&now, cache.as_deref()) else {
+            return Task::none();
+        };
+        Task::perform(crate::lyrics::fetch(lookup), |loaded| {
+            Message::LyricsReady {
+                key: loaded.key,
+                outcome: loaded.outcome,
+            }
+        })
+    }
+
+    fn scroll_lyrics(&mut self, elapsed: std::time::Duration) -> Task<Message> {
+        match self.lyrics.follow(elapsed) {
+            Some(y) => crate::lyrics::scroll_to(y),
+            None => Task::none(),
         }
     }
 
@@ -2051,6 +2101,7 @@ impl Shell {
         self.preview = Some(player::NowPlaying {
             title: track.title.clone(),
             artist: track.artists.join(", "),
+            album: track.album.clone(),
             phase: Phase::Playing,
             elapsed: std::time::Duration::from_secs(48),
             duration: track.duration,
@@ -2066,6 +2117,11 @@ impl Shell {
             loaded: Some(track),
             upcoming: Vec::new(),
         });
+        // Offline lines so the capture shows the column without a lookup.
+        // 48s is the preview position, so the third line is the current one.
+        self.lyrics.show_synced(
+            "[00:00.00] Streetlights on the wet lane\n[00:20.00] The radio keeps the time\n[00:48.00] Keep the window down\n[01:12.00] Home is a left turn\n",
+        );
     }
 
     fn on_screenshot_frame(&mut self) -> Task<Message> {
@@ -2154,12 +2210,16 @@ impl Shell {
     }
 
     fn view(shell: &Self) -> Element<'_, Message> {
+        let mut body = row![sidebar(shell), vertical_rule(), main_column(shell)]
+            .width(Fill)
+            .height(Fill);
+        if let Some(panel) = crate::lyrics::panel(&shell.lyrics, shell.displayed_now().elapsed) {
+            body = body.push(vertical_rule()).push(panel);
+        }
         let layout = column![
             title_bar(shell),
             horizontal_rule(),
-            row![sidebar(shell), vertical_rule(), main_column(shell)]
-                .width(Fill)
-                .height(Fill),
+            body,
             horizontal_rule(),
             now_playing(shell),
         ]
@@ -3512,6 +3572,7 @@ fn mixed_playlists_can_be_edited_and_played_from_the_other_panes() {
     shell.preview = Some(player::NowPlaying {
         title: spotify.title.clone(),
         artist: spotify.artists.join(", "),
+        album: spotify.album.clone(),
         phase: Phase::Playing,
         elapsed: std::time::Duration::from_secs(4),
         duration: spotify.duration,

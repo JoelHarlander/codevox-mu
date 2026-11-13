@@ -79,6 +79,8 @@ pub struct NowPlaying {
     pub source: Option<Source>,
     /// Source id of the loaded track. Empty when nothing is loaded.
     pub track_id: String,
+    /// Album of the loaded track. `None` when the source has none, or nothing is loaded.
+    pub album: Option<String>,
     /// The loaded track, when there is one.
     ///
     /// The queue view saves this into a mixed playlist. The title and artist
@@ -105,6 +107,7 @@ impl Default for NowPlaying {
             can_previous: false,
             source: None,
             track_id: String::new(),
+            album: None,
             loaded: None,
             upcoming: Vec::new(),
         }
@@ -403,23 +406,14 @@ where
     }
 
     pub fn view(&self) -> NowPlaying {
-        let loaded = self.queue.current().cloned();
-        let (title, artist, source, track_id) = match &loaded {
-            Some(track) => (
-                track.title.clone(),
-                artist_line(track),
-                Some(track.source),
-                track.id.clone(),
-            ),
-            None => (String::new(), String::new(), None, String::new()),
-        };
-        let has_current = loaded.is_some();
+        let current = self.queue.current();
         NowPlaying {
-            title,
-            artist,
+            title: current.map(|track| track.title.clone()).unwrap_or_default(),
+            artist: current.map(artist_line).unwrap_or_default(),
+            album: current.and_then(|track| track.album.clone()),
             phase: self.phase,
             elapsed: self.elapsed(),
-            duration: if has_current {
+            duration: if current.is_some() {
                 self.duration
             } else {
                 Duration::ZERO
@@ -429,11 +423,11 @@ where
             can_play: self.can_play(),
             can_pause: self.phase == Phase::Playing,
             can_stop: matches!(self.phase, Phase::Playing | Phase::Paused),
-            can_next: has_current || !self.queue.is_empty(),
+            can_next: current.is_some() || !self.queue.is_empty(),
             can_previous: self.queue.can_back(),
-            source,
-            track_id,
-            loaded,
+            source: current.map(|track| track.source),
+            track_id: current.map(|track| track.id.clone()).unwrap_or_default(),
+            loaded: current.cloned(),
             upcoming: self.queue.upcoming().to_vec(),
         }
     }
@@ -1007,6 +1001,7 @@ fn loading_now(track: &Track, queue: &Queue) -> NowPlaying {
         can_previous: queue.can_back(),
         source: Some(track.source),
         track_id: track.id.clone(),
+        album: track.album.clone(),
         loaded: Some(track.clone()),
         upcoming: queue.upcoming().to_vec(),
     }
@@ -1392,6 +1387,7 @@ mod tests {
         let resumed = player.view();
         assert_eq!(resumed.phase, Phase::Playing);
         assert_eq!(resumed.elapsed, Duration::from_secs(12));
+        assert_eq!(resumed.album, None);
         assert_eq!(player.extractor.calls, ["yt-1"]);
         assert_eq!(player.sink.starts, 1);
         assert_eq!(player.sink.pauses, 1);
