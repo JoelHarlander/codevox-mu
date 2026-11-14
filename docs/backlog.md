@@ -22,7 +22,7 @@ Status: Done (real screen, 3 OSes) · Built (merged, CI green on 3 OSes, not yet
 | 10 | Playlist import from Spotify or YouTube Music into a mixed playlist | Built (PR #29) |
 | 11 | Tray icon or mini player | Built (PR #30) |
 | 12 | Synced lyrics | Built (PR #27) |
-| 13 | Local files | Not started |
+| 13 | Local files | Built (PR #31) |
 | 14 | Release builds on GitHub Actions for all 3 OSes (artifacts only, no publishing) | Built (package workflow) |
 
 The ranking puts the playable core (1 to 5) first, so there's something real to test, then system integration (6), then libraries and playlists (7 to 10), then extras (11 to 13).
