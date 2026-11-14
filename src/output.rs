@@ -6,6 +6,7 @@
 //! macOS, and ALSA on Linux. Symphonia is MPL-2.0, a file-level weak
 //! copyleft, not GPL. rodio's MIT and Apache decoders do not read the AAC
 //! inside the MP4 container YouTube serves, so symphonia is the decoder.
+//! The same decoder reads local mp3, flac, ogg Vorbis, m4a/aac, and wav.
 //!
 //! Opening the device happens on the first play, on the playback thread.
 //! `--smoke` never constructs a [`RodioSink`].

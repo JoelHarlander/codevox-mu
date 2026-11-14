@@ -1,11 +1,11 @@
 //! Play order for a mixed session.
 //!
 //! One [`Queue`] holds the loaded track, what plays after it, and what
-//! previous can return to. Spotify and YouTube Music tracks share that
-//! order. The window and the OS media keys both call into this type, so
+//! previous can return to. Spotify, YouTube Music, and local tracks share
+//! that order. The window and the OS media keys both call into this type, so
 //! next and previous cannot drift from the panel.
 
-use crate::music::{Source, Track};
+use crate::music::Track;
 
 /// How far back [`Queue::back`] moved.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -16,15 +16,6 @@ pub enum Shift {
     Restart(Track),
     /// Nothing is loaded.
     Idle,
-}
-
-/// Result of stepping backwards.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Retreat {
-    pub shift: Shift,
-    /// A local file was in the history and was dropped. Local playback is
-    /// not available, so previous skips those entries.
-    pub skipped_local: bool,
 }
 
 /// Loaded track, the tracks after it, and the tracks already heard.
@@ -151,36 +142,22 @@ impl Queue {
     /// At the start, the loaded track stays so the caller can restart it.
     /// With nothing loaded and nothing earlier, the result is [`Shift::Idle`].
     /// Otherwise the newest history entry becomes loaded and the displaced
-    /// track is inserted at the front of the upcoming list. Local files in
-    /// the history are dropped.
-    pub fn back(&mut self) -> Retreat {
+    /// track is inserted at the front of the upcoming list. Local files are
+    /// a normal step: previous lands on them.
+    pub fn back(&mut self) -> Shift {
         let displaced = self.current.take();
-        let mut skipped_local = false;
-        loop {
-            let Some(track) = self.history.pop() else {
-                self.current = displaced;
-                let shift = match self.current.clone() {
-                    Some(track) => Shift::Restart(track),
-                    None => Shift::Idle,
-                };
-                return Retreat {
-                    shift,
-                    skipped_local,
-                };
+        let Some(track) = self.history.pop() else {
+            self.current = displaced;
+            return match self.current.clone() {
+                Some(track) => Shift::Restart(track),
+                None => Shift::Idle,
             };
-            if track.source == Source::Local {
-                skipped_local = true;
-                continue;
-            }
-            if let Some(current) = displaced {
-                self.upcoming.insert(0, current);
-            }
-            self.current = Some(track.clone());
-            return Retreat {
-                shift: Shift::Play(track),
-                skipped_local,
-            };
+        };
+        if let Some(current) = displaced {
+            self.upcoming.insert(0, current);
         }
+        self.current = Some(track.clone());
+        Shift::Play(track)
     }
 
     fn promote(&mut self) {
@@ -334,9 +311,7 @@ mod tests {
         );
         assert_eq!(upcoming_ids(&queue), ["last"]);
 
-        let retreat = queue.back();
-        assert!(matches!(retreat.shift, Shift::Restart(track) if track.id == "next"));
-        assert!(!retreat.skipped_local);
+        assert!(matches!(queue.back(), Shift::Restart(track) if track.id == "next"));
         assert_eq!(queue.current().map(|item| item.id.as_str()), Some("next"));
 
         queue.remove_current();
@@ -344,7 +319,7 @@ mod tests {
         queue.remove_current();
         assert!(queue.current().is_none());
         assert!(queue.is_empty());
-        assert!(matches!(queue.back().shift, Shift::Idle));
+        assert!(matches!(queue.back(), Shift::Idle));
 
         queue.load(sp("only"));
         queue.enqueue(yt("kept"));
@@ -358,13 +333,12 @@ mod tests {
     #[test]
     fn forward_and_back_stop_at_both_ends() {
         let mut queue = Queue::new();
-        assert!(matches!(queue.back().shift, Shift::Idle));
+        assert!(matches!(queue.back(), Shift::Idle));
         queue.forward();
         assert!(queue.current().is_none());
 
         queue.load(yt("only"));
-        let retreat = queue.back();
-        assert!(matches!(retreat.shift, Shift::Restart(track) if track.id == "only"));
+        assert!(matches!(queue.back(), Shift::Restart(track) if track.id == "only"));
         assert_eq!(queue.current().map(|item| item.id.as_str()), Some("only"));
         assert!(queue.upcoming().is_empty());
 
@@ -376,14 +350,12 @@ mod tests {
         assert!(queue.is_empty());
         assert!(queue.can_back());
 
-        let retreat = queue.back();
-        assert!(matches!(retreat.shift, Shift::Play(track) if track.id == "only"));
+        assert!(matches!(queue.back(), Shift::Play(track) if track.id == "only"));
         assert_eq!(
             queue.current().map(|item| item.source),
             Some(Source::YouTubeMusic)
         );
-        let retreat = queue.back();
-        assert!(matches!(retreat.shift, Shift::Restart(track) if track.id == "only"));
+        assert!(matches!(queue.back(), Shift::Restart(track) if track.id == "only"));
         assert!(queue.upcoming().is_empty());
     }
 
@@ -400,15 +372,15 @@ mod tests {
         queue.forward();
         assert!(queue.current().is_none());
 
-        assert!(matches!(queue.back().shift, Shift::Play(track) if track.id == "yt-2"));
+        assert!(matches!(queue.back(), Shift::Play(track) if track.id == "yt-2"));
         assert!(matches!(
-            queue.back().shift,
+            queue.back(),
             Shift::Play(track) if track.source == Source::Spotify
         ));
         assert_eq!(upcoming_ids(&queue), ["yt-2"]);
-        assert!(matches!(queue.back().shift, Shift::Play(track) if track.id == "yt-1"));
+        assert!(matches!(queue.back(), Shift::Play(track) if track.id == "yt-1"));
         assert_eq!(upcoming_ids(&queue), ["sp-1", "yt-2"]);
-        assert!(matches!(queue.back().shift, Shift::Restart(track) if track.id == "yt-1"));
+        assert!(matches!(queue.back(), Shift::Restart(track) if track.id == "yt-1"));
 
         queue.forward();
         assert_eq!(
@@ -454,17 +426,34 @@ mod tests {
     }
 
     #[test]
-    fn local_history_is_skipped_and_then_previous_stops() {
+    fn next_and_previous_cross_a_local_track() {
         let mut queue = Queue::new();
-        queue.load(track(Source::Local, "desk"));
-        queue.remember_current();
-        queue.load(yt("now"));
+        queue.enqueue(yt("yt-1"));
+        queue.enqueue(track(Source::Local, "desk"));
+        queue.enqueue(sp("sp-1"));
 
-        let retreat = queue.back();
-        assert!(retreat.skipped_local);
-        assert!(matches!(retreat.shift, Shift::Restart(track) if track.id == "now"));
-        assert_eq!(queue.current().map(|item| item.id.as_str()), Some("now"));
-        assert!(queue.upcoming().is_empty());
+        queue.forward();
+        assert_eq!(queue.current().map(|item| item.id.as_str()), Some("yt-1"));
+        queue.forward();
+        assert_eq!(queue.current().map(|item| item.source), Some(Source::Local));
+        assert_eq!(queue.current().map(|item| item.id.as_str()), Some("desk"));
+        queue.forward();
+        assert_eq!(
+            queue.current().map(|item| item.source),
+            Some(Source::Spotify)
+        );
+
+        assert!(matches!(
+            queue.back(),
+            Shift::Play(track) if track.id == "desk" && track.source == Source::Local
+        ));
+        assert_eq!(upcoming_ids(&queue), ["sp-1"]);
+        assert!(matches!(
+            queue.back(),
+            Shift::Play(track) if track.source == Source::YouTubeMusic
+        ));
+        assert_eq!(upcoming_ids(&queue), ["desk", "sp-1"]);
+        assert!(matches!(queue.back(), Shift::Restart(track) if track.id == "yt-1"));
     }
 
     #[test]
@@ -475,8 +464,7 @@ mod tests {
 
         assert!(queue.current().is_none());
         assert_eq!(upcoming_ids(&queue), ["b", "c"]);
-        let retreat = queue.back();
-        assert!(matches!(retreat.shift, Shift::Play(track) if track.id == "a"));
+        assert!(matches!(queue.back(), Shift::Play(track) if track.id == "a"));
         assert_eq!(
             queue.current().map(|item| item.source),
             Some(Source::Spotify)
@@ -487,6 +475,6 @@ mod tests {
         idle.start_from(vec![yt("only")], 2);
         assert!(idle.current().is_none());
         assert!(idle.upcoming().is_empty());
-        assert!(matches!(idle.back().shift, Shift::Idle));
+        assert!(matches!(idle.back(), Shift::Idle));
     }
 }
