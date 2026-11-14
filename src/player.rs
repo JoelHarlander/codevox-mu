@@ -13,8 +13,9 @@
 //! A track librespot cannot decrypt does the same match, with
 //! [`SPOTIFY_KEY_FALLBACK_NOTE`], and stays on screen with
 //! [`SPOTIFY_KEY_UNAVAILABLE_NOTE`] when YouTube Music has no match.
-//! Local files are skipped with an error. A failure to resolve a stream or
-//! open the device is stored on the snapshot. Nothing here panics for those
+//! A local file is read from its path and played on the same sink as a
+//! YouTube stream. A failure to open that file, resolve a stream, or open
+//! the device is stored on the snapshot. Nothing here panics for those
 //! cases.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -45,8 +46,6 @@ pub const SPOTIFY_KEY_FALLBACK_NOTE: &str =
 /// Shown when that match does not exist. The Spotify row stays put.
 pub const SPOTIFY_KEY_UNAVAILABLE_NOTE: &str =
     "Spotify couldn't play this track, and no YouTube Music match was found.";
-
-const LOCAL_UNAVAILABLE: &str = "Local playback is not available yet";
 
 /// What the transport is doing. `Loading` is only a snapshot value, written
 /// while a YouTube stream is still downloading.
@@ -254,16 +253,13 @@ where
         self.advance();
     }
 
-    /// Play `track` now. A YouTube track replaces whatever is audible. A
-    /// Spotify track plays in-app when the account can, and otherwise plays
-    /// the YouTube Music match. A click that cannot play anything leaves the
-    /// current track running and sets a note.
+    /// Play `track` now. A YouTube or local track replaces whatever is
+    /// audible. A Spotify track plays in-app when the account can, and
+    /// otherwise plays the YouTube Music match. A click that cannot play
+    /// anything leaves the current track running and sets a note.
     pub fn play_now(&mut self, track: Track) {
         match track.source {
-            Source::Local => {
-                self.error = Some(LOCAL_UNAVAILABLE.to_string());
-            }
-            Source::YouTubeMusic => {
+            Source::Local | Source::YouTubeMusic => {
                 self.halt_audio();
                 self.queue.remember_current();
                 self.note = None;
@@ -337,14 +333,10 @@ where
     ///
     /// With no earlier track, the current one starts again from the beginning.
     /// A Spotify entry plays in-app when the account can, and otherwise plays
-    /// its YouTube Music match. Local files in the history are skipped.
+    /// its YouTube Music match. A local file plays from its path.
     pub fn previous(&mut self) {
         self.halt_audio();
-        let retreat = self.queue.back();
-        if retreat.skipped_local {
-            self.error = Some(LOCAL_UNAVAILABLE.to_string());
-        }
-        match retreat.shift {
+        match self.queue.back() {
             Shift::Idle => {}
             Shift::Restart(_) => self.restart_current(),
             Shift::Play(track) => {
@@ -560,16 +552,25 @@ where
             self.phase = Phase::Idle;
             return Start::Stop;
         };
-        if track.source != Source::YouTubeMusic {
-            self.phase = Phase::Stopped;
-            return Start::Skip;
-        }
-
-        let source = match self.extractor.audio(&track.id) {
-            Ok(source) => source,
-            Err(error) => {
+        let source = match track.source {
+            Source::YouTubeMusic => match self.extractor.audio(&track.id) {
+                Ok(source) => source,
+                Err(error) => {
+                    self.phase = Phase::Stopped;
+                    self.error = Some(format!("Couldn't open the stream: {error}"));
+                    return Start::Skip;
+                }
+            },
+            Source::Local => match crate::local::open_file(&track.id) {
+                Ok(source) => source,
+                Err(error) => {
+                    self.phase = Phase::Stopped;
+                    self.error = Some(format!("Couldn't open the file: {error}"));
+                    return Start::Skip;
+                }
+            },
+            Source::Spotify => {
                 self.phase = Phase::Stopped;
-                self.error = Some(format!("Couldn't open the stream: {error}"));
                 return Start::Skip;
             }
         };
@@ -692,10 +693,12 @@ where
             };
 
             match track.source {
-                Source::Local => {
-                    self.error = Some(LOCAL_UNAVAILABLE.to_string());
-                    self.queue.remove_current();
-                }
+                Source::Local => match self.play_stream(track, None) {
+                    Start::Playing | Start::Stop => return,
+                    Start::Skip => {
+                        self.queue.remove_current();
+                    }
+                },
                 Source::Spotify => {
                     if self.spotify.can_play() {
                         match self.load_spotify(&track) {
@@ -1063,6 +1066,7 @@ mod tests {
         finished: bool,
         position: Duration,
         fail: Fail,
+        last_mime: String,
     }
 
     impl FakeSink {
@@ -1077,12 +1081,13 @@ mod tests {
                 finished: false,
                 position: Duration::ZERO,
                 fail,
+                last_mime: String::new(),
             }
         }
     }
 
     impl AudioSink for FakeSink {
-        fn start(&mut self, _source: AudioSource) -> Result<(), SinkError> {
+        fn start(&mut self, source: AudioSource) -> Result<(), SinkError> {
             match self.fail {
                 Fail::Device => {
                     return Err(SinkError::Device("no output device".into()));
@@ -1093,6 +1098,7 @@ mod tests {
                 Fail::None => {}
             }
             self.starts += 1;
+            self.last_mime = source.mime;
             self.playing = true;
             self.paused = false;
             self.finished = false;
@@ -1547,9 +1553,66 @@ mod tests {
     }
 
     #[test]
-    fn local_tracks_in_the_queue_are_skipped() {
+    fn next_previous_pause_and_resume_cross_a_local_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "codevox-mu-player-local-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("desk.wav");
+        std::fs::write(&path, silence_wav()).expect("wav");
+        let local = track(Source::Local, &path.to_string_lossy(), "Desk", "Room");
+
         let mut player = machine(&[], Fail::None);
-        player.enqueue(track(Source::Local, "desk", "Desk", "Room"));
+        player.enqueue(yt("yt-1", "Kitchen Radio"));
+        player.enqueue(local);
+        player.enqueue(yt("yt-2", "Paper Planes"));
+
+        player.play();
+        assert_eq!(player.view().title, "Kitchen Radio");
+        assert_eq!(player.view().phase, Phase::Playing);
+
+        player.next();
+        let now = player.view();
+        assert_eq!(now.title, "Desk");
+        assert_eq!(now.phase, Phase::Playing);
+        assert_eq!(now.source, Some(Source::Local));
+        assert!(now.can_pause);
+        assert!(now.can_next);
+        assert!(now.error.is_none());
+        assert_eq!(player.sink.starts, 2);
+        assert_eq!(player.sink.last_mime, "audio/wav");
+
+        player.pause();
+        assert_eq!(player.view().phase, Phase::Paused);
+        assert_eq!(player.sink.pauses, 1);
+        player.play();
+        assert_eq!(player.view().phase, Phase::Playing);
+        assert_eq!(player.sink.resumes, 1);
+        assert_eq!(player.sink.starts, 2);
+
+        player.next();
+        assert_eq!(player.view().title, "Paper Planes");
+        assert_eq!(player.view().source, Some(Source::YouTubeMusic));
+
+        player.previous();
+        let now = player.view();
+        assert_eq!(now.title, "Desk");
+        assert_eq!(now.source, Some(Source::Local));
+        assert_eq!(now.phase, Phase::Playing);
+        assert_eq!(player.sink.last_mime, "audio/wav");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_local_file_is_skipped_for_the_next_track() {
+        let mut player = machine(&[], Fail::None);
+        player.enqueue(track(Source::Local, "missing-desk.wav", "Desk", "Room"));
         player.enqueue(yt("yt-1", "Kitchen Radio"));
 
         player.play();
@@ -1557,20 +1620,43 @@ mod tests {
         assert_eq!(player.view().title, "Kitchen Radio");
         assert_eq!(player.view().phase, Phase::Playing);
         assert!(player.view().error.is_none());
+        assert_eq!(player.sink.starts, 1);
     }
 
     #[test]
-    fn a_local_track_alone_reports_an_error() {
+    fn a_missing_local_file_alone_reports_an_error() {
         let mut player = machine(&[], Fail::None);
-        player.play_now(track(Source::Local, "desk", "Desk", "Room"));
+        player.play_now(track(Source::Local, "missing-desk.wav", "Desk", "Room"));
 
         let now = player.view();
-        assert_eq!(now.phase, Phase::Idle);
-        assert_eq!(
-            now.error.as_deref(),
-            Some("Local playback is not available yet")
-        );
+        assert_eq!(now.phase, Phase::Stopped);
+        assert_eq!(now.title, "Desk");
+        assert_eq!(now.source, Some(Source::Local));
+        let error = now.error.expect("file error");
+        assert!(error.contains("Couldn't open the file"), "{error}");
         assert_eq!(player.sink.starts, 0);
+    }
+
+    fn silence_wav() -> Vec<u8> {
+        let samples = vec![1000i16; 800];
+        let data_len = u32::try_from(samples.len() * 2).expect("fits");
+        let mut bytes = Vec::with_capacity(44 + data_len as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&8_000u32.to_le_bytes());
+        bytes.extend_from_slice(&(8_000u32 * 2).to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        bytes
     }
 
     #[test]

@@ -15,6 +15,7 @@
 
 mod diag;
 mod extract;
+mod local;
 mod lrc;
 mod lyrics;
 mod media_controls;

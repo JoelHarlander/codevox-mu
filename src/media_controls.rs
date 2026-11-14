@@ -478,6 +478,22 @@ mod tests {
     }
 
     #[test]
+    fn local_overlay_uses_the_local_source_and_has_no_artwork() {
+        let overlay = OverlayMetadata::from_now(&now_playing(
+            "Desk Tape",
+            Some(Source::Local),
+            "/music/desk.wav",
+            Phase::Playing,
+        ));
+
+        assert_eq!(overlay.title, "Desk Tape");
+        assert_eq!(overlay.artist, "Ada Vega");
+        assert_eq!(overlay.source, Some(Source::Local));
+        assert_eq!(overlay.artwork_url, None);
+        assert_eq!(overlay.source_line().as_deref(), Some("Local"));
+    }
+
+    #[test]
     fn idle_overlay_is_empty() {
         let overlay = OverlayMetadata::from_now(&NowPlaying::default());
         assert_eq!(overlay, OverlayMetadata::default());

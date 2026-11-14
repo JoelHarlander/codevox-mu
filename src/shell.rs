@@ -198,6 +198,17 @@ enum Message {
     /// Save the open Spotify or YouTube Music playlist as a mixed playlist.
     ImportPlaylist,
     ShowSearch,
+    /// Native folder picker. The dialog and the scan run off the UI thread.
+    PickLocalFolder,
+    /// Native file picker. The dialog and the scan run off the UI thread.
+    PickLocalFiles,
+    LocalFolderChosen(Option<PathBuf>),
+    LocalFilesChosen(Option<Vec<PathBuf>>),
+    LocalScanned {
+        generation: u64,
+        tracks: Vec<Track>,
+    },
+    LocalFailed(String),
     ShowQueue,
     ShowMixes,
     MixDraftChanged(String),
@@ -316,6 +327,16 @@ struct Shell {
     playlist_note: Option<String>,
     /// Mixed playlists saved on this device.
     mixes: playlists::Store,
+    /// Folders and files chosen for local music. Smoke keeps an empty store.
+    local: crate::local::Store,
+    /// Tracks from the last finished scan.
+    local_tracks: Vec<Track>,
+    local_scanning: bool,
+    /// A folder or file dialog is already open.
+    local_picking: bool,
+    /// Bumped when a scan starts, so a slower scan cannot overwrite a newer one.
+    local_generation: u64,
+    local_error: Option<String>,
     /// Playlist that Add writes to, and the one open on the Mix pane.
     mix_id: Option<String>,
     mix_draft: String,
@@ -482,6 +503,33 @@ fn search_box_merges_spotify_now_and_youtube_when_it_returns() {
     let _ = shell.update(Message::QueryChanged("   ".into()));
     assert!(shell.results.is_empty());
     assert!(shell.error.is_none());
+    let _ = Shell::view(&shell);
+}
+
+#[test]
+fn search_includes_a_local_track_and_an_empty_query_lists_local_tracks() {
+    let mut shell = test_shell(Mode::Smoke);
+    shell.local_tracks = vec![Track {
+        id: "/music/Desk Tape.wav".to_string(),
+        source: Source::Local,
+        title: "Desk Tape".to_string(),
+        artists: Vec::new(),
+        album: None,
+        duration: std::time::Duration::from_secs(1),
+    }];
+    shell.publish_results();
+    assert_eq!(shell.results.len(), 1);
+    assert_eq!(shell.results[0].track.source, Source::Local);
+    assert_eq!(shell.results[0].track.title, "Desk Tape");
+
+    shell.query = "desk".to_string();
+    shell.publish_results();
+    assert_eq!(shell.results.len(), 1);
+    assert_eq!(shell.results[0].track.source, Source::Local);
+
+    shell.query = "night".to_string();
+    shell.publish_results();
+    assert!(shell.results.is_empty());
     let _ = Shell::view(&shell);
 }
 
@@ -1177,10 +1225,18 @@ impl Shell {
         // Saved playlists outlive this process. Smoke and screenshots stay
         // on the empty in-memory store.
         shell.load_saved_playlists();
-        let task = Task::perform(
-            account_task("spotify-restore", move || account.restore()),
-            |phase| Message::AccountChanged { epoch: 0, phase },
-        );
+        shell.local = crate::local::Store::load_default();
+        if let Some(note) = shell.local.blocked_message() {
+            shell.local_error = Some(note.to_string());
+        }
+        let scan = shell.start_local_scan();
+        let task = Task::batch([
+            Task::perform(
+                account_task("spotify-restore", move || account.restore()),
+                |phase| Message::AccountChanged { epoch: 0, phase },
+            ),
+            scan,
+        ]);
         (shell, task)
     }
 
@@ -1240,6 +1296,12 @@ impl Shell {
             playlist_loaded: false,
             playlist_note: None,
             mixes: playlists::Store::memory(),
+            local: crate::local::Store::memory(),
+            local_tracks: Vec::new(),
+            local_scanning: false,
+            local_picking: false,
+            local_generation: 0,
+            local_error: None,
             mix_id: None,
             mix_draft: String::new(),
             mix_error: None,
@@ -1484,6 +1546,20 @@ impl Shell {
             Message::ShowSearch => {
                 self.library_epoch = self.library_epoch.wrapping_add(1);
                 self.back_to_search();
+                Task::none()
+            }
+            Message::PickLocalFolder => self.begin_local_pick(false),
+            Message::PickLocalFiles => self.begin_local_pick(true),
+            Message::LocalFolderChosen(folder) => self.choose_local_folder(folder),
+            Message::LocalFilesChosen(files) => self.choose_local_files(files),
+            Message::LocalScanned { generation, tracks } => {
+                self.finish_local_scan(generation, tracks);
+                Task::none()
+            }
+            Message::LocalFailed(message) => {
+                self.local_picking = false;
+                self.local_scanning = false;
+                self.local_error = Some(message);
                 Task::none()
             }
             Message::BackToLibrary => {
@@ -2007,6 +2083,97 @@ impl Shell {
         )
     }
 
+    fn begin_local_pick(&mut self, files: bool) -> Task<Message> {
+        if self.local_picking {
+            return Task::none();
+        }
+        self.local_picking = true;
+        if files {
+            self.off_ui(
+                "local-files",
+                || Ok(crate::local::pick_files()),
+                |result| match result {
+                    Ok(picked) => Message::LocalFilesChosen(picked),
+                    Err(error) => Message::LocalFailed(error.to_string()),
+                },
+            )
+        } else {
+            self.off_ui(
+                "local-folder",
+                || Ok(crate::local::pick_folder()),
+                |result| match result {
+                    Ok(picked) => Message::LocalFolderChosen(picked),
+                    Err(error) => Message::LocalFailed(error.to_string()),
+                },
+            )
+        }
+    }
+
+    fn choose_local_folder(&mut self, folder: Option<PathBuf>) -> Task<Message> {
+        self.local_picking = false;
+        let Some(folder) = folder else {
+            return Task::none();
+        };
+        match self.local.add_folder(folder) {
+            Ok(()) => {
+                self.local_error = None;
+                self.start_local_scan()
+            }
+            Err(error) => {
+                self.local_error = Some(error);
+                Task::none()
+            }
+        }
+    }
+
+    fn choose_local_files(&mut self, files: Option<Vec<PathBuf>>) -> Task<Message> {
+        self.local_picking = false;
+        let Some(files) = files else {
+            return Task::none();
+        };
+        match self.local.add_files(files) {
+            Ok(()) => {
+                self.local_error = None;
+                self.start_local_scan()
+            }
+            Err(error) => {
+                self.local_error = Some(error);
+                Task::none()
+            }
+        }
+    }
+
+    /// Read every saved folder and file. An empty list clears the tracks.
+    fn start_local_scan(&mut self) -> Task<Message> {
+        self.local_generation = self.local_generation.wrapping_add(1);
+        let generation = self.local_generation;
+        let paths = self.local.paths();
+        if paths.is_empty() {
+            self.local_scanning = false;
+            self.local_tracks.clear();
+            self.publish_results();
+            return Task::none();
+        }
+        self.local_scanning = true;
+        self.off_ui(
+            "local-scan",
+            move || Ok(crate::local::scan(&paths)),
+            move |result| match result {
+                Ok(tracks) => Message::LocalScanned { generation, tracks },
+                Err(error) => Message::LocalFailed(error.to_string()),
+            },
+        )
+    }
+
+    fn finish_local_scan(&mut self, generation: u64, tracks: Vec<Track>) {
+        if generation != self.local_generation {
+            return;
+        }
+        self.local_scanning = false;
+        self.local_tracks = tracks;
+        self.publish_results();
+    }
+
     fn set_query(&mut self, query: String) -> Task<Message> {
         self.query = query;
         self.generation += 1;
@@ -2020,11 +2187,12 @@ impl Shell {
 
         self.spotify_rows.clear();
         self.youtube_rows.clear();
-        self.results.clear();
         self.error = None;
         self.spotify_error = None;
         self.spotify_pending = true;
         self.youtube_pending = true;
+        // Local matches can show before either service replies.
+        self.publish_results();
 
         let query = self.query.clone();
         Task::batch([
@@ -2034,13 +2202,13 @@ impl Shell {
     }
 
     fn clear_results(&mut self) {
-        self.results.clear();
         self.spotify_rows.clear();
         self.youtube_rows.clear();
         self.error = None;
         self.spotify_error = None;
         self.spotify_pending = false;
         self.youtube_pending = false;
+        self.publish_results();
     }
 
     fn start_sign_in(&mut self) -> Task<Message> {
@@ -2098,10 +2266,32 @@ impl Shell {
     fn publish_results(&mut self) {
         // YouTube Music is the row a click plays when the same recording
         // is on both services. A Spotify-only hit stays a Spotify row.
-        self.results = search::merge_results(
+        // Local files stay their own rows: a click plays the file, not a
+        // service match of the same title.
+        let query = self.query.trim();
+        if query.is_empty() {
+            self.results = self
+                .local_tracks
+                .iter()
+                .cloned()
+                .map(|track| search::SearchRow {
+                    track,
+                    also: Vec::new(),
+                })
+                .collect();
+            return;
+        }
+        let mut rows = search::merge_results(
             &[&self.spotify_rows, &self.youtube_rows],
             Source::YouTubeMusic,
         );
+        for track in crate::local::matching(&self.local_tracks, query) {
+            rows.push(search::SearchRow {
+                track,
+                also: Vec::new(),
+            });
+        }
+        self.results = rows;
     }
 
     fn on_frame(&mut self) -> Task<Message> {
@@ -2917,6 +3107,7 @@ fn main_column(shell: &Shell) -> Element<'_, Message> {
     header = header.push(pane_title(shell));
     if shell.pane == Pane::Search {
         header = header.push(search_input(shell));
+        header = header.push(local_sources_row(shell));
     }
     if shell.pane == Pane::Mixes {
         header = header.push(create_saved_row(shell));
@@ -3052,6 +3243,31 @@ fn search_input(shell: &Shell) -> Element<'_, Message> {
         .into()
 }
 
+fn local_sources_row(shell: &Shell) -> Element<'_, Message> {
+    let folder = (!shell.local_picking).then_some(Message::PickLocalFolder);
+    let files = (!shell.local_picking).then_some(Message::PickLocalFiles);
+    let summary = if shell.local_scanning {
+        "Scanning…".to_string()
+    } else {
+        match shell.local_tracks.len() {
+            1 => "1 local track".to_string(),
+            count => format!("{count} local tracks"),
+        }
+    };
+    row![
+        transport_button("Add folder", folder, false),
+        transport_button("Add files", files, false),
+        text(summary)
+            .font(crate::theme::BODY)
+            .size(META_SIZE)
+            .color(crate::theme::TEXT_SECONDARY),
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center)
+    .width(Fill)
+    .into()
+}
+
 fn accounts_view(shell: &Shell) -> Element<'_, Message> {
     let presentation = spotify::present_account(&shell.phase);
     let mut spotify_block = column![
@@ -3179,6 +3395,14 @@ fn status_note(shell: &Shell) -> Option<String> {
     }
     let fixed = match shell.pane {
         Pane::Search if shell.spotify_pending || shell.youtube_pending => Some("Searching…"),
+        Pane::Search if shell.local_scanning => Some("Scanning local files…"),
+        Pane::Search
+            if shell.query.trim().is_empty()
+                && shell.local_tracks.is_empty()
+                && shell.local.has_sources() =>
+        {
+            Some("No audio files in the local folders.")
+        }
         Pane::Search if !shell.query.trim().is_empty() && shell.results.is_empty() => {
             Some("No matches")
         }
@@ -3239,6 +3463,9 @@ fn notice_lines(shell: &Shell) -> Vec<String> {
         push_notice(&mut lines, error.clone());
     }
     if let Some(error) = &shell.mix_error {
+        push_notice(&mut lines, error.clone());
+    }
+    if let Some(error) = &shell.local_error {
         push_notice(&mut lines, error.clone());
     }
     if let AccountPhase::Failed { message } = &shell.phase {

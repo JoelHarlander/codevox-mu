@@ -32,7 +32,19 @@ png = "0.17"
 innertube-rs = "0.10.1"
 # Symphonia decodes. cpal plays: WASAPI, CoreAudio, and ALSA.
 # Symphonia itself is MPL-2.0. rodio is MIT OR Apache-2.0.
-rodio = { version = "0.23.0", default-features = false, features = ["playback", "mp4", "wav"] }
+# mp3, flac, ogg Vorbis, m4a/aac, and wav. Opus is not in this symphonia
+# 0.5 build; local Opus files are decoded separately. No C library.
+rodio = { version = "0.23.0", default-features = false, features = ["playback", "mp3", "flac", "vorbis", "mp4", "wav"] }
+# Tags for local files. MIT OR Apache-2.0. Pure Rust.
+lofty = "0.25"
+# Native folder and file dialogs. MIT. Linux uses the XDG desktop portal
+# (pure Rust over the session bus). GTK is not enabled: CI does not install
+# GTK headers, and the package build must not grow a native UI dependency.
+rfd = { version = "0.15.3", default-features = false, features = ["xdg-portal", "async-std"] }
+# Opus in Ogg, decoded to wav bytes before the rodio sink. MPL-2.0, same
+# terms as the Symphonia demuxer rodio already uses. Pure Rust.
+symphonia = { version = "0.6", default-features = false, features = ["ogg"] }
+symphonia-opus = "0.1"
 # YouTube Music browser cookies. The OS keyring when the session has one,
 # and a per-user file when it does not.
 keyring = "3"
