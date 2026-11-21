@@ -17,7 +17,8 @@
 //!
 //! Playback uses [librespot-playback](https://crates.io/crates/librespot-playback)
 //! (MIT). Its rodio backend links an older `alsa-sys` than the YouTube player,
-//! so decoded PCM is handed to this app's rodio 0.23 device instead.
+//! so decoded PCM is written into the same rodio 0.23 device as YouTube audio.
+//! A second device stays silent on Windows while the first one is still open.
 //!
 //! librespot calls `process::exit` when a session's product info is not
 //! Premium. A free account is detected from the Web API profile and never
@@ -50,6 +51,7 @@ use oauth2::{
 };
 
 use crate::music::{Error, MusicService, Playlist, Source, Track};
+use crate::output::SharedOutput;
 use crate::player::{SpotifyEngine, SpotifyFeed};
 
 /// How long an error row is allowed to get.
@@ -1780,6 +1782,9 @@ fn map_playlist_access(result: Result<Vec<Track>, Error>) -> Result<Vec<Track>, 
 /// [`SpotifyEngine::load`], never at construction, so `--smoke` stays silent.
 pub struct LibrespotEngine {
     account: SpotifyAccount,
+    /// The app output, when the playback thread has bound one. Absent in
+    /// `--selftest`, which opens a private device for the Spotify check.
+    shared: Option<Arc<SharedOutput>>,
     player: Option<Arc<Player>>,
     events: Option<librespot_playback::player::PlayerEventChannel>,
     position: Duration,
@@ -1794,6 +1799,7 @@ impl LibrespotEngine {
     pub fn new(account: SpotifyAccount) -> Self {
         Self {
             account,
+            shared: None,
             player: None,
             events: None,
             position: Duration::ZERO,
@@ -1812,6 +1818,7 @@ impl LibrespotEngine {
 
         let gate = Arc::new(DeviceGate::new());
         let report = Arc::clone(&gate);
+        let shared = self.shared.clone();
         // A new track should cut the previous one. Gapless would keep the old sink running.
         let config = PlayerConfig {
             gapless: false,
@@ -1819,7 +1826,7 @@ impl LibrespotEngine {
             ..PlayerConfig::default()
         };
         let player = Player::new(config, session, Box::new(NoOpVolume), move || {
-            let sink = match PcmSink::open() {
+            let sink = match PcmSink::open(shared) {
                 Ok(sink) => {
                     report.finish(Ok(()));
                     sink
@@ -1893,6 +1900,10 @@ impl LibrespotEngine {
 }
 
 impl SpotifyEngine for LibrespotEngine {
+    fn bind_output(&mut self, output: Arc<SharedOutput>) {
+        self.shared = Some(output);
+    }
+
     fn can_play(&self) -> bool {
         self.account.can_play()
     }
@@ -2014,14 +2025,23 @@ impl DeviceGate {
 
 /// PCM from librespot, played by rodio 0.23.
 struct PcmSink {
-    /// Kept so the stream stays open. The player borrows the mixer.
-    #[allow(dead_code, reason = "the device must outlive the player")]
+    /// Private device for `--selftest`. The live app leaves this empty and
+    /// uses [`SharedOutput`] instead, so the stream is not a second device.
+    #[allow(dead_code, reason = "dropping the device stops the stream")]
     output: Option<rodio::MixerDeviceSink>,
     player: Option<rodio::Player>,
 }
 
 impl PcmSink {
-    fn open() -> Result<Self, String> {
+    fn open(shared: Option<Arc<SharedOutput>>) -> Result<Self, String> {
+        if let Some(shared) = shared {
+            let mixer = shared.mixer().map_err(|error| error.to_string())?;
+            log::info!("spotify playback: using the shared output device");
+            return Ok(Self {
+                output: None,
+                player: Some(rodio::Player::connect_new(&mixer)),
+            });
+        }
         let mut output =
             rodio::DeviceSinkBuilder::open_default_sink().map_err(|error| error.to_string())?;
         output.log_on_drop(false);

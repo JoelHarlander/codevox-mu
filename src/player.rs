@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use crate::extract::{Extractor, InnertubeExtractor};
 use crate::music::{Source, Track};
-use crate::output::{AudioSink, RodioSink, SinkError};
+use crate::output::{AudioSink, RodioSink, SharedOutput, SinkError};
 use crate::queue::{Queue, Shift};
 
 /// Shown when a Spotify track is heard through its YouTube Music match.
@@ -131,6 +131,11 @@ pub trait SpotifyEngine: Send {
     fn pause(&mut self);
     fn stop(&mut self);
     fn poll(&mut self) -> SpotifyFeed;
+
+    /// Play Spotify PCM through the same device as YouTube and local audio.
+    ///
+    /// The default does nothing, which leaves the engine on a private device.
+    fn bind_output(&mut self, _output: Arc<SharedOutput>) {}
 }
 
 /// Finds a YouTube Music track for a Spotify row that cannot play.
@@ -583,11 +588,13 @@ where
                 Start::Playing
             }
             Err(SinkError::Device(message)) => {
+                log::error!("playback: couldn't open the audio device: {message}");
                 self.phase = Phase::Stopped;
                 self.error = Some(format!("Couldn't open the audio device: {message}"));
                 Start::Stop
             }
             Err(SinkError::Decode(message)) => {
+                log::error!("playback: couldn't decode the audio: {message}");
                 self.phase = Phase::Stopped;
                 self.error = Some(format!("Couldn't decode the audio: {message}"));
                 Start::Skip
@@ -926,12 +933,16 @@ fn worker(
 fn worker_loop(
     receiver: Receiver<Command>,
     snapshot: Arc<Mutex<NowPlaying>>,
-    spotify: Box<dyn SpotifyEngine>,
+    mut spotify: Box<dyn SpotifyEngine>,
     matcher: Box<dyn YoutubeMatch>,
 ) {
+    // One device. Opening a second stream while librespot still holds the
+    // default output stays silent on Windows, with no line in the log.
+    let output = Arc::new(SharedOutput::new());
+    spotify.bind_output(Arc::clone(&output));
     let mut player = Player::new(
         InnertubeExtractor::new(),
-        RodioSink::new(),
+        RodioSink::new(output),
         spotify,
         matcher,
     );
