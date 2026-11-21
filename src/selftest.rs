@@ -4,11 +4,13 @@
 //! 0 only when every line is PASS or SKIP. YouTube Music audio is checked
 //! without a signed-in account.
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::extract::{InnertubeExtractor, SELFTEST_TRACKS};
 use crate::music::MusicService;
-use crate::output;
+use crate::output::{AudioSink, RodioSink, SharedOutput};
 use crate::spotify::Check;
 use crate::youtube_account::LibrarySession;
 use crate::youtube_music::YouTubeMusic;
@@ -57,26 +59,41 @@ fn listen(extractor: &mut InnertubeExtractor, video_id: &str) -> Result<String, 
     let resolved = extractor
         .open(video_id)
         .map_err(|error| crate::diag::redact(&error.to_string()))?;
-    let decoded = output::decode_prefix(
-        &resolved.source.bytes,
-        &resolved.source.mime,
-        Duration::from_secs(5),
-    )
-    .map_err(|error| crate::diag::redact(&error))?;
-    if decoded.loud_samples() < 1000 {
-        return Err(format!(
-            "{} itag {} decoded silence ({} loud samples)",
-            resolved.client,
-            resolved.itag,
-            decoded.loud_samples()
-        ));
-    }
+    let client = resolved.client.clone();
+    let itag = resolved.itag;
+    let mime = resolved.source.mime.clone();
+    // The same sink the window uses, including the shared device. Decoding
+    // into a buffer hid a stream that never reached the speakers.
+    let output = Arc::new(SharedOutput::new());
+    let mut sink = RodioSink::new(output);
+    sink.start(resolved.source)
+        .map_err(|error| crate::diag::redact(&error.to_string()))?;
+    let heard = wait_until_heard(&sink);
+    sink.stop();
+    let position = heard?;
     Ok(format!(
-        "{} itag {}, {:.1}s {}",
-        resolved.client,
-        resolved.itag,
-        decoded.seconds(),
-        resolved.source.mime
+        "{client} itag {itag}, played {}ms {mime}",
+        position.as_millis()
+    ))
+}
+
+/// Position comes from the device callback. If that callback never runs, it
+/// stays at zero and this fails instead of reporting a successful decode.
+fn wait_until_heard(sink: &RodioSink) -> Result<Duration, String> {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(4) {
+        let position = sink.elapsed();
+        if position >= Duration::from_millis(250) {
+            return Ok(position);
+        }
+        if sink.finished() {
+            return Err(format!("playback ended after {}ms", position.as_millis()));
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+    Err(format!(
+        "output position did not advance (last {}ms)",
+        sink.elapsed().as_millis()
     ))
 }
 
