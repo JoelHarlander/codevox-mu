@@ -1,5 +1,8 @@
 //! `--selftest` checks a saved account without opening the window.
 //!
+//! YouTube Music song search does not need that account. It runs even when
+//! signed out, and the line reports how many rows came back.
+//!
 //! The same lines are printed and written to the log. The process exits
 //! 0 only when every line is PASS or SKIP. YouTube Music audio is checked
 //! without a signed-in account.
@@ -10,7 +13,6 @@ use crate::extract::{InnertubeExtractor, SELFTEST_TRACKS};
 use crate::music::MusicService;
 use crate::output;
 use crate::spotify::Check;
-use crate::youtube_account::LibrarySession;
 use crate::youtube_music::YouTubeMusic;
 
 /// Run the checks and return the process status. 0 means nothing failed.
@@ -80,13 +82,10 @@ fn listen(extractor: &mut InnertubeExtractor, video_id: &str) -> Result<String, 
     ))
 }
 
+/// Unauthenticated song search. A missing cookie is not a skip.
 fn youtube_search(youtube: &YouTubeMusic, query: &str) -> Result<Option<usize>, String> {
-    match youtube.restore() {
-        Ok(true) => match youtube.search(query) {
-            Ok(tracks) => Ok(Some(tracks.len())),
-            Err(error) => Err(crate::diag::redact(&error.to_string())),
-        },
-        Ok(false) => Ok(None),
+    match youtube.search(query) {
+        Ok(tracks) => Ok(Some(tracks.len())),
         Err(error) => Err(crate::diag::redact(&error.to_string())),
     }
 }

@@ -2138,8 +2138,11 @@ impl Check {
     }
 }
 
-/// Saved-account checks. No window. `youtube` returns `Ok(None)` when that
-/// service is signed out, which is reported as SKIP.
+/// Saved-account checks. No window.
+///
+/// `youtube` is the YouTube Music song search. `Ok(Some(count))` is how many
+/// rows came back. `Ok(None)` means that search was not run, which is
+/// reported as SKIP. The process self-test always runs it, signed in or not.
 pub fn self_test(
     query: &str,
     youtube: impl FnMut(&str) -> Result<Option<usize>, String>,
@@ -3253,6 +3256,16 @@ mod tests {
         assert!(
             !rendered.contains("stopped before it finished"),
             "{rendered}"
+        );
+    }
+
+    #[test]
+    fn youtube_selftest_reports_how_many_rows_came_back() {
+        let line = youtube_check("nice for", &mut |_| Ok(Some(18)));
+        assert_eq!(line.status, CheckStatus::Pass);
+        assert_eq!(
+            line.line(),
+            "PASS youtube music search: 18 tracks for \"nice for\""
         );
     }
 

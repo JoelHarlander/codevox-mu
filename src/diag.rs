@@ -65,10 +65,15 @@ pub fn redact(message: &str) -> String {
     redact_json_string(&mut text, "access_token");
     redact_json_string(&mut text, "playback_refresh_token");
     redact_json_string(&mut text, "auth_data");
+    redact_json_string(&mut text, "visitorData");
+    redact_json_string(&mut text, "VISITOR_DATA");
     redact_query(&mut text, "code");
     redact_query(&mut text, "access_token");
     redact_query(&mut text, "refresh_token");
+    redact_query(&mut text, "visitorData");
     redact_labeled(&mut text, "SAPISID=");
+    redact_labeled(&mut text, "VISITOR_INFO1_LIVE=");
+    redact_labeled(&mut text, "X-Goog-Visitor-Id:");
     text
 }
 
@@ -227,7 +232,13 @@ fn redact_bearer(text: &mut String) {
 fn redact_labeled(text: &mut String, label: &str) {
     let mut start = 0;
     while let Some(found) = text[start..].find(label) {
-        let value = start + found + label.len();
+        let mut value = start + found + label.len();
+        let skipped = text[value..]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .map(char::len_utf8)
+            .sum::<usize>();
+        value += skipped;
         let end = text[value..]
             .find(|ch: char| ch.is_whitespace() || ch == ';' || ch == '"' || ch == ',')
             .map_or(text.len(), |offset| value + offset);
@@ -383,6 +394,24 @@ mod tests {
         assert!(!cleaned.contains("sapisid-cookie-value"), "{cleaned}");
         assert!(cleaned.contains("[redacted]"), "{cleaned}");
         assert!(cleaned.contains("callback?"), "{cleaned}");
+    }
+
+    #[test]
+    fn redact_strips_visitor_ids() {
+        let raw = concat!(
+            "X-Goog-Visitor-Id: CgtVisitorDataValueHere ",
+            r#"{"VISITOR_DATA":"CgtJsonVisitorDataValue","visitorData":"CgtSecondVisitorDataValue"} "#,
+            "cookie VISITOR_INFO1_LIVE=CgtCookieVisitorDataValue; other=1 ",
+            "page?visitorData=CgtQueryVisitorDataValue&x=1"
+        );
+        let cleaned = redact(raw);
+        assert!(!cleaned.contains("CgtVisitorDataValueHere"), "{cleaned}");
+        assert!(!cleaned.contains("CgtJsonVisitorDataValue"), "{cleaned}");
+        assert!(!cleaned.contains("CgtSecondVisitorDataValue"), "{cleaned}");
+        assert!(!cleaned.contains("CgtCookieVisitorDataValue"), "{cleaned}");
+        assert!(!cleaned.contains("CgtQueryVisitorDataValue"), "{cleaned}");
+        assert!(cleaned.contains("[redacted]"), "{cleaned}");
+        assert!(cleaned.contains("cookie"), "{cleaned}");
     }
 
     #[test]
