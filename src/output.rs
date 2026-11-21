@@ -8,17 +8,24 @@
 //! inside the MP4 container YouTube serves, so symphonia is the decoder.
 //! The same decoder reads local mp3, flac, ogg Vorbis, m4a/aac, and wav.
 //!
-//! Opening the device happens on the first play, on the playback thread.
-//! `--smoke` never constructs a [`RodioSink`].
+//! Opening the device happens on the first play, on whichever thread asks
+//! for it. Spotify PCM and YouTube or local audio share that one device.
+//! A second WASAPI stream opened while the first is still held stays silent
+//! on Windows, and cpal only prints the failure. `--smoke` never constructs
+//! a [`RodioSink`].
+
+use std::io::Cursor;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use std::fs::File;
-use std::io::Cursor;
 #[cfg(test)]
 use std::io::Write;
 #[cfg(test)]
 use std::path::Path;
-use std::time::Duration;
 
 use rodio::Source;
 
@@ -51,51 +58,127 @@ pub trait AudioSink {
     fn finished(&self) -> bool;
 }
 
-/// cpal output. The stream stays open until this value is dropped.
+/// The one output device. Spotify and the stream player both borrow its mixer.
+pub struct SharedOutput {
+    opened: Mutex<Option<Opened>>,
+    failed: Arc<AtomicBool>,
+}
+
+struct Opened {
+    /// Kept so the stream stays open. The mixer is cloned out to players.
+    #[allow(dead_code, reason = "dropping the device stops the stream")]
+    device: rodio::MixerDeviceSink,
+    mixer: rodio::mixer::Mixer,
+}
+
+impl SharedOutput {
+    pub fn new() -> Self {
+        Self {
+            opened: Mutex::new(None),
+            failed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The mixer for the open device, opening or replacing it when needed.
+    pub fn mixer(&self) -> Result<rodio::mixer::Mixer, SinkError> {
+        let mut opened = self
+            .opened
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.failed.swap(false, Ordering::SeqCst) && opened.is_some() {
+            log::error!("playback: reopening the output device after the stream stopped");
+            *opened = None;
+        }
+        if opened.is_none() {
+            let device = open_device(Arc::clone(&self.failed))?;
+            let mixer = device.mixer().clone();
+            *opened = Some(Opened { device, mixer });
+        }
+        Ok(opened
+            .as_ref()
+            .expect("the device was just opened")
+            .mixer
+            .clone())
+    }
+}
+
+fn open_device(failed: Arc<AtomicBool>) -> Result<rodio::MixerDeviceSink, SinkError> {
+    match rodio::DeviceSinkBuilder::from_default_device() {
+        Ok(builder) => {
+            let flag = Arc::clone(&failed);
+            match builder
+                .with_error_callback(move |error: rodio::CpalError| {
+                    log::error!("playback: audio output stopped: {error}");
+                    flag.store(true, Ordering::SeqCst);
+                })
+                .open_stream()
+            {
+                Ok(mut device) => {
+                    device.log_on_drop(false);
+                    Ok(device)
+                }
+                Err(error) => {
+                    log::error!("playback: default output failed ({error}); trying another device");
+                    fallback_device()
+                }
+            }
+        }
+        Err(error) => {
+            log::error!("playback: default output failed ({error}); trying another device");
+            fallback_device()
+        }
+    }
+}
+
+fn fallback_device() -> Result<rodio::MixerDeviceSink, SinkError> {
+    let mut device = rodio::DeviceSinkBuilder::open_default_sink()
+        .map_err(|error| SinkError::Device(error.to_string()))?;
+    device.log_on_drop(false);
+    Ok(device)
+}
+
+/// cpal output. The stream stays open until the [`SharedOutput`] is dropped.
 pub struct RodioSink {
-    output: Option<rodio::MixerDeviceSink>,
+    output: Arc<SharedOutput>,
     player: Option<rodio::Player>,
     playing: bool,
     paused: bool,
+    started_at: Option<Instant>,
+    stall_logged: AtomicBool,
 }
 
 impl RodioSink {
-    pub fn new() -> Self {
+    pub fn new(output: Arc<SharedOutput>) -> Self {
         Self {
-            output: None,
+            output,
             player: None,
             playing: false,
             paused: false,
+            started_at: None,
+            stall_logged: AtomicBool::new(false),
         }
     }
 }
 
 impl AudioSink for RodioSink {
     fn start(&mut self, source: AudioSource) -> Result<(), SinkError> {
-        let decoded = open_decoder(Cursor::new(source.bytes), &source.mime)?;
-        if self.output.is_none() {
-            let mut output = rodio::DeviceSinkBuilder::open_default_sink()
-                .map_err(|error| SinkError::Device(error.to_string()))?;
-            // Closing the window drops the stream on purpose.
-            output.log_on_drop(false);
-            self.output = Some(output);
-        }
+        let byte_len = source.bytes.len();
+        let mime = source.mime.clone();
+        let decoded = open_decoder(source.bytes, &mime)?;
+        let decoded = ReportingDecoder::new(decoded);
+        let mixer = self.output.mixer()?;
 
-        // Drop the previous track before borrowing the mixer. `connect_new`
-        // only needs the mixer for the call; the player keeps its own queue.
+        // Drop the previous track before connecting. `connect_new` only
+        // needs the mixer for the call; the player keeps its own queue.
         self.player = None;
-        let player = {
-            let mixer = self
-                .output
-                .as_ref()
-                .ok_or_else(|| SinkError::Device("audio output was not opened".into()))?
-                .mixer();
-            rodio::Player::connect_new(mixer)
-        };
+        let player = rodio::Player::connect_new(&mixer);
+        log::info!("playback: playing {mime} ({byte_len} bytes)");
         player.append(decoded);
         self.player = Some(player);
         self.playing = true;
         self.paused = false;
+        self.started_at = Some(Instant::now());
+        self.stall_logged.store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -121,17 +204,20 @@ impl AudioSink for RodioSink {
         self.player = None;
         self.playing = false;
         self.paused = false;
+        self.started_at = None;
     }
 
     fn elapsed(&self) -> Duration {
-        if self.playing || self.paused {
+        let position = if self.playing || self.paused {
             self.player
                 .as_ref()
                 .map(rodio::Player::get_pos)
                 .unwrap_or_default()
         } else {
             Duration::ZERO
-        }
+        };
+        self.note_stall(position);
+        position
     }
 
     fn finished(&self) -> bool {
@@ -139,13 +225,36 @@ impl AudioSink for RodioSink {
     }
 }
 
+impl RodioSink {
+    /// The callback updates position as soon as it pulls a sample. A position
+    /// that stays at zero means that callback is not running.
+    fn note_stall(&self, position: Duration) {
+        if !self.playing || self.paused || !position.is_zero() {
+            return;
+        }
+        let Some(started) = self.started_at else {
+            return;
+        };
+        if started.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        if self.stall_logged.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        log::error!(
+            "playback: output produced no samples for 2s; the device callback is not running"
+        );
+    }
+}
+
 /// Samples from the start of `bytes`, stopped after `limit`.
 ///
-/// This does not open an audio device. `--selftest` and the ignored live
-/// test use it as a null sink. Playback itself decodes inside the rodio player.
+/// This does not open an audio device. The ignored live test uses it as a
+/// null sink. Playback decodes with the same [`open_decoder`] inside the
+/// rodio player.
+#[cfg(test)]
 pub fn decode_prefix(bytes: &[u8], mime: &str, limit: Duration) -> Result<DecodedPrefix, String> {
-    let decoder =
-        open_decoder(Cursor::new(bytes.to_vec()), mime).map_err(|error| error.to_string())?;
+    let decoder = open_decoder(bytes.to_vec(), mime).map_err(|error| error.to_string())?;
     let sample_rate = decoder.sample_rate().get();
     let channels = decoder.channels().get();
     let frame = u64::from(sample_rate) * u64::from(channels);
@@ -161,6 +270,7 @@ pub fn decode_prefix(bytes: &[u8], mime: &str, limit: Duration) -> Result<Decode
 }
 
 /// Interleaved float samples from [`decode_prefix`].
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecodedPrefix {
     pub sample_rate: u32,
@@ -168,6 +278,7 @@ pub struct DecodedPrefix {
     pub samples: Vec<f32>,
 }
 
+#[cfg(test)]
 impl DecodedPrefix {
     pub(crate) fn seconds(&self) -> f32 {
         let frame = u32::from(self.channels.max(1)) * self.sample_rate.max(1);
@@ -222,19 +333,131 @@ pub fn write_wav(path: &Path, decoded: &DecodedPrefix) -> Result<(), String> {
     Ok(())
 }
 
-fn open_decoder(
-    bytes: Cursor<Vec<u8>>,
-    mime: &str,
-) -> Result<rodio::Decoder<Cursor<Vec<u8>>>, SinkError> {
+/// The bytes are already in memory. Tell symphonia the length and that it
+/// can seek, or a fragmented MP4 (YouTube itag 140, with an `sidx`) is read
+/// as a forward-only stream. Once a sample offset falls behind the 64 KiB
+/// cache, the demuxer stops and rodio turns that into a silent end.
+fn open_decoder(data: Vec<u8>, mime: &str) -> Result<rodio::Decoder<Cursor<Vec<u8>>>, SinkError> {
+    let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
     let mime = mime.to_ascii_lowercase();
-    let decoded = if mime.contains("mp4") || mime.contains("m4a") || mime.contains("aac") {
-        rodio::Decoder::new_mp4(bytes)
+    let mut builder = rodio::Decoder::builder()
+        .with_data(Cursor::new(data))
+        .with_byte_len(len);
+    if mime.contains("mp4") || mime.contains("m4a") || mime.contains("aac") {
+        builder = builder.with_mime_type("audio/mp4");
     } else if mime.contains("wav") {
-        rodio::Decoder::new_wav(bytes)
+        builder = builder.with_hint("wav");
+    }
+    builder
+        .build()
+        .map_err(|error| SinkError::Decode(error.to_string()))
+}
+
+/// Logs why the device callback stopped pulling samples.
+struct ReportingDecoder {
+    inner: rodio::Decoder<Cursor<Vec<u8>>>,
+    samples: u64,
+    sample_rate: rodio::SampleRate,
+    channels: rodio::ChannelCount,
+    reported: bool,
+    dead: bool,
+}
+
+impl ReportingDecoder {
+    fn new(inner: rodio::Decoder<Cursor<Vec<u8>>>) -> Self {
+        let sample_rate = inner.sample_rate();
+        let channels = inner.channels();
+        Self {
+            inner,
+            samples: 0,
+            sample_rate,
+            channels,
+            reported: false,
+            dead: false,
+        }
+    }
+
+    fn finish(&mut self, reason: &str) {
+        if self.reported {
+            return;
+        }
+        self.reported = true;
+        let frame = u64::from(self.sample_rate.get()) * u64::from(self.channels.get().max(1));
+        let secs = self.samples as f32 / frame.max(1) as f32;
+        if reason == "end of stream" && secs >= 0.25 {
+            log::info!(
+                "playback: output ended after {secs:.2}s ({} samples): {reason}",
+                self.samples
+            );
+        } else {
+            log::error!(
+                "playback: output ended after {secs:.2}s ({} samples): {reason}",
+                self.samples
+            );
+        }
+    }
+}
+
+impl Iterator for ReportingDecoder {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        if self.dead {
+            return None;
+        }
+        let pulled = catch_unwind(AssertUnwindSafe(|| self.inner.next()));
+        match pulled {
+            Ok(Some(sample)) => {
+                self.samples = self.samples.saturating_add(1);
+                Some(sample)
+            }
+            Ok(None) => {
+                self.finish("end of stream");
+                None
+            }
+            Err(payload) => {
+                self.dead = true;
+                self.finish(&panic_reason(&payload));
+                None
+            }
+        }
+    }
+}
+
+impl Source for ReportingDecoder {
+    fn current_span_len(&self) -> Option<usize> {
+        if self.dead {
+            Some(0)
+        } else {
+            self.inner.current_span_len()
+        }
+    }
+
+    fn channels(&self) -> rodio::ChannelCount {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> rodio::SampleRate {
+        self.sample_rate
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        if self.dead {
+            None
+        } else {
+            self.inner.total_duration()
+        }
+    }
+}
+
+fn panic_reason(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
     } else {
-        rodio::Decoder::new(bytes)
-    };
-    decoded.map_err(|error| SinkError::Decode(error.to_string()))
+        "decoder panicked".to_string()
+    }
 }
 
 #[cfg(test)]
@@ -281,5 +504,54 @@ mod tests {
             bytes.extend_from_slice(&sample.to_le_bytes());
         }
         bytes
+    }
+
+    /// Generated sine, AAC in a fragmented MP4 with an `sidx` and three
+    /// `moof`/`mdat` pairs. Same container as a visionOS itag 140 stream.
+    #[test]
+    fn fragmented_aac_reaches_the_live_player_graph() {
+        let bytes = include_bytes!("../tests/fixtures/fragmented-aac.mp4");
+        let decoded = decode_prefix(
+            bytes,
+            "audio/mp4; codecs=\"mp4a.40.2\"",
+            Duration::from_secs(5),
+        )
+        .expect("seekable decoder reads the fragmented file");
+        assert_eq!(decoded.channels, 2);
+        assert_eq!(decoded.sample_rate, 44_100);
+        assert!(
+            decoded.seconds() >= 1.8,
+            "decoded {:.2}s, wanted the whole clip",
+            decoded.seconds()
+        );
+        assert!(
+            decoded.loud_samples() > 1_000,
+            "{} loud samples",
+            decoded.loud_samples()
+        );
+
+        // `Player::connect_new` wraps the queue before `append`. Pull that
+        // graph at a device rate. No hardware.
+        let (player, queue) = rodio::Player::new();
+        let mut heard = rodio::source::UniformSourceIterator::new(
+            queue,
+            rodio::math::nz!(2),
+            rodio::math::nz!(48_000),
+        );
+        player.append(open_decoder(bytes.to_vec(), "audio/mp4").expect("the sink's decoder"));
+        let mut loud = 0usize;
+        let limit = 48_000usize * 2 * 4;
+        for _ in 0..limit {
+            match heard.next() {
+                Some(sample) if sample.abs() > 0.01 => loud += 1,
+                Some(_) => {}
+                None => break,
+            }
+        }
+        let heard_secs = loud as f32 / 48_000.0 / 2.0;
+        assert!(
+            heard_secs >= 1.5,
+            "device graph heard {heard_secs:.2}s ({loud} loud samples)"
+        );
     }
 }
