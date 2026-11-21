@@ -9,8 +9,8 @@
 //!
 //! mp3, flac, ogg Vorbis, m4a/aac, and wav go to the rodio sink, which
 //! decodes them with symphonia. Opus is not in the symphonia build rodio
-//! links, so an Opus file is decoded with the pure-Rust `symphonia-opus`
-//! crate and handed to that sink as wav bytes.
+//! links, so an Opus file (Ogg, or the WebM Opus YouTube serves) is decoded
+//! with the pure-Rust `symphonia-opus` crate and handed to that sink as wav.
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -455,8 +455,8 @@ fn looks_like_opus(bytes: &[u8]) -> bool {
     bytes[..window].windows(8).any(|chunk| chunk == b"OpusHead")
 }
 
-/// Decode an Ogg Opus file to 16-bit wav the rodio sink already plays.
-fn opus_to_wav(bytes: &[u8]) -> Result<Vec<u8>, String> {
+/// Decode an Ogg or WebM Opus file to 16-bit wav the rodio sink already plays.
+pub(crate) fn opus_to_wav(bytes: &[u8]) -> Result<Vec<u8>, String> {
     use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::codecs::registry::CodecRegistry;
     use symphonia::core::common::Tier;
