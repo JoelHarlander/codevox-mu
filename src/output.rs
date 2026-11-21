@@ -20,7 +20,6 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
-#[cfg(test)]
 use rodio::Source;
 
 use crate::extract::AudioSource;
@@ -142,10 +141,8 @@ impl AudioSink for RodioSink {
 
 /// Samples from the start of `bytes`, stopped after `limit`.
 ///
-/// This does not open an audio device. The ignored live test uses it as a
-/// null sink, then writes the same samples to a wav. Playback itself
-/// decodes inside the rodio player.
-#[cfg(test)]
+/// This does not open an audio device. `--selftest` and the ignored live
+/// test use it as a null sink. Playback itself decodes inside the rodio player.
 pub fn decode_prefix(bytes: &[u8], mime: &str, limit: Duration) -> Result<DecodedPrefix, String> {
     let decoder =
         open_decoder(Cursor::new(bytes.to_vec()), mime).map_err(|error| error.to_string())?;
@@ -164,12 +161,25 @@ pub fn decode_prefix(bytes: &[u8], mime: &str, limit: Duration) -> Result<Decode
 }
 
 /// Interleaved float samples from [`decode_prefix`].
-#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecodedPrefix {
     pub sample_rate: u32,
     pub channels: u16,
     pub samples: Vec<f32>,
+}
+
+impl DecodedPrefix {
+    pub(crate) fn seconds(&self) -> f32 {
+        let frame = u32::from(self.channels.max(1)) * self.sample_rate.max(1);
+        self.samples.len() as f32 / frame as f32
+    }
+
+    pub(crate) fn loud_samples(&self) -> usize {
+        self.samples
+            .iter()
+            .filter(|sample| sample.abs() > 0.01)
+            .count()
+    }
 }
 
 /// Write interleaved `f32` samples as 16-bit PCM wav.

@@ -2109,7 +2109,7 @@ impl CheckStatus {
 }
 
 impl Check {
-    fn pass(name: &'static str, detail: impl Into<String>) -> Self {
+    pub(crate) fn pass(name: &'static str, detail: impl Into<String>) -> Self {
         Self {
             name,
             status: CheckStatus::Pass,
@@ -2117,7 +2117,7 @@ impl Check {
         }
     }
 
-    fn fail(name: &'static str, detail: impl Into<String>) -> Self {
+    pub(crate) fn fail(name: &'static str, detail: impl Into<String>) -> Self {
         Self {
             name,
             status: CheckStatus::Fail,

@@ -41,9 +41,10 @@ lofty = "0.25"
 # (pure Rust over the session bus). GTK is not enabled: CI does not install
 # GTK headers, and the package build must not grow a native UI dependency.
 rfd = { version = "0.15.3", default-features = false, features = ["xdg-portal", "async-std"] }
-# Opus in Ogg, decoded to wav bytes before the rodio sink. MPL-2.0, same
-# terms as the Symphonia demuxer rodio already uses. Pure Rust.
-symphonia = { version = "0.6", default-features = false, features = ["ogg"] }
+# Opus in Ogg and WebM, decoded to wav bytes before the rodio sink.
+# YouTube itag 251 is WebM Opus. MPL-2.0, same terms as the Symphonia
+# demuxer rodio already uses. Pure Rust.
+symphonia = { version = "0.6", default-features = false, features = ["ogg", "mkv"] }
 symphonia-opus = "0.1"
 # YouTube Music browser cookies. The OS keyring when the session has one,
 # and a per-user file when it does not.
