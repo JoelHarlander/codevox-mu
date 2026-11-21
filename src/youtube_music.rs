@@ -6,6 +6,11 @@
 //! browser cookie and opens a signed-in client. No API key is stored here;
 //! the crate carries the public web client key.
 //!
+//! Song rows are read here. ytmapi-rs 0.3.4 rejects a whole song shelf when
+//! one byline has a third field and that field has no album browse id.
+//! A row without a video id, or whose byline is not two or three ` • `
+//! fields, is skipped. The other rows are kept.
+//!
 //! [`YouTubeMusic::search`] blocks on the network. The window runs it on a
 //! background thread. Parsing is separate, so a recorded response can be
 //! tested without a socket.
@@ -15,8 +20,6 @@ use std::time::Duration;
 
 use ytmapi_rs::YtMusic;
 use ytmapi_rs::auth::noauth::NoAuthToken;
-use ytmapi_rs::common::YoutubeID;
-use ytmapi_rs::parse::SearchResultSong;
 use ytmapi_rs::query::SearchQuery;
 use ytmapi_rs::query::search::{FilteredSearch, SongsFilter};
 
@@ -57,14 +60,23 @@ impl YouTubeMusic {
     /// Read a song-search response body into tracks.
     ///
     /// `body` is the JSON YouTube Music returned. Nothing is fetched.
+    /// One bad row does not fail the search. The error is only for a body
+    /// that has no song shelf to read.
     pub fn tracks_from_song_search_json(body: &str) -> Result<Vec<Track>, Error> {
-        let query = SearchQuery::<FilteredSearch<SongsFilter>>::new_filtered("", SongsFilter);
-        let songs: Vec<SearchResultSong> = ytmapi_rs::process_json::<
-            SearchQuery<'_, FilteredSearch<SongsFilter>>,
-            NoAuthToken,
-        >(body.to_string(), &query)
-        .map_err(brief)?;
-        songs.into_iter().map(track_from_song).collect()
+        let value: serde_json::Value = serde_json::from_str(body).map_err(brief)?;
+        let shelves = song_shelves(&value);
+        if shelves.is_empty() {
+            return Err(missing_shelf(&value));
+        }
+        let mut tracks = Vec::new();
+        for shelf in shelves {
+            for item in shelf_items(shelf) {
+                if let Some(track) = track_from_row(item) {
+                    tracks.push(track);
+                }
+            }
+        }
+        Ok(tracks)
     }
 }
 
@@ -75,17 +87,12 @@ impl MusicService for YouTubeMusic {
             return Ok(Vec::new());
         }
 
-        let runtime = self.handle()?;
-        let service = self.clone();
-        let query = query.to_string();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        runtime.spawn(async move {
-            let result = service.songs(&query).await;
-            let _ = sender.send(result);
-        });
-        receiver
-            .recv()
-            .map_err(|_| brief_message("the search task stopped before it replied"))?
+        let result = self.blocking_search(query);
+        if let Err(error) = &result {
+            // One line. The log file redacts cookies, tokens, and visitor ids.
+            log::error!("youtube music: search failed: {error}");
+        }
+        result
     }
 
     fn resolve(&self, _id: &str) -> Result<Track, Error> {
@@ -129,6 +136,20 @@ impl LibrarySession for YouTubeMusic {
 }
 
 impl YouTubeMusic {
+    fn blocking_search(&self, query: &str) -> Result<Vec<Track>, Error> {
+        let runtime = self.handle()?;
+        let service = self.clone();
+        let query = query.to_string();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        runtime.spawn(async move {
+            let result = service.songs(&query).await;
+            let _ = sender.send(result);
+        });
+        receiver
+            .recv()
+            .map_err(|_| brief_message("the search task stopped before it replied"))?
+    }
+
     fn handle(&self) -> Result<tokio::runtime::Handle, Error> {
         let mut guard = self
             .inner
@@ -156,8 +177,8 @@ impl YouTubeMusic {
     async fn songs(&self, query: &str) -> Result<Vec<Track>, Error> {
         let client = self.client().await?;
         let query = SearchQuery::<FilteredSearch<SongsFilter>>::new_filtered(query, SongsFilter);
-        // Same parser as the fixture test. The client returns a JSON value;
-        // writing it back out keeps one read path.
+        // The client returns the InnerTube body. Writing it back out keeps
+        // one read path with the fixture test.
         let json = client
             .json_query::<SearchQuery<'_, FilteredSearch<SongsFilter>>>(&query)
             .await
@@ -194,25 +215,119 @@ impl YouTubeMusic {
     }
 }
 
-fn track_from_song(song: SearchResultSong) -> Result<Track, Error> {
-    let id = song.video_id.get_raw().trim().to_string();
-    if id.is_empty() {
-        return Err(brief_message("song search result had no video id"));
+/// The bullet YouTube Music puts between artist, album, and duration.
+const BYLINE_SEPARATOR: &str = " • ";
+
+fn song_shelves(root: &serde_json::Value) -> Vec<&serde_json::Value> {
+    let mut shelves = Vec::new();
+    let Some(tabs) = root
+        .pointer("/contents/tabbedSearchResultsRenderer/tabs")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return shelves;
+    };
+    for tab in tabs {
+        let Some(sections) = tab
+            .pointer("/tabRenderer/content/sectionListRenderer/contents")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for section in sections {
+            push_shelf(&mut shelves, section);
+            let Some(wrapped) = section
+                .pointer("/itemSectionRenderer/contents")
+                .and_then(serde_json::Value::as_array)
+            else {
+                continue;
+            };
+            for item in wrapped {
+                push_shelf(&mut shelves, item);
+            }
+        }
     }
+    shelves
+}
 
-    let artists = artists_from_byline(&song.artist);
+fn push_shelf<'a>(shelves: &mut Vec<&'a serde_json::Value>, node: &'a serde_json::Value) {
+    if let Some(shelf) = node
+        .get("musicShelfRenderer")
+        .filter(|shelf| shelf.is_object())
+    {
+        shelves.push(shelf);
+    }
+}
 
-    Ok(Track {
+fn shelf_items(shelf: &serde_json::Value) -> &[serde_json::Value] {
+    shelf
+        .get("contents")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn track_from_row(item: &serde_json::Value) -> Option<Track> {
+    let row = item.get("musicResponsiveListItemRenderer")?;
+    let id = video_id(row)?;
+    let title = flex_runs(row, 0).map(joined_runs).unwrap_or_default();
+    let byline = joined_runs(flex_runs(row, 1)?);
+    let (artist, album, duration) = song_fields(&byline)?;
+    let duration = parse_duration(&duration).ok()?;
+    Some(Track {
         id,
         source: Source::YouTubeMusic,
-        title: song.title,
-        artists,
-        album: song
-            .album
-            .map(|album| album.name)
-            .filter(|name| !name.trim().is_empty()),
-        duration: parse_duration(&song.duration)?,
+        title,
+        artists: artists_from_byline(&artist),
+        album,
+        duration,
     })
+}
+
+fn video_id(row: &serde_json::Value) -> Option<String> {
+    let id = row.pointer("/playlistItemData/videoId")?.as_str()?.trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
+fn flex_runs(row: &serde_json::Value, column: usize) -> Option<&[serde_json::Value]> {
+    row.get("flexColumns")?
+        .as_array()?
+        .get(column)?
+        .pointer("/musicResponsiveListItemFlexColumnRenderer/text/runs")?
+        .as_array()
+        .map(Vec::as_slice)
+}
+
+fn joined_runs(runs: &[serde_json::Value]) -> String {
+    let mut text = String::new();
+    for run in runs {
+        if let Some(piece) = run.get("text").and_then(serde_json::Value::as_str) {
+            text.push_str(piece);
+        }
+    }
+    text
+}
+
+/// Artist, optional album, and duration.
+///
+/// Two fields are artist and duration. Three fields are artist, album, and
+/// duration. The album name is kept when the row has no browse id. Any
+/// other shape is left unread.
+fn song_fields(byline: &str) -> Option<(String, Option<String>, String)> {
+    let fields: Vec<&str> = byline.split(BYLINE_SEPARATOR).collect();
+    let (artist, album, duration) = match fields.as_slice() {
+        [artist, duration] => (*artist, None, *duration),
+        [artist, album, duration] => (*artist, Some(*album), *duration),
+        _ => return None,
+    };
+    let album = album
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+    Some((artist.to_string(), album, duration.to_string()))
 }
 
 /// The song row joins collaborators into one string, with `", "` between
@@ -331,8 +446,26 @@ pub fn first_youtube_match(
         .cloned()
 }
 
+fn missing_shelf(value: &serde_json::Value) -> Error {
+    let Some(error) = value.get("error") else {
+        return brief_message("YouTube Music search returned no song shelf");
+    };
+    let code = error.get("code").and_then(serde_json::Value::as_u64);
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    match code {
+        Some(code) if !message.is_empty() => brief_message(format!("{code}: {message}")),
+        Some(code) => brief_message(code.to_string()),
+        None if !message.is_empty() => brief_message(message),
+        None => brief_message("YouTube Music search returned no song shelf"),
+    }
+}
+
 fn brief_message(message: impl Into<String>) -> Error {
-    let message = message.into();
+    let message = crate::diag::redact(&message.into());
     let line = message.lines().next().unwrap_or("unknown error").trim();
     let line = if line.is_empty() {
         "unknown error"
@@ -450,6 +583,101 @@ mod tests {
         assert_eq!(tracks[0].duration, Duration::from_secs(220));
     }
 
+    /// Live song rows from a search for "nice for" on 21 Nov 2026.
+    /// Menus, overlays, tracking parameters, and thumbnails are removed.
+    /// Scorpion is the live album run with `browseId` left out. The Korn
+    /// row is the live row: its third field is a view count and has no
+    /// browse endpoint. The last row has no video id and no byline fields.
+    const MISSING_BROWSE_ID_FIXTURE: &str =
+        include_str!("../tests/fixtures/youtube_music_search_no_album_browse_id.json");
+
+    #[test]
+    fn a_missing_album_browse_id_keeps_the_other_songs() {
+        let tracks = YouTubeMusic::tracks_from_song_search_json(MISSING_BROWSE_ID_FIXTURE)
+            .expect("mixed shelf");
+
+        assert_eq!(tracks.len(), 2);
+        assert!(tracks.iter().all(|track| track.title != "Broken row"));
+        assert!(
+            tracks
+                .iter()
+                .all(|track| track.source == Source::YouTubeMusic)
+        );
+
+        assert_eq!(tracks[0].id, "El2KPBO-_uk");
+        assert_eq!(tracks[0].title, "Nice For What");
+        assert_eq!(tracks[0].artists, ["Drake"]);
+        assert_eq!(tracks[0].album.as_deref(), Some("Scorpion"));
+        assert_eq!(tracks[0].duration, Duration::from_secs(3 * 60 + 31));
+
+        assert_eq!(tracks[1].id, "ECE27vtp4WU");
+        assert_eq!(tracks[1].title, "Y'all Want A Single (Official Video)");
+        assert_eq!(tracks[1].artists, ["Korn"]);
+        assert_eq!(tracks[1].album.as_deref(), Some("26M views"));
+        assert_eq!(tracks[1].duration, Duration::from_secs(3 * 60 + 20));
+    }
+
+    #[test]
+    fn an_item_section_shelf_is_read() {
+        let body = r#"{
+          "contents": {"tabbedSearchResultsRenderer": {"tabs": [{"tabRenderer": {"content": {
+            "sectionListRenderer": {"contents": [{"itemSectionRenderer": {"contents": [{
+              "musicShelfRenderer": {"contents": [{
+                "musicResponsiveListItemRenderer": {
+                  "flexColumns": [
+                    {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Night Drive"}]}}},
+                    {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [
+                      {"text": "Ada Vega"}, {"text": " • "}, {"text": "Harbour"}, {"text": " • "}, {"text": "3:40"}
+                    ]}}}
+                  ],
+                  "playlistItemData": {"videoId": "abcdefghijk"}
+                }
+              }]}
+            }]}}]}
+          }}}]}}
+        }"#;
+        let tracks = YouTubeMusic::tracks_from_song_search_json(body).expect("wrapped shelf");
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].id, "abcdefghijk");
+        assert_eq!(tracks[0].album.as_deref(), Some("Harbour"));
+        assert_eq!(tracks[0].duration, Duration::from_secs(220));
+    }
+
+    #[test]
+    fn a_shelf_of_unreadable_rows_is_empty() {
+        let body = r#"{
+          "contents": {"tabbedSearchResultsRenderer": {"tabs": [{"tabRenderer": {"content": {
+            "sectionListRenderer": {"contents": [{"musicShelfRenderer": {"contents": [
+              {"musicResponsiveListItemRenderer": {"flexColumns": []}},
+              {"continuationItemRenderer": {}}
+            ]}}]}
+          }}}]}}
+        }"#;
+        let tracks = YouTubeMusic::tracks_from_song_search_json(body).expect("bad rows");
+        assert!(tracks.is_empty());
+    }
+
+    #[test]
+    fn song_search_without_a_shelf_is_an_error() {
+        let error = YouTubeMusic::tracks_from_song_search_json("{}").expect_err("no shelf");
+        let Error::Unavailable(reason) = error else {
+            panic!("a missing shelf is unavailable");
+        };
+        assert!(reason.contains("no song shelf"), "{reason}");
+    }
+
+    #[test]
+    fn song_search_failure_redacts_a_visitor_id() {
+        let error = YouTubeMusic::tracks_from_song_search_json(
+            r#"{"error":{"code":400,"message":"bad X-Goog-Visitor-Id: CgtVisitorDataValueHere"}}"#,
+        )
+        .expect_err("visitor");
+        let text = error.to_string();
+        assert!(!text.contains("CgtVisitorDataValueHere"), "{text}");
+        assert!(text.contains("[redacted]"), "{text}");
+        assert!(!text.contains('\n'), "{text}");
+    }
+
     #[test]
     fn song_search_rejects_an_error_payload() {
         let error = YouTubeMusic::tracks_from_song_search_json(
@@ -536,21 +764,15 @@ mod tests {
     #[test]
     #[ignore = "calls YouTube Music; cargo test stays offline"]
     fn live_search_returns_tracks() {
-        let tracks = YouTubeMusic::new()
-            .search("daft punk get lucky")
-            .expect("live search");
-        assert!(!tracks.is_empty());
-        for track in &tracks {
-            assert_eq!(track.source, Source::YouTubeMusic);
-            assert!(!track.id.is_empty());
-            assert!(!track.title.is_empty());
-            eprintln!(
-                "{}\t{}\t{}\t{:?}",
-                track.id,
-                track.title,
-                track.artists.join(", "),
-                track.duration
-            );
+        for query in ["nice for", "Nice For What Drake", "daft punk get lucky"] {
+            let tracks = YouTubeMusic::new().search(query).expect("live search");
+            assert!(!tracks.is_empty(), "{query}");
+            eprintln!("{query}: {} tracks", tracks.len());
+            for track in &tracks {
+                assert_eq!(track.source, Source::YouTubeMusic);
+                assert!(!track.id.is_empty());
+                assert!(!track.title.is_empty());
+            }
         }
     }
 }

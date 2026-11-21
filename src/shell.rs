@@ -2256,7 +2256,8 @@ impl Shell {
                 self.youtube_rows = tracks;
             }
             Err(error) => {
-                self.error = Some(format!("YouTube Music search failed: {error}"));
+                let detail = crate::diag::redact(&error.to_string());
+                self.error = Some(format!("YouTube Music search failed: {detail}"));
                 self.youtube_rows.clear();
             }
         }
